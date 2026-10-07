@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=ShojiWM
+Exec=/home/q/.local/bin/shojiwm-session
+TryExec=/home/q/.local/bin/shojiwm-session
+DesktopNames=ShojiWM
+Type=Application

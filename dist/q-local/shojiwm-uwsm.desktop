@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=ShojiWM (uwsm-managed)
+Exec=uwsm start -eD ShojiWM shojiwm.desktop
+TryExec=uwsm
+DesktopNames=ShojiWM
+Type=Application

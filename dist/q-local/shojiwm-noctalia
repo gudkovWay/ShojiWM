@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Launch the preinstalled native Noctalia for the ShojiWM trial session.
+# Uses the trial-copied config/state roots only; does not touch the live
+# noctalia setup or any global XDG environment.
+set -euo pipefail
+
+if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+	echo "shojiwm-noctalia: WAYLAND_DISPLAY is not set" >&2
+	exit 1
+fi
+
+config_home="/home/q/.config/shoji-trial"
+state_home="/home/q/.local/state/shoji-trial"
+data_home="/home/q/.local/share/shoji-trial"
+
+if [[ ! -d "$config_home" ]]; then
+	echo "shojiwm-noctalia: trial config directory missing: $config_home" >&2
+	exit 1
+fi
+if [[ ! -d "$state_home" ]]; then
+	echo "shojiwm-noctalia: trial state directory missing: $state_home" >&2
+	exit 1
+fi
+
+noctalia_bin="/home/q/.local/opt/noctalia-jelly-cat/bin/noctalia"
+if [[ ! -x "$noctalia_bin" ]]; then
+	echo "shojiwm-noctalia: noctalia executable missing: $noctalia_bin" >&2
+	exit 1
+fi
+
+# Under a managed Type=notify unit systemd supplies NOTIFY_SOCKET; finalize the
+# session so systemd considers startup complete. On direct login (no
+# NOTIFY_SOCKET) there is no managed session, so skip finalization entirely.
+if [[ -n "${NOTIFY_SOCKET:-}" ]]; then
+	uwsm finalize
+fi
+
+exec env \
+	NOCTALIA_CONFIG_HOME="$config_home" \
+	NOCTALIA_STATE_HOME="$state_home" \
+	NOCTALIA_DATA_HOME="$data_home" \
+	GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=1048576:glibc.malloc.trim_threshold=2097152 \
+	"$noctalia_bin"

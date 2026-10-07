@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# ShojiWM login session launcher (stable installed mode).
+# Runs the compositor binary and decoration runtime snapshot from
+# ~/.local/libexec/shojiwm; config is a real installed copy under
+# ~/.config/shojiwm. No source-checkout/worktree dependency.
+set -euo pipefail
+
+libexec="$HOME/.local/libexec/shojiwm"
+
+wm_bin="$libexec/shoji_wm"
+runtime_dir="$libexec/runtime"
+config="$HOME/.config/shojiwm/src/index.tsx"
+
+if [[ ! -x "$wm_bin" ]]; then
+	echo "shojiwm-session: compositor binary missing or not executable: $wm_bin" >&2
+	exit 1
+fi
+if [[ ! -f "$runtime_dir/tools/decoration-runtime.ts" ]]; then
+	echo "shojiwm-session: decoration runtime missing: $runtime_dir/tools/decoration-runtime.ts" >&2
+	exit 1
+fi
+if [[ ! -d "$runtime_dir/packages/shoji_wm" ]]; then
+	echo "shojiwm-session: runtime SDK package missing: $runtime_dir/packages/shoji_wm" >&2
+	exit 1
+fi
+if [[ ! -f "$config" ]]; then
+	echo "shojiwm-session: user config missing: $config" >&2
+	exit 1
+fi
+
+# Installed-mode runtime: --runtime-dir points at the installed snapshot so the
+# decoration runtime resolves to $runtime_dir/tools/decoration-runtime.ts.
+exec "$wm_bin" --tty --runtime-dir "$runtime_dir" --config "$config"

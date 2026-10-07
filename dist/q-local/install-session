@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Register the two ShojiWM session desktop files system-wide so the greeter
+# can discover them. Registers exactly two entries; idempotent when the
+# existing content is identical. Requires root; refuses to overwrite an
+# existing different registration. No services are restarted.
+set -euo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+src_dir="$(dirname "$script_path")"
+
+target_dir="/usr/local/share/wayland-sessions"
+entries=(shojiwm.desktop shojiwm-uwsm.desktop)
+
+if [[ "$(id -u)" -ne 0 ]]; then
+	echo "install-session: must run as root (e.g. sudo -n $0)" >&2
+	exit 1
+fi
+
+# Registration runs as root, but the desktop entries belong to this user.
+libexec="/home/q/.local/libexec/shojiwm"
+wm_bin="$libexec/shoji_wm"
+runtime_dir="$libexec/runtime"
+session_link="/home/q/.local/bin/shojiwm-session"
+user_config="/home/q/.config/shojiwm/src/index.tsx"
+
+if [[ ! -x "$wm_bin" ]]; then
+	echo "install-session: compositor binary missing or not executable: $wm_bin" >&2
+	exit 1
+fi
+if [[ ! -f "$runtime_dir/tools/decoration-runtime.ts" ]]; then
+	echo "install-session: decoration runtime missing: $runtime_dir/tools/decoration-runtime.ts" >&2
+	exit 1
+fi
+if [[ ! -d "$runtime_dir/packages/shoji_wm" ]]; then
+	echo "install-session: runtime SDK package missing: $runtime_dir/packages/shoji_wm" >&2
+	exit 1
+fi
+for tool in "$libexec/tools/shoji_native.py" "$libexec/tools/shoji-screen-off.py"; do
+	if [[ ! -f "$tool" ]]; then
+		echo "install-session: native client tool missing: $tool" >&2
+		exit 1
+	fi
+done
+if [[ ! -x "$session_link" ]]; then
+	echo "install-session: session launcher missing or not executable: $session_link" >&2
+	exit 1
+fi
+if [[ ! -f "$user_config" ]]; then
+	echo "install-session: user config missing: $user_config" >&2
+	exit 1
+fi
+
+# Preflight: verify every destination before writing anything.
+for entry in "${entries[@]}"; do
+	src="$src_dir/$entry"
+	dst="$target_dir/$entry"
+	if [[ ! -f "$src" ]]; then
+		echo "install-session: source entry missing: $src" >&2
+		exit 1
+	fi
+	if [[ -L "$dst" ]]; then
+		echo "install-session: refusing symlink destination: $dst" >&2
+		exit 1
+	fi
+	if [[ -e "$dst" ]] && ! cmp -s "$src" "$dst"; then
+		echo "install-session: refusing to overwrite different existing registration: $dst" >&2
+		exit 1
+	fi
+done
+
+for entry in "${entries[@]}"; do
+	install -Dm644 "$src_dir/$entry" "$target_dir/$entry"
+done
+
+echo "install-session: registered exactly two entries under $target_dir:"
+for entry in "${entries[@]}"; do
+	echo "  $target_dir/$entry"
+done
+echo "install-session: session entries registered. Compositor boot itself has not been verified."
