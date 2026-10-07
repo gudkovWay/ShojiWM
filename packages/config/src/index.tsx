@@ -52,6 +52,7 @@ import {
   WINDOW_STATE_VISIBLE_OUTPUTS,
   WINDOW_STATE_RECT,
   WINDOW_STATE_WORKSPACE_VISIBLE,
+  WINDOW_STATE_WORKSPACE_INPUT_ELIGIBLE,
   WINDOW_STATE_WORKSPACE_OFFSET_Y,
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
@@ -63,6 +64,7 @@ import {
 } from "./effect/ambient-composition";
 import { createRainFrameEffect } from "./effect/rain-frame";
 import { createRainWeatherEffect } from "./effect/rain-weather";
+import { installDotCursorTrail } from "./effect/dot-cursor-trail";
 import { RAIN_BORDER_PX } from "./effect/rain-layout";
 import {
   RainCloseButton,
@@ -71,8 +73,8 @@ import {
 } from "./effect/rain-controls";
 // Rainlit frame packs: the runtime module imports the four authored pack
 // modules purely (no asset loading, no effect compilation, no selection side
-// effects at load). Pack 02 is the declared startup default; an explicit
-// `{ id: null }` selection keeps the legacy pipeline below.
+// effects at load). With the default `{ id: null }` selection nothing here
+// resolves a pack, so the legacy pipeline below is bit-for-bit unchanged.
 import {
   headerPadding,
   rainlitFor,
@@ -86,31 +88,25 @@ import {
   type RainlitEdges,
   type RainlitFrameId,
 } from "./effect/rainlit/runtime";
+import { RainlitDollControls, RainlitWoodControls } from "./effect/rainlit/controls";
 import {
-  RainlitDollControls,
-  RainlitWoodControls,
-} from "./effect/rainlit/controls";
+  WORKSPACES_PER_OUTPUT,
+  globalWorkspaceIndex,
+} from "./workspace-policy";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
   QT_QPA_PLATFORMTHEME: "qt6ct",
-  QT_IM_MODULE: "fcitx",
-  XMODIFIERS: "@im=fcitx",
-  SDL_IM_MODULE: "fcitx",
   GLFW_IM_MODULE: "ibus",
   ELECTRON_OZONE_PLATFORM_HINT: "wayland",
 });
 COMPOSITOR.env.publish();
 
 COMPOSITOR.cursor.configure({
-  theme: "Bibata-Modern-Ice",
+  theme: "Dot-Dark",
   size: 24,
 });
-
-COMPOSITOR.process.once("GTK-CSD-control-buttons", {
-  command: "gsettings set org.gnome.desktop.wm.preferences button-layout ':minimize,maximize,close'",
-  runPolicy: "once-per-session",
-});
+installDotCursorTrail();
 
 COMPOSITOR.window.decoration.configure((_window, context) => {
   return { mode: context.clientPreference ?? "server" };
@@ -153,9 +149,9 @@ const FOCUSED_TILED_WINDOW_Z_INDEX = 1_000_000_000;
 const REORDERING_TILED_WINDOW_Z_INDEX = -2_000_000_000;
 const RAIN_EFFECTS_STATE = "config.rain-effects-enabled";
 // Own reload key for the explicit Rainlit frame selection. The value is the
-// full `{ id, reducedMotion }` policy; the startup default is pack "02", and a
-// restored `id: null` keeps the legacy frame. Only `rainlit.frames.select`
-// (or the restore of a previously persisted selection) changes it.
+// full `{ id, reducedMotion }` policy; a restored `id: null` keeps the legacy
+// frame. Nothing is auto-selected: only `rainlit.frames.select` (or the
+// restore of a previously persisted selection) changes it.
 const RAINLIT_SELECTION_STATE = "config.rainlit-selection";
 const rainEffectsEnabled = signal(true);
 const ambientPhase = animationVariable("ambient-shoji-phase");
@@ -199,9 +195,9 @@ function isRainlitFrameId(value: unknown): value is RainlitFrameId {
 
 /**
  * Logical root insets for the unified frame come from the selected pack's
- * authored insets (52px for 02, 26px for 06/09, and 48px top for 07);
- * this constant is the legacy 26px ring used when the selection is null.
- * Geometry is deliberately independent of the rain-art toggle, so
+ * authored insets (26px sides/bottom, top 26 for 02/06/09 and 48 for the 07
+ * beam); this constant is the legacy fixed 26px ring used when the selection
+ * is null. Geometry is deliberately independent of the rain-art toggle, so
  * native chrome and the reserved opening never move when art is switched off.
  */
 const LEGACY_RAIN_INSETS: RainlitEdges = {
@@ -311,8 +307,8 @@ COMPOSITOR.onEnable((event) => {
     if (rainEnabled !== undefined) {
       rainEffectsEnabled.set(rainEnabled);
     }
-    // Restore only a valid policy. Missing or malformed state keeps startup
-    // pack 02; an explicit null remains the legacy alternative.
+    // Restore the known selection only if it validates exactly; a stale or
+    // malformed value (or the previous `null`) leaves the legacy default.
     const restoredSelection = event.restore<unknown>(RAINLIT_SELECTION_STATE);
     if (restoredSelection && typeof restoredSelection === "object") {
       const { id, reducedMotion } = restoredSelection as {
@@ -342,7 +338,7 @@ COMPOSITOR.onEnable((event) => {
 // External IPC: expose the workspace layout to clients such as the bar.
 //   workspaces.get           -> WorkspacesView                     (request/response)
 //   workspaces.switch        { direction: -1 | 1 }                 (command)
-//   workspaces.activate      { monitor: string, index: number }    (command)
+//   workspaces.activate      { monitor, index }  index is global      (command)
 //   workspaces.toggleTiling  { monitor?: string }                  (command)
 //   workspaces.changed       -> WorkspacesView                     (broadcast)
 //   windows.activate         { windowId: string }                  (command)
@@ -382,23 +378,56 @@ function scheduleWorkspaceBroadcast() {
   });
 }
 
+// Workspace labels: DP-3 carries the CJK numerals 一..十 and DP-2 the ten
+// heavenly stems 甲..癸, matching q's Noctalia bar (which renders the protocol
+// `name`). Labels stay monitor-local, but protocol ids and coordinates use
+// the global index from workspace-policy (DP-3 1..10, DP-2 11..20, further
+// outputs 21+), so DP-3:1 and DP-2:11 stay distinct.
+const WORKSPACE_LABELS: Record<string, string[]> = {
+  "DP-3": ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"],
+  "DP-2": ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"],
+};
+
 COMPOSITOR.workspace.configure(() => {
   const view = HYBRID_WINDOW_MANAGER.viewForIpc();
+  // `viewForIpc` reports global workspace indices. Enumerate each output's
+  // ten local slots, map them to their global index for the protocol id and
+  // coordinates, and match the known set by that global index.
+  const outputs = COMPOSITOR.output.list;
   return {
-    groups: view.monitors.map((monitor) => ({
-      id: monitor.name,
-      outputs: [monitor.name],
-      workspaces: monitor.workspaces.map((workspace) => ({
-        id: `${monitor.name}:${workspace.index}`,
-        name: String(workspace.index),
-        coordinates: [Math.max(0, workspace.index - 1)],
-        active: workspace.active,
-        hidden: !workspace.active && workspace.windowCount === 0,
-      })),
-    })),
+    groups: view.monitors.map((monitor) => {
+      const known = new Map(
+        monitor.workspaces.map((workspace) => [workspace.index, workspace]),
+      );
+      const workspaces = [];
+      for (let local = 1; local <= WORKSPACES_PER_OUTPUT; local += 1) {
+        const globalIndex = globalWorkspaceIndex(
+          monitor.name,
+          local,
+          outputs,
+        );
+        const workspace = known.get(globalIndex);
+        workspaces.push({
+          id: `${monitor.name}:${globalIndex}`,
+          name: WORKSPACE_LABELS[monitor.name]?.[local - 1] ?? String(local),
+          coordinates: [globalIndex - 1],
+          active: workspace?.active ?? false,
+          // All ten slots stay advertised so the bar renders a stable,
+          // persistent workspace strip rather than a shifting set.
+          hidden: false,
+        });
+      }
+      return {
+        id: monitor.name,
+        outputs: [monitor.name],
+        workspaces,
+      };
+    }),
   };
 });
 
+// Protocol workspace ids are `monitor:globalIndex` (see workspace-policy), so
+// the parsed suffix is already a global index at the external boundary.
 COMPOSITOR.workspace.event.onActivate((event) => {
   const [monitor, rawIndex] = event.workspaceId.split(":");
   const index = Number(rawIndex);
@@ -419,6 +448,8 @@ WORKSPACE_IPC.handle("workspaces.switch", (params) => {
 });
 WORKSPACE_IPC.handle("workspaces.activate", (params) => {
   const request = params as { monitor?: string; index?: number } | undefined;
+  // External clients address global indices; the manager converts them to
+  // the monitor-local slot at this boundary.
   if (request?.monitor && typeof request.index === "number") {
     HYBRID_WINDOW_MANAGER.activate(request.monitor, request.index);
     scheduleWorkspaceBroadcast();
@@ -447,8 +478,8 @@ WORKSPACE_IPC.handle("windows.activate", (params) => {
 //                            catalog; runtimeVerified is always false)
 //   rainlit.frames.select  { id: null|'02'|'06'|'07'|'09', reducedMotion?: bool }
 //                          (command) -> RainlitStatus
-// Pack 02 is the cold-start default. IPC selections survive hot reload only;
-// no picker or frame-selection keybinding is registered here.
+// Selection is configuration only: it is never auto-applied, no keybinding is
+// registered, and no picker UI lives here (that is a later workstream).
 // ---------------------------------------------------------------------------
 WORKSPACE_IPC.handle("rainlit.frames.get", () => rainlitStatus());
 WORKSPACE_IPC.handle("rainlit.frames.select", (params) => {
@@ -615,121 +646,166 @@ COMPOSITOR.onDisable(() => {
   WORKSPACE_IPC.close();
 });
 
-COMPOSITOR.process.once("fcitx5", {
-  command: "fcitx5 -d",
+// Noctalia, q's native shell: bar, wallpaper, notification daemon and tray.
+// `shojiwm-noctalia` finalizes UWSM readiness with the live Wayland display and
+// launches the installed native binary under the trial-only NOCTALIA_* roots.
+COMPOSITOR.process.once("noctalia", {
+  command: ["/home/q/.local/bin/shojiwm-noctalia"],
   runPolicy: "once-per-session",
 });
 
-// shoji-bar-3, the session's shell: bar, wallpaper, notification daemon and
-// tray host.
+// ---------------------------------------------------------------------------
+// Compositor-global bindings for q.
 //
-// The shader is compiled first. The built .qsb is not in the repository, and
-// without it the islands have no silhouette at all. The two are sequenced with
-// `;` rather than `&&` on purpose: if the build fails, starting anyway with a
-// previously built .qsb is far better than a session with no shell in it.
-COMPOSITOR.process.once("shell", {
-  command: "cd ~/.config/shoji-bar-3 && bash build.sh; exec quickshell --path .",
-  runPolicy: "once-per-session",
-});
-// cliphist clipboard history watchers. Text and image need separate watchers;
-// run as services so they are restarted if they ever exit.
-COMPOSITOR.process.service("cliphist-text", {
-  command: ["wl-paste", "--type", "text", "--watch", "cliphist", "store"],
-  restart: "on-exit",
-});
-COMPOSITOR.process.service("cliphist-image", {
-  command: ["wl-paste", "--type", "image", "--watch", "cliphist", "store"],
-  restart: "on-exit",
-});
+// XKB owns layout switching (grp:caps_toggle in COMPOSITOR.input.configure), so
+// every chord matches the physical raw-Latin key and works under both the US
+// and RU groups. Noctalia IPC is addressed by the absolute installed binary so
+// no PATH/upstream `noctalia` can capture a msg call; app openers go through
+// UWSM. Held volume keys opt into native held-repeat below (250 ms delay,
+// 100 ms interval); every other media key stays press-only.
+// ---------------------------------------------------------------------------
+const NOCTALIA_BIN = "/home/q/.local/opt/noctalia-jelly-cat/bin/noctalia";
+const TMUS_BIN = "/home/q/.cargo/bin/tmus";
+const LAUNCH_PREFIX = ["uwsm", "app", "--"] as const;
 
-COMPOSITOR.key.bind("terminal", "Super+T", () => {
-  COMPOSITOR.process.spawn({ command: ["kitty"] });
-});
-
-// if kwallet6 is used as the password store, be sure to add the --password-store=kwallet6 flag
-COMPOSITOR.key.bind("chrome", "Super+B", () => {
-  COMPOSITOR.process.spawn({
-    command:
-      "google-chrome-stable --enable-features=OzonePlatform --ozone-platform=wayland",
-  });
-});
-
-COMPOSITOR.key.bind("discord", "Super+D", () => {
-  COMPOSITOR.process.spawn({
-    command:
-      "discord --enable-features=UseOzonePlatform --ozone-platform=wayland --enable-wayland-ime --disable-gpu",
-  });
-});
-
-COMPOSITOR.key.bind("dolphin", "Super+E", () => {
-  COMPOSITOR.process.spawn({ command: "dolphin" });
-});
-
-COMPOSITOR.key.bind("play", "XF86AudioPlay", () => {
-  COMPOSITOR.process.spawn({ command: "playerctl play-pause" });
-});
-COMPOSITOR.key.bind("pause", "XF86AudioPause", () => {
-  COMPOSITOR.process.spawn({ command: "playerctl play-pause" });
-});
-COMPOSITOR.key.bind("next", "XF86AudioNext", () => {
-  COMPOSITOR.process.spawn({ command: "playerctl next" });
-});
-COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
-  COMPOSITOR.process.spawn({ command: "playerctl previous" });
-});
-
-// shoji-bar-3's application launcher, on the monitor under the cursor.
-//
-// The bar answers on Quickshell's IPC socket, which is addressed by the config
-// it was started with rather than by a running instance id, so this works
-// whether the bar was started by hand or by a service.
-//
-//   quickshell -p ~/.config/shoji-bar-3 ipc show
-//
-// lists the rest of the target's functions (open / close / toggle, each also
-// in a `...On <screen>` form). An empty screen name would open it everywhere.
-function toggleLauncher() {
-  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: `quickshell -p ~/.config/shoji-bar-3 ipc call launcher toggleOn "${monitor}"`,
-  });
+function noctaliaMsg(...args: string[]) {
+  COMPOSITOR.process.spawn({ command: [NOCTALIA_BIN, "msg", ...args] });
 }
-COMPOSITOR.key.bind("launcher", "Super+A", toggleLauncher);
-// Super tap (fires on release only, when no other key/button was pressed in between).
-COMPOSITOR.key.bind("launcher-tap", "Super", toggleLauncher, {
-  on: "release",
-});
-// The same launcher panel with its field pointed at the clipboard's history.
-function toggleClipboard() {
-  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
-  COMPOSITOR.process.spawn({
-    command: `quickshell -p ~/.config/shoji-bar-3 ipc call launcher clipboardOn "${monitor}"`,
-  });
+
+function launchApp(...args: string[]) {
+  COMPOSITOR.process.spawn({ command: [...LAUNCH_PREFIX, ...args] });
 }
-COMPOSITOR.key.bind("clipboard", "Super+V", toggleClipboard);
 
-// Lock the session. No monitor argument: a lock covers every screen there is,
-// and the shell refuses to expose an unlock over the same socket.
-COMPOSITOR.key.bind("lock", "Super+L", () => {
-  COMPOSITOR.process.spawn({
-    command: "quickshell -p ~/.config/shoji-bar-3 ipc call session lock",
-  });
+// Application openers.
+COMPOSITOR.key.bind("terminal", "Super+Return", () => {
+  launchApp("kitty");
+});
+COMPOSITOR.key.bind("file-manager", "Super+E", () => {
+  launchApp("nemo");
+});
+COMPOSITOR.key.bind("telegram", "Super+T", () => {
+  launchApp("AyuGram");
+});
+COMPOSITOR.key.bind("calculator", "Super+C", () => {
+  launchApp("gnome-calculator");
+});
+COMPOSITOR.key.bind("browser", "Super+B", () => {
+  launchApp("zen-browser");
+});
+COMPOSITOR.key.bind("calculator-key", "XF86Calculator", () => {
+  launchApp("gnome-calculator");
+});
+COMPOSITOR.key.bind("btop", "Ctrl+Shift+Escape", () => {
+  launchApp("kitty", "-e", "btop");
 });
 
-COMPOSITOR.key.bind("screenshot", "Super+P", () => {
-  COMPOSITOR.process.spawn({
-    command: "hyprshot -m region --raw | swappy -f -",
-  });
+// Noctalia panel / plugin openers.
+COMPOSITOR.key.bind("settings-toggle", "Super+Z", () => {
+  noctaliaMsg("settings-toggle");
 });
-COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
-  COMPOSITOR.process.spawn({
-    command: "hyprshot -m region --freeze --raw | swappy -f -",
-  });
+COMPOSITOR.key.bind("control-center", "Super+X", () => {
+  noctaliaMsg("panel-toggle", "control-center");
 });
-COMPOSITOR.key.bind("toggle-tiling-mode", "Super+S", () => {
-  HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
-  scheduleWorkspaceBroadcast();
+COMPOSITOR.key.bind("launcher", "Super+D", () => {
+  noctaliaMsg("panel-toggle", "launcher");
 });
+COMPOSITOR.key.bind("launcher-emoji", "Super+period", () => {
+  noctaliaMsg("panel-toggle", "launcher", "/emo");
+});
+COMPOSITOR.key.bind("window-switcher", "Super+Tab", () => {
+  noctaliaMsg("window-switcher");
+});
+COMPOSITOR.key.bind("clipboard", "Super+V", () => {
+  noctaliaMsg("panel-toggle", "clipboard");
+});
+COMPOSITOR.key.bind("notifications", "Super+N", () => {
+  noctaliaMsg("panel-toggle", "control-center", "notifications");
+});
+COMPOSITOR.key.bind("notification-dnd", "Super+Alt+D", () => {
+  noctaliaMsg("notification-dnd-toggle");
+});
+COMPOSITOR.key.bind("session", "Super+Alt+P", () => {
+  noctaliaMsg("panel-toggle", "session");
+});
+COMPOSITOR.key.bind("lock", "Super+Alt+L", () => {
+  noctaliaMsg("session", "lock");
+});
+COMPOSITOR.key.bind("calendar", "Super+Alt+C", () => {
+  noctaliaMsg("panel-toggle", "control-center", "calendar");
+});
+COMPOSITOR.key.bind("bluetooth", "Super+Alt+B", () => {
+  noctaliaMsg("panel-toggle", "control-center", "bluetooth");
+});
+COMPOSITOR.key.bind("network", "Super+Alt+N", () => {
+  noctaliaMsg("panel-toggle", "control-center", "network");
+});
+COMPOSITOR.key.bind("ai-triage", "Super+Alt+A", () => {
+  noctaliaMsg("panel-toggle", "q/ai-triage:triage");
+});
+COMPOSITOR.key.bind("tmus-panel", "Super+Alt+M", () => {
+  noctaliaMsg("panel-toggle", "q/tmus:library");
+});
+
+// Audio volume, microphone and brightness belong to Noctalia.
+COMPOSITOR.key.bind(
+  "volume-up",
+  "XF86AudioRaiseVolume",
+  () => {
+    noctaliaMsg("volume-up");
+  },
+  { repeat: { delayMs: 250, intervalMs: 100 } },
+);
+COMPOSITOR.key.bind(
+  "volume-down",
+  "XF86AudioLowerVolume",
+  () => {
+    noctaliaMsg("volume-down");
+  },
+  { repeat: { delayMs: 250, intervalMs: 100 } },
+);
+COMPOSITOR.key.bind("volume-mute", "XF86AudioMute", () => {
+  noctaliaMsg("volume-mute");
+});
+COMPOSITOR.key.bind("mic-mute", "XF86AudioMicMute", () => {
+  noctaliaMsg("mic-mute");
+});
+COMPOSITOR.key.bind("brightness-up", "XF86MonBrightnessUp", () => {
+  noctaliaMsg("brightness-up");
+});
+COMPOSITOR.key.bind("brightness-down", "XF86MonBrightnessDown", () => {
+  noctaliaMsg("brightness-down");
+});
+
+// Media goes straight to the tmus daemon, never through an MPRIS "active
+// player" lookup: with AyuGram on the bus, `noctalia msg media` would route
+// playback to Telegram.
+COMPOSITOR.key.bind("media-toggle", "XF86AudioPlay", () => {
+  COMPOSITOR.process.spawn({ command: [TMUS_BIN, "toggle"] });
+});
+COMPOSITOR.key.bind("media-toggle-pause", "XF86AudioPause", () => {
+  COMPOSITOR.process.spawn({ command: [TMUS_BIN, "toggle"] });
+});
+COMPOSITOR.key.bind("media-next", "XF86AudioNext", () => {
+  COMPOSITOR.process.spawn({ command: [TMUS_BIN, "next"] });
+});
+COMPOSITOR.key.bind("media-prev", "XF86AudioPrev", () => {
+  COMPOSITOR.process.spawn({ command: [TMUS_BIN, "prev"] });
+});
+COMPOSITOR.key.bind("media-stop", "XF86AudioStop", () => {
+  COMPOSITOR.process.spawn({ command: [TMUS_BIN, "stop"] });
+});
+
+// Screenshots through Noctalia.
+COMPOSITOR.key.bind("screenshot-region", "Print", () => {
+  noctaliaMsg("screenshot-region");
+});
+COMPOSITOR.key.bind("screenshot-fullscreen", "Super+Print", () => {
+  noctaliaMsg("screenshot-fullscreen");
+});
+
+// Window management. Directional focus/move reuse the same full modifier
+// strings on both arrows and the physical HJKL Latin keys, so the chords work
+// identically under the US and RU groups (XKB owns group switching).
 COMPOSITOR.key.bind("close-focused-window", "Super+Q", () => {
   HYBRID_WINDOW_MANAGER.closeFocusedWindow();
 });
@@ -739,33 +815,89 @@ COMPOSITOR.key.bind("toggle-focused-window-maximize", "Super+M", () => {
 COMPOSITOR.key.bind("toggle-focused-window-fullscreen", "Super+F", () => {
   HYBRID_WINDOW_MANAGER.toggleFocusedWindowFullscreen();
 });
-COMPOSITOR.key.bind("tile-focus-left-quick", "Super+Left", () => {
-  HYBRID_WINDOW_MANAGER.focusTile(-1);
-});
-COMPOSITOR.key.bind("tile-focus-right-quick", "Super+Right", () => {
-  HYBRID_WINDOW_MANAGER.focusTile(1);
-});
-COMPOSITOR.key.bind("tile-focus-left", "Super+Ctrl+Left", () => {
-  HYBRID_WINDOW_MANAGER.focusTile(-1);
-});
-COMPOSITOR.key.bind("tile-focus-right", "Super+Ctrl+Right", () => {
-  HYBRID_WINDOW_MANAGER.focusTile(1);
-});
-COMPOSITOR.key.bind("tile-move-left", "Super+Shift+Left", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedTile(-1);
+COMPOSITOR.key.bind("toggle-focused-window-floating", "Super+A", () => {
+  HYBRID_WINDOW_MANAGER.toggleFocusedWindowFloating();
   scheduleWorkspaceBroadcast();
 });
-COMPOSITOR.key.bind("tile-move-right", "Super+Shift+Right", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedTile(1);
+COMPOSITOR.key.bind("toggle-focused-window-split", "Super+Alt+J", () => {
+  HYBRID_WINDOW_MANAGER.toggleFocusedWindowSplit();
   scheduleWorkspaceBroadcast();
 });
-COMPOSITOR.key.bind("window-move-workspace-prev", "Super+Shift+Up", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1);
+
+// Directional focus: Super + arrow or HJKL.
+COMPOSITOR.key.bind("focus-window-left-arrow", "Super+Left", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("left");
+});
+COMPOSITOR.key.bind("focus-window-right-arrow", "Super+Right", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("right");
+});
+COMPOSITOR.key.bind("focus-window-up-arrow", "Super+Up", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("up");
+});
+COMPOSITOR.key.bind("focus-window-down-arrow", "Super+Down", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("down");
+});
+COMPOSITOR.key.bind("focus-window-left-key", "Super+H", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("left");
+});
+COMPOSITOR.key.bind("focus-window-right-key", "Super+L", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("right");
+});
+COMPOSITOR.key.bind("focus-window-up-key", "Super+K", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("up");
+});
+COMPOSITOR.key.bind("focus-window-down-key", "Super+J", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("down");
+});
+
+// Directional movement: Super+Shift + arrow or HJKL.
+COMPOSITOR.key.bind("move-window-left-arrow", "Super+Shift+Left", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("left");
   scheduleWorkspaceBroadcast();
 });
-COMPOSITOR.key.bind("window-move-workspace-next", "Super+Shift+Down", () => {
-  HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1);
+COMPOSITOR.key.bind("move-window-right-arrow", "Super+Shift+Right", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("right");
   scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-up-arrow", "Super+Shift+Up", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("up");
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-down-arrow", "Super+Shift+Down", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("down");
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-left-key", "Super+Shift+H", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("left");
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-right-key", "Super+Shift+L", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("right");
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-up-key", "Super+Shift+K", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("up");
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("move-window-down-key", "Super+Shift+J", () => {
+  HYBRID_WINDOW_MANAGER.moveFocusedWindow("down");
+  scheduleWorkspaceBroadcast();
+});
+
+// Super+Ctrl+Left/Right stay intentional focus aliases.
+COMPOSITOR.key.bind("focus-window-left-alias", "Super+Ctrl+Left", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("left");
+});
+COMPOSITOR.key.bind("focus-window-right-alias", "Super+Ctrl+Right", () => {
+  HYBRID_WINDOW_MANAGER.focusWindow("right");
+});
+
+// Alt+Tab cycles visible non-minimized windows; Alt+Shift+Tab reverses.
+COMPOSITOR.key.bind("cycle-window-forward", "Alt+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleFocusedWindow(1);
+});
+COMPOSITOR.key.bind("cycle-window-backward", "Alt+Shift+Tab", () => {
+  HYBRID_WINDOW_MANAGER.cycleFocusedWindow(-1);
 });
 COMPOSITOR.key.bind("workspace-prev", "Super+Ctrl+Up", () => {
   HYBRID_WINDOW_MANAGER.switchWorkspace(-1);
@@ -775,6 +907,88 @@ COMPOSITOR.key.bind("workspace-next", "Super+Ctrl+Down", () => {
   HYBRID_WINDOW_MANAGER.switchWorkspace(1);
   scheduleWorkspaceBroadcast();
 });
+COMPOSITOR.key.bind("workspace-wheel-prev", "Super+WheelScrollUp", () => {
+  HYBRID_WINDOW_MANAGER.switchWorkspace(-1);
+  scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("workspace-wheel-next", "Super+WheelScrollDown", () => {
+  HYBRID_WINDOW_MANAGER.switchWorkspace(1);
+  scheduleWorkspaceBroadcast();
+});
+
+// Relative transfer of the focused window to the previous/next workspace.
+COMPOSITOR.key.bind(
+  "window-to-workspace-prev-key",
+  "Super+Ctrl+Shift+Left",
+  () => {
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1);
+    scheduleWorkspaceBroadcast();
+  },
+);
+COMPOSITOR.key.bind(
+  "window-to-workspace-next-key",
+  "Super+Ctrl+Shift+Right",
+  () => {
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1);
+    scheduleWorkspaceBroadcast();
+  },
+);
+COMPOSITOR.key.bind(
+  "window-to-workspace-prev-wheel",
+  "Super+Ctrl+Shift+WheelScrollUp",
+  () => {
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(-1);
+    scheduleWorkspaceBroadcast();
+  },
+);
+COMPOSITOR.key.bind(
+  "window-to-workspace-next-wheel",
+  "Super+Ctrl+Shift+WheelScrollDown",
+  () => {
+    HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspace(1);
+    scheduleWorkspaceBroadcast();
+  },
+);
+
+// Digit workspaces are the monitor's own ten workspaces: 1..0 maps to the
+// local slot carrying that digit on the monitor under the pointer (DP-3
+// 一..十, DP-2 甲..癸). The key chooses a monitor-local slot, so activation
+// passes the corresponding global index to the manager.
+function activateWorkspaceDigit(digit: number) {
+  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
+  if (!monitor) {
+    return;
+  }
+  HYBRID_WINDOW_MANAGER.activate(
+    monitor,
+    globalWorkspaceIndex(monitor, digit, COMPOSITOR.output.list),
+  );
+  scheduleWorkspaceBroadcast();
+}
+
+for (let digit = 1; digit <= 10; digit += 1) {
+  COMPOSITOR.key.bind(`workspace-${digit}`, `Super+${digit % 10}`, () => {
+    activateWorkspaceDigit(digit);
+  });
+  // Super+Shift+digit sends the focused window and follows it;
+  // Super+Ctrl+digit sends it without leaving the current workspace.
+  COMPOSITOR.key.bind(
+    `workspace-${digit}-move-follow`,
+    `Super+Shift+${digit % 10}`,
+    () => {
+      HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspaceIndex(digit, true);
+      scheduleWorkspaceBroadcast();
+    },
+  );
+  COMPOSITOR.key.bind(
+    `workspace-${digit}-move-silent`,
+    `Super+Ctrl+${digit % 10}`,
+    () => {
+      HYBRID_WINDOW_MANAGER.moveFocusedWindowToWorkspaceIndex(digit, false);
+      scheduleWorkspaceBroadcast();
+    },
+  );
+}
 
 let fpsCounter = false;
 COMPOSITOR.key.bind("fps", "Super+Shift+F", () => {
@@ -792,97 +1006,47 @@ COMPOSITOR.key.bind("rain-effects-toggle", "Super+Alt+E", () => {
   rainEffectsEnabled.update((enabled) => !enabled);
 });
 
-COMPOSITOR.output.configure((context) => {
+COMPOSITOR.output.configure(() => {
   const display: DisplayConfigDraft = {};
 
-  display["eDP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-    transform: "normal",
-  };
-  display["eDP-2"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.8,
-  };
-  display["HDMI-A-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-1"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
-  display["DP-4"] = {
-    mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.5,
-  };
+  // q's two panels. DP-2 (ultrawide) sits at the origin and DP-3 (2560x1440
+  // main) directly below it; both keep x=0 so XWayland never sees a negative
+  // coordinate and Wine/UE5 games can pick the right monitor size.
   display["DP-2"] = {
     mode: "extend",
-    resolution: "best",
-    position: "auto",
-    scale: 1.6,
+    resolution: { width: 3440, height: 1440, refreshRate: 180 },
+    position: { x: 0, y: 0 },
+    scale: 1,
   };
-
-  const isDocked = context.connected.some(
-    (output) => output.name === "HDMI-A-1",
-  );
-  if (isDocked) {
-    display["eDP-1"] = { mode: "disabled" };
-    display["eDP-2"] = { mode: "disabled" };
-  }
+  display["DP-3"] = {
+    mode: "extend",
+    resolution: { width: 2560, height: 1440, refreshRate: 240 },
+    position: { x: 0, y: 1440 },
+    scale: 1,
+  };
 
   return display;
 });
 
-COMPOSITOR.input.configure((input, _context) => {
+COMPOSITOR.input.configure((input) => {
   input.global = {
-    touchpad: {
-      tapToClick: true,
-      naturalScroll: true,
-      scrollMethod: "twoFinger",
-      disableWhileTyping: true,
-      scrollFactor: 0.3,
-    },
-    pointer: {
-      pointerAccel: 0.0,
-      accelProfile: "flat",
-      motionSpace: "logical",
-    },
     keyboard: {
-      options: "caps:ctrl_modifier",
-      repeatRate: 60,
+      layout: "us,ru",
+      options: "grp:caps_toggle,fkeys:basic_13-24",
+      repeatRate: 55,
       repeatDelay: 250,
     },
-  };
-
-  input.device["Razer Razer Blade Keyboard"] = {
-    keyboard: {
-      layout: "us",
+    pointer: {
+      pointerAccel: 0,
+      accelProfile: "flat",
+      naturalScroll: false,
     },
   };
 });
 
 HYBRID_WINDOW_MANAGER.configureWorkspaceGestureSpeed({
-  workspaceScrollFactor: 1.5,
-  workspaceScrollKineticFactor: 1,
   workspaceSwitchFactor: 1,
   workspaceSwitchVelocityFactor: 1,
-  // At or below this scroll speed (logical px/s) the workspace scroll
-  // catches on tile snap positions (fully-on-screen edges; center for
-  // maximized tiles). 0 disables snapping.
-  workspaceScrollSnapMaxVelocity: 600,
-  // Finger travel (logical px) needed to break out of a caught position.
-  workspaceScrollSnapBreakoutPx: 48,
 });
 
 COMPOSITOR.effect.background_effect = compileEffect({
@@ -1167,8 +1331,8 @@ COMPOSITOR.event.onClose((window) => {
 });
 
 COMPOSITOR.event.onFocus((window, focused) => {
-  HYBRID_WINDOW_MANAGER.onFocus(window, focused);
-  if (focused) {
+  const accepted = HYBRID_WINDOW_MANAGER.onFocus(window, focused);
+  if (focused && accepted) {
     HYBRID_WINDOW_MANAGER.recordFocus(window.id);
     scheduleWorkspaceBroadcast();
   }
@@ -1243,12 +1407,19 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
   scheduleWorkspaceBroadcast();
 });
 
+function usesClientDecoration(window: WaylandWindow): boolean {
+  const decoration = window.decoration();
+  return decoration.mode === "client" &&
+    !(decoration.clientPreference === "server" &&
+      decoration.configuredMode === "server");
+}
+
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
   if (rainVariantFor(window.appId()) !== undefined) {
-    // Unified frame: the selected pack's authored material ring (52px for 02,
-    // 26px for 06/09, 48px top for 07), or the legacy 26px ring while the
-    // selection is null. Positive L/R/B insets
+    // Unified frame: the selected pack's authored material ring (26px sides
+    // and bottom; top 26 for 02/06/09, 48 for the 07 beam), or the legacy
+    // fixed 26px ring while the selection is null. Positive L/R/B insets
     // reserve the rails and the native header occupies the top inset, so the
     // total overhead is left+right by top+bottom — and this is independent of
     // the rain-art toggle so target geometry never changes when art is off.
@@ -1260,22 +1431,18 @@ function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
       height: client.height + insets.top + insets.bottom,
     };
   }
+  const border = WINDOW_BORDER_PX;
+  const titlebar = TITLEBAR_HEIGHT;
   return {
-    x: client.x - WINDOW_BORDER_PX,
-    y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
-    width: client.width + WINDOW_BORDER_PX * 2,
-    height: client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2,
+    x: client.x - border,
+    y: client.y - titlebar - border,
+    width: client.width + border * 2,
+    height: client.height + titlebar + border * 2,
   };
 }
 
 COMPOSITOR.window.composition = (window: WaylandWindow) => {
-  const decoration = window.decoration();
-  const useClientDecoration =
-    decoration.mode === "client" &&
-    !(
-      decoration.clientPreference === "server" &&
-      decoration.configuredMode === "server"
-    );
+  const useClientDecoration = usesClientDecoration(window);
   const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
   const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
   const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
@@ -1319,6 +1486,14 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const inactive = computed(
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
   );
+  const inputEligible = window.state[WINDOW_STATE_WORKSPACE_INPUT_ELIGIBLE];
+  // Input target, not merely visual presence: an outgoing workspace keeps
+  // WORKSPACE_VISIBLE true while its transition renders, but only the active
+  // workspace may accept input. The dragged tile stays interactive across a
+  // workspace change, matching the existing tile-drag exception in `inactive`.
+  const interactive = computed(
+    () => !inactive() && (inputEligible() || tileDragging()),
+  );
 
   // Target identity is independent of the rain-art toggle: kitty/zen always
   // carry the unified frame and its native header, whether or not the
@@ -1333,29 +1508,19 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   // selection keeps LEGACY_RAIN_INSETS.
   const selectedPack = selectedRainlitPack();
   const rootInsets = selectedPack?.insets ?? LEGACY_RAIN_INSETS;
-
-  // Kitty's inner backdrop is the animated ambient glass, but only while the
-  // effects toggle is on; with the toggle off Kitty renders a bare
-  // ClientWindow like any other app. `null` doubles as the "do not wrap"
-  // signal in the unified-frame branch below. The ambient handle is used by
-  // the legacy (null) selection AND by pack 02, whose approved S-tier
-  // restoration puts the original two-lamp/rain backdrop back inside its
-  // timber ring; every other selected pack keeps its own runtime interior
-  // glass (and no longer compiles an interior for 02 at all). The sizes are
-  // keyed by the selected pack's actual insets, so the 26px legacy ring and
-  // pack 02's 52px timber never share a cached graph.
-  const rainTerminal =
-    rainDecorated() && rainVariantFor(window.appId()) === "terminal";
-  const ambientGlass =
-    rainTerminal && (selectedPack === null || selectedPack.id === "02")
-      ? ambientGlassFor(window, selectedPack?.insets ?? LEGACY_RAIN_INSETS)
-      : null;
-
-  const borderColor = window.isFocused((focused) =>
-    focused ? "#d7ba7d" : "#4f5666",
+  const borderWidth = computed(() => rainDecorated() ? RAIN_BORDER_PX : WINDOW_BORDER_PX);
+  const borderRadius = computed(() => rainDecorated() ? 0 : 10);
+  const resizeEdge = computed(() => rainDecorated() ? RAIN_BORDER_PX : 8);
+  const resizeCorner = computed(() => rainDecorated() ? 28 : 14);
+  const borderColor = computed(() =>
+    rainDecorated()
+      ? "#00000000"
+      : window.isFocused() ? "#d7ba7d" : "#4f5666",
   );
-  const titlebarBackground = window.isFocused((focused) =>
-    focused ? "#1f243080" : "#2a2f3a80",
+  const titlebarBackground = computed(() =>
+    rainDecorated()
+      ? window.isFocused() ? "#1c2530b0" : "#1c253090"
+      : window.isFocused() ? "#1f243080" : "#2a2f3a80",
   );
   const titleColor = window.isFocused((focused) =>
     focused ? "#f5f7fa" : "#c9d1d9",
@@ -1369,7 +1534,25 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     background: titlebarBackground,
   };
 
-  const backgroundShader = compileEffect({
+  // Kitty's inner backdrop is the animated ambient glass, but only while the
+  // effects toggle is on; with the toggle off Kitty renders a bare
+  // ClientWindow like any other app. `null` doubles as the "do not wrap"
+  // signal in the unified-frame branch below. The ambient handle is used by
+  // the legacy (null) selection AND by pack 02, whose approved S-tier
+  // restoration puts the original two-lamp/rain backdrop back inside its
+  // timber ring; every other selected pack keeps its own runtime interior
+  // glass (and no longer compiles an interior for 02 at all). The sizes are
+  // keyed by the selected pack's actual insets, so the 26px legacy ring and
+  // pack 02's 52px timber never share a cached graph.
+  const rainTerminal = rainDecorated() && rainVariantFor(window.appId()) === "terminal";
+  const ambientGlass =
+    rainTerminal && (selectedPack === null || selectedPack.id === "02")
+      ? ambientGlassFor(window, selectedPack?.insets ?? LEGACY_RAIN_INSETS)
+      : null;
+
+  // Legacy liquid-glass backdrop for the remaining non-target terminal windows
+  // (ghostty); untouched by the ambient composition work.
+  const legacyGlassShader = compileEffect({
     input: backdropSource(),
     capturePadding: 24,
     invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
@@ -1394,6 +1577,9 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
   });
 
+  // Legacy app icon for ordinary windows. The unified-frame targets (Kitty and
+  // Zen) render no icon and no title — their header is a flexible spacer plus
+  // the native min/max/close controls (see the `targetChrome` branch below).
   const appIcon = (
     <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
   );
@@ -1436,7 +1622,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   if (TERMINALS.includes(window.appId() ?? "")) {
     innerComponents = (
-      <ShaderEffect shader={backgroundShader} direction="column">
+      <ShaderEffect shader={legacyGlassShader} direction="column">
         <Box direction="row" style={titlebarStyle}>
           {appIcon}
           {label}
@@ -1464,7 +1650,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         forceRectSize={forceRectSize}
         tiled={tiled}
         idle={inactive}
-        interactive={inactive((value) => !value)}
+        interactive={interactive}
         // Permit low-latency tearing for fullscreen windows. The compositor only actually tears
         // once the window is on the direct-scanout fast path and is committing faster than the
         // refresh rate (i.e. games), so this is a no-op for ordinary fullscreen apps. Narrow it
@@ -1541,7 +1727,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         forceRectSize={forceRectSize}
         tiled={tiled}
         idle={inactive}
-        interactive={inactive((value) => !value)}
+        interactive={interactive}
       >
         <WindowBorder
           style={{
@@ -1611,12 +1797,12 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         forceRectSize={forceRectSize}
         tiled={tiled}
         idle={inactive}
-        interactive={inactive((value) => !value)}
+        interactive={interactive}
       >
         <WindowBorder
           style={{
-            border: { px: WINDOW_BORDER_PX, color: borderColor },
-            borderRadius: 10,
+            border: { px: borderWidth, color: borderColor },
+            borderRadius,
             background: "#10131900",
             padding: 0,
             paddingX: 0,
@@ -1624,8 +1810,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
           }}
           interaction={{
             resizeHitArea: {
-              edgePx: 8,
-              cornerPx: 14,
+              edgePx: resizeEdge,
+              cornerPx: resizeCorner,
             },
           }}
         >
@@ -1645,12 +1831,12 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       forceRectSize={forceRectSize}
       tiled={tiled}
       idle={inactive}
-      interactive={inactive((value) => !value)}
+      interactive={interactive}
     >
       <WindowBorder
         style={{
-          border: { px: WINDOW_BORDER_PX, color: borderColor },
-          borderRadius: 10,
+          border: { px: borderWidth, color: borderColor },
+          borderRadius,
           background: "#10131900",
           padding: 0,
           paddingX: 0,
@@ -1658,8 +1844,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         }}
         interaction={{
           resizeHitArea: {
-            edgePx: 8,
-            cornerPx: 14,
+            edgePx: resizeEdge,
+            cornerPx: resizeCorner,
           },
         }}
       >
