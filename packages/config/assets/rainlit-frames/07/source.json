@@ -1,0 +1,606 @@
+{
+  "id": "07",
+  "title": "Rainlit 07 - Lacquered Knot and Dolls",
+  "version": 1,
+  "master": {
+    "file": "master.webp",
+    "sha256": "9c8b21fd7ec24142c383b5c0655093d2a088b29098c18579574306ba7de1db8f",
+    "size": [
+      1536,
+      1024
+    ],
+    "mode": "RGB (no embedded alpha)",
+    "origin": ".superpowers/assets/rainlit-frame-concepts/07-painterly.webp"
+  },
+  "geometry": {
+    "opening_source": [
+      171,
+      1185,
+      191,
+      777
+    ],
+    "insets_logical": {
+      "left": 26,
+      "right": 26,
+      "top": 48,
+      "bottom": 26
+    },
+    "ring_outer_source": {
+      "left": 85,
+      "top": 32,
+      "right": 1271,
+      "bottom": 863
+    },
+    "alpha_atlas_per_source_px": 1.2093,
+    "logical_per_source_px": 0.30233,
+    "cells": {
+      "rail_top": [
+        2,
+        2,
+        1024,
+        192
+      ],
+      "rail_bottom": [
+        2,
+        196,
+        1024,
+        104
+      ],
+      "rail_left": [
+        1028,
+        196,
+        104,
+        512
+      ],
+      "rail_right": [
+        1134,
+        196,
+        104,
+        512
+      ],
+      "corner_tl": [
+        1240,
+        196,
+        168,
+        256
+      ],
+      "corner_tr": [
+        1410,
+        196,
+        168,
+        256
+      ],
+      "corner_bl": [
+        1580,
+        196,
+        168,
+        168
+      ],
+      "corner_br": [
+        1750,
+        196,
+        168,
+        168
+      ],
+      "knot": [
+        1920,
+        196,
+        119,
+        68
+      ],
+      "tassel_a": [
+        2,
+        710,
+        65,
+        276
+      ],
+      "tassel_b": [
+        69,
+        710,
+        51,
+        336
+      ]
+    },
+    "cell_measurements": {
+      "rail_top": {
+        "cell": [
+          2,
+          2,
+          1024,
+          192
+        ],
+        "opaque_fraction": 1.0,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          1023,
+          191
+        ]
+      },
+      "rail_bottom": {
+        "cell": [
+          2,
+          196,
+          1024,
+          104
+        ],
+        "opaque_fraction": 1.0,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          1023,
+          103
+        ]
+      },
+      "rail_left": {
+        "cell": [
+          1028,
+          196,
+          104,
+          512
+        ],
+        "opaque_fraction": 1.0,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          103,
+          511
+        ]
+      },
+      "rail_right": {
+        "cell": [
+          1134,
+          196,
+          104,
+          512
+        ],
+        "opaque_fraction": 1.0,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          103,
+          511
+        ]
+      },
+      "corner_tl": {
+        "cell": [
+          1240,
+          196,
+          168,
+          256
+        ],
+        "opaque_fraction": 0.9048,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          167,
+          255
+        ]
+      },
+      "corner_tr": {
+        "cell": [
+          1410,
+          196,
+          168,
+          256
+        ],
+        "opaque_fraction": 0.9048,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          167,
+          255
+        ]
+      },
+      "corner_bl": {
+        "cell": [
+          1580,
+          196,
+          168,
+          168
+        ],
+        "opaque_fraction": 0.8549,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          167,
+          167
+        ]
+      },
+      "corner_br": {
+        "cell": [
+          1750,
+          196,
+          168,
+          168
+        ],
+        "opaque_fraction": 0.8549,
+        "opaque_bbox_in_cell": [
+          0,
+          0,
+          167,
+          167
+        ]
+      },
+      "knot": {
+        "cell": [
+          1920,
+          196,
+          119,
+          68
+        ],
+        "opaque_fraction": 0.3641,
+        "opaque_bbox_in_cell": [
+          16,
+          1,
+          117,
+          66
+        ]
+      },
+      "tassel_a": {
+        "cell": [
+          2,
+          710,
+          65,
+          276
+        ],
+        "opaque_fraction": 0.3664,
+        "opaque_bbox_in_cell": [
+          11,
+          1,
+          63,
+          274
+        ]
+      },
+      "tassel_b": {
+        "cell": [
+          69,
+          710,
+          51,
+          336
+        ],
+        "opaque_fraction": 0.4576,
+        "opaque_bbox_in_cell": [
+          1,
+          1,
+          49,
+          325
+        ]
+      }
+    },
+    "reconstruction": {
+      "ring_model": "The declared ring (26 / 26 / 26 logical, 48 on top) is a clean rectangle whose source outer corner lands at (85, 32) under the uniform scale. The master's beams overhang the side rails (top beam x50..1306 against rails x85..171 / x1186..1271) and its corner feet continue below y863; that material lies outside the declared ring rectangle and is therefore not represented.",
+      "hardware_isotropy": "Measured beam and rail profiles carry no brass or hardware (max channel ~100-165, no specular islands), so nothing recognizable is mirrored, repeated or stretched. Every cell uses the single uniform factor 1.2093 source->atlas px, so no material is anisotropically scaled.",
+      "hardware_note": "The one lighter ochre panel in the master (x90..144 on the beam, left of the opening) sits outside the clean beam window used for the top rail and is not duplicated.",
+      "seams": "Each cell is authored from its own measured crops, so the corner<->rail junctions are mitre seams with a material phase change. Rails themselves repeat seamlessly: mirror-periodic construction makes the cell edges identical, so the wrap delta is zero and the rail period is exactly 256 logical horizontal / 128 logical vertical.",
+      "removed_moving_ornaments": "The red knot (y194..246) and both tassels (y234..508) were cut out of every static cell first: rail_left/rail_right and the corner rail zones use ornament-free rail windows, and corner_tl/corner_tr take their rail zone from the clean rail band. No second painted copy of a knot or tassel remains behind the moving sprites.",
+      "tassel_root_overlap": "The tassel sprites begin at the measured knot/cord junction, so a few rows of the knot's lower fringe ride inside them next to the pivot. At the authored amplitudes (+-0.03 rad) that fringe moves under 0.1 logical px, i.e. it coincides with the static knot."
+    },
+    "notes": {
+      "rail_top": {
+        "source_rows": [
+          101,
+          191
+        ],
+        "source_cols": [
+          320,
+          743
+        ],
+        "source_px": [
+          423,
+          90
+        ],
+        "construction": "mirror-periodic over a 423px hardware-free beam window; the declared 48-logical band is 158.8 source rows while the beam face measures 90, so the extra 68.8 rows repeat the beam's own wood face (rows 13..71) verbatim; the original dark rim + highlight sits at the outer edge and the original under-lip at the opening edge. No stretching."
+      },
+      "rail_bottom": {
+        "source_rows": [
+          779,
+          865
+        ],
+        "source_cols": [
+          320,
+          743
+        ],
+        "construction": "86 measured rows scaled to 104 atlas rows, mirror-periodic horizontally."
+      },
+      "rail_left": {
+        "source_rows": [
+          520,
+          732
+        ],
+        "source_cols": [
+          85,
+          171
+        ],
+        "construction": "only the ornament-free lower rail window is used, so the red knot (y194..246) and the tassels (y234..508) never enter the static cell; 212 rows scale to 256 and mirror to 512.",
+        "source_width_px": 86
+      },
+      "rail_right": {
+        "source_rows": [
+          300,
+          512
+        ],
+        "source_cols": [
+          1186,
+          1271
+        ],
+        "construction": "clean mid-rail window; 212 rows scale to 256 and mirror to 512.",
+        "source_width_px": 85
+      },
+      "corner_tl": {
+        "source_cols": [
+          85,
+          225
+        ],
+        "source_above_beam_rows": [
+          32,
+          101
+        ],
+        "construction": "own-column top band; real above-beam post composited over the extended wood; rail zone from the clean left rail band so the knot tip (x85..100, y196..244) and tassel roots are absent from the static cell."
+      },
+      "corner_tr": {
+        "source_cols": [
+          1131,
+          1271
+        ],
+        "construction": "mirror of corner_tl with the right rail band; inboard 16 logical stays transparent."
+      },
+      "corner_bl": {
+        "source_cols": [
+          85,
+          225
+        ],
+        "construction": "rail zone from the clean left rail band; bottom band from the own corner columns (no feet below the declared ring)."
+      },
+      "corner_br": {
+        "source_cols": [
+          1000,
+          1140
+        ],
+        "construction": "bottom band deliberately taken from a clean mid-beam window: the master's lower-right shelf and dolls sit at x>=1270 / y>=781 and must not appear in the derived frame atlas."
+      },
+      "knot": {
+        "source_box": [
+          10,
+          192,
+          108,
+          248
+        ],
+        "construction": "static red knot ribbon; alpha from flat-backdrop segmentation (no dark key)."
+      },
+      "tassel_a": {
+        "source_box": [
+          12,
+          232,
+          66,
+          460
+        ],
+        "root_source": [
+          50.5,
+          240.0
+        ],
+        "construction": "left tassel body + thread; swings about its measured thread root."
+      },
+      "tassel_b": {
+        "source_box": [
+          62,
+          232,
+          104,
+          510
+        ],
+        "root_source": [
+          74.5,
+          240.0
+        ],
+        "construction": "right tassel body + thread; swings about its measured thread root."
+      }
+    },
+    "layers": [
+      {
+        "id": "knot",
+        "cell": [
+          1920,
+          196,
+          119,
+          68
+        ],
+        "offset_logical": [
+          -22.67,
+          48.37
+        ],
+        "size_logical": [
+          29.63,
+          16.93
+        ],
+        "anchor": "tl",
+        "pivot_logical": [
+          0,
+          0
+        ]
+      },
+      {
+        "id": "tassel_a",
+        "cell": [
+          2,
+          710,
+          65,
+          276
+        ],
+        "offset_logical": [
+          -22.07,
+          60.47
+        ],
+        "size_logical": [
+          16.33,
+          68.93
+        ],
+        "anchor": "tl",
+        "pivot_logical": [
+          11.64,
+          2.42
+        ]
+      },
+      {
+        "id": "tassel_b",
+        "cell": [
+          69,
+          710,
+          51,
+          336
+        ],
+        "offset_logical": [
+          -6.95,
+          60.47
+        ],
+        "size_logical": [
+          12.7,
+          84.05
+        ],
+        "anchor": "tl",
+        "pivot_logical": [
+          3.78,
+          2.42
+        ]
+      }
+    ],
+    "outsets": {
+      "left": 24,
+      "right": 4,
+      "top": 2,
+      "bottom": 14
+    },
+    "dolls": {
+      "min": {
+        "bbox_src": [
+          1424,
+          659,
+          1472,
+          780
+        ],
+        "w_src": 48,
+        "h_src": 121,
+        "canvas": [
+          128,
+          176
+        ],
+        "opaque_fraction": 0.1004,
+        "offset_in_canvas": [
+          45,
+          78
+        ],
+        "draw_size": [
+          39,
+          98
+        ],
+        "pupils_canvas": [
+          [
+            59.6,
+            98.28
+          ],
+          [
+            69.33,
+            98.28
+          ]
+        ]
+      },
+      "max": {
+        "bbox_src": [
+          1362,
+          626,
+          1422,
+          780
+        ],
+        "w_src": 60,
+        "h_src": 154,
+        "canvas": [
+          128,
+          176
+        ],
+        "opaque_fraction": 0.1944,
+        "offset_in_canvas": [
+          40,
+          51
+        ],
+        "draw_size": [
+          49,
+          125
+        ],
+        "pupils_canvas": [
+          [
+            57.03,
+            76.95
+          ],
+          [
+            69.2,
+            76.95
+          ]
+        ]
+      },
+      "close": {
+        "bbox_src": [
+          1280,
+          563,
+          1360,
+          780
+        ],
+        "w_src": 80,
+        "h_src": 217,
+        "canvas": [
+          128,
+          176
+        ],
+        "opaque_fraction": 0.353,
+        "offset_in_canvas": [
+          32,
+          0
+        ],
+        "draw_size": [
+          65,
+          176
+        ],
+        "pupils_canvas": [
+          [
+            55.93,
+            34.06
+          ],
+          [
+            72.96,
+            34.06
+          ]
+        ]
+      }
+    }
+  },
+  "semantics": {
+    "rect": "[x, y, width, height] in atlas pixels",
+    "anchor": "point anchor: tl=(0,0), tr=(rootWidth,0), bl=(0,rootHeight), br=(rootWidth,rootHeight). offset is the layer TOP-LEFT translation from that point (signed, +x right, +y down); the renderer does not subtract the layer size.",
+    "pivot": "local logical pixel point from the layer top-left; angle in radians",
+    "parent_child": "a child's offset/pivot are relative to the parent's unrotated top-left; the renderer applies the parent rotation to the attachment point plus the accumulated child rotation.",
+    "emission": "RGB light gain (typically around 1) that preserves mask alpha; not a general opacity pulse. Authored emissive cells carry real region alpha, never a full-cell rectangle.",
+    "eyes": "separate per-role control opacity 0..1 (pack.controls.eyes*)",
+    "railPeriod": "logical repeat: horizontal 256, vertical 128"
+  },
+  "segmentation": {
+    "backdrop_rgb": [
+      35,
+      36,
+      40
+    ],
+    "method": "flat area-fill segmentation against the measured backdrop with a soft 10..28 distance ramp; no global dark-key, so the dolls' dark hair and the knot's shadowed folds stay opaque. Interior holes are flood-filled, then a 1px 3x3 blur feathers the contour."
+  },
+  "controls": {
+    "min": "indigo doll (left)",
+    "max": "ochre doll (middle)",
+    "close": "red doll (right)",
+    "canvas": [
+      128,
+      176
+    ],
+    "logical_size": [
+      32,
+      44
+    ],
+    "shots": "assets/rainlit-frames/07/doll-*.png (RGB + honest alpha), eyes-*.png (full-canvas glow)"
+  },
+  "unverified": "Runtime rendering, hit-testing, alpha compositing at real sizes, adaptive joins and motion timing are unverified by this builder. This tool only materialises the authored assets."
+}

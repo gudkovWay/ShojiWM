@@ -1,0 +1,478 @@
+{
+  "pack": "09",
+  "title": "Rain Charms & Paper Garlands",
+  "version": 1,
+  "generation": {
+    "provider": "openai-codex",
+    "model": "gpt-image-2-codex",
+    "catalog": "openai-codex/gpt-image-2",
+    "phase": "painterly"
+  },
+  "source": {
+    "master": "master.webp",
+    "master_sha256": "1f44c287907277f765b21f49868f9f0b335b88bfc5470e8cd30945a35ab4d838",
+    "master_size": [
+      1536,
+      1024
+    ],
+    "approved_master": "09-painterly.webp",
+    "approved_master_sha256": "1f44c287907277f765b21f49868f9f0b335b88bfc5470e8cd30945a35ab4d838",
+    "alpha_authority": "measured: no embedded alpha in the RGB master; alpha derived from backdrop connectivity (background/opening components of the flat backdrop colour are transparent, enclosed painted darks stay opaque). No global dark-key.",
+    "backdrop_rgb": [
+      33.0,
+      35.0,
+      40.0
+    ],
+    "alpha_source_sha256": "7e5d00ccca86aab65acdb57e48d29f97337f0f32712f2d4f8b4c0388be47f74a",
+    "alpha_range": [
+      0.0,
+      1.0
+    ]
+  },
+  "outputs": {
+    "frame_atlas": "frame-atlas.png",
+    "frame_atlas_sha256": "7cae1aaa2cb6f3c02a914f1c3b51256f85a5d1a86b3bbbba383a1eec53f818cd",
+    "frame_atlas_size": [
+      2048,
+      2048
+    ],
+    "frame_atlas_alpha": "straight RGBA; RGB zeroed exactly where alpha is zero",
+    "master_copy": "master.webp",
+    "master_copy_sha256": "1f44c287907277f765b21f49868f9f0b335b88bfc5470e8cd30945a35ab4d838"
+  },
+  "geometry": {
+    "master_origin_px": [
+      141.0,
+      119.0
+    ],
+    "source_px_per_logical": {
+      "x": 3.077,
+      "y": 3.192
+    },
+    "atlas_px_per_logical": 4.0,
+    "opening_source_px": [
+      221,
+      202,
+      1318,
+      796
+    ],
+    "frame_logical": [
+      408,
+      240
+    ],
+    "insets_logical": {
+      "left": 26,
+      "right": 26,
+      "top": 26,
+      "bottom": 26
+    },
+    "minimum_root_logical": [
+      240,
+      240
+    ],
+    "outsets_logical": {
+      "left": 48,
+      "right": 52,
+      "top": 14,
+      "bottom": 4
+    },
+    "sweep_budget_note": "the left cloth chain reaches y ~= 187 logical at rest (fabric heads 15.349 + 62.651 + 52.627, fabric-3 body 56.386) and swings to x ~= -44 at the 1x gust peak; the right paper chain swings to x ~= rootWidth + 48. The declared minimum root (240x240) contains the full vertical sweep when the ornament scale is 1, and the outsets (left 48, right 52) cover the full horizontal swing of both chains. Core scales ornament sizes/pivots/offsets by s = min(1, W/minW, H/minH), so the declared 240x240 support is truthful and smaller sizes are bounded rather than cropped.",
+    "root_anchor_note": "left-hand roots anchor to tl; mount_right and crane_1 anchor to tr with offsets measured from the source outer right edge (logical 408.2), so they track the actual window width; cranes 2/3 keep parent-local offsets.",
+    "note": "per-axis scale maps the master's own 80px left / 83px top rail to the declared 26px native inset; the right/bottom source rails are 79/90px so the drawn ring is a uniform 26 and the rail cells resample the real transverse profile."
+  },
+  "layer_transform_semantics": {
+    "anchor": "point: tl=(0,0), tr=(rootWidth,0), bl=(0,rootHeight), br=(rootWidth,rootHeight)",
+    "offset": "layer top-left translation from the anchor point, signed +x right / +y down",
+    "pivot": "local logical point from the layer's own top-left; angle in radians",
+    "parent": "child offset/pivot are relative to the parent's unrotated top-left; the renderer applies the parent rotation to the attachment point plus the accumulated child rotation",
+    "rail_period_logical": {
+      "horizontal": 256,
+      "vertical": 128
+    },
+    "emission_channel": "RGB light gain preserving the mask alpha (paper face / slits), not opacity"
+  },
+  "rails": {
+    "top": [
+      600,
+      119,
+      1380,
+      202
+    ],
+    "bottom": [
+      600,
+      796,
+      1300,
+      886
+    ],
+    "left": [
+      141,
+      202,
+      221,
+      796
+    ],
+    "right": [
+      1318,
+      202,
+      1397,
+      796
+    ],
+    "endpoint_method": "each rail is a real source transverse profile resampled to the common cell; the tail is cross-faded into the head over 56 px so the repeat is seam-free. Rails are cut from ornament-free source spans, so no charm, crane or bamboo copy is baked into a repeating cell."
+  },
+  "corners": {
+    "size": 168,
+    "source_windows": {
+      "corner_tl": [
+        141.0,
+        119.0,
+        270.231,
+        253.077
+      ],
+      "corner_tr": [
+        1267.769,
+        119.0,
+        1397.0,
+        253.077
+      ],
+      "corner_bl": [
+        141.0,
+        751.923,
+        270.231,
+        886.0
+      ],
+      "corner_br": [
+        1267.769,
+        751.923,
+        1397.0,
+        886.0
+      ]
+    },
+    "note": "four one-shot source-derived corner regions; never repeated. The top-left window also contains the fixed bamboo blind, which its own fixed layer redraws at the same source alignment on top, so no moving ornament is duplicated and no ornament is baked into a repeating rail"
+  },
+  "resampling": "premultiplied LANCZOS; straight RGB restored on write",
+  "cells": {
+    "rail_top": {
+      "atlas": [
+        0,
+        0,
+        1024,
+        104
+      ]
+    },
+    "rail_bottom": {
+      "atlas": [
+        0,
+        108,
+        1024,
+        104
+      ]
+    },
+    "rail_left": {
+      "atlas": [
+        0,
+        216,
+        104,
+        512
+      ]
+    },
+    "rail_right": {
+      "atlas": [
+        108,
+        216,
+        104,
+        512
+      ]
+    },
+    "corner_tl": {
+      "atlas": [
+        216,
+        216,
+        168,
+        168
+      ]
+    },
+    "corner_tr": {
+      "atlas": [
+        388,
+        216,
+        168,
+        168
+      ]
+    },
+    "corner_bl": {
+      "atlas": [
+        560,
+        216,
+        168,
+        168
+      ]
+    },
+    "corner_br": {
+      "atlas": [
+        732,
+        216,
+        168,
+        168
+      ]
+    },
+    "bamboo": {
+      "atlas": [
+        0,
+        736,
+        562,
+        152
+      ]
+    },
+    "mount_left": {
+      "atlas": [
+        572,
+        736,
+        96,
+        48
+      ]
+    },
+    "mount_right": {
+      "atlas": [
+        678,
+        736,
+        71,
+        53
+      ]
+    },
+    "fabric_1": {
+      "atlas": [
+        759,
+        736,
+        139,
+        256
+      ]
+    },
+    "fabric_2": {
+      "atlas": [
+        908,
+        736,
+        139,
+        215
+      ]
+    },
+    "fabric_3": {
+      "atlas": [
+        1057,
+        736,
+        139,
+        226
+      ]
+    },
+    "crane_1": {
+      "atlas": [
+        1206,
+        736,
+        151,
+        205
+      ]
+    },
+    "crane_2": {
+      "atlas": [
+        1367,
+        736,
+        151,
+        150
+      ]
+    },
+    "crane_3": {
+      "atlas": [
+        1528,
+        736,
+        151,
+        153
+      ]
+    }
+  },
+  "layers": {
+    "bamboo": {
+      "anchor": "tl",
+      "source_box": [
+        150,
+        85,
+        582,
+        206
+      ],
+      "offset": [
+        2.925,
+        -10.651
+      ],
+      "size": [
+        140.4,
+        37.904
+      ]
+    },
+    "mount_left": {
+      "anchor": "tl",
+      "source_box": [
+        64,
+        120,
+        138,
+        168
+      ],
+      "offset": [
+        -25.025,
+        0.313
+      ],
+      "size": [
+        24.05,
+        15.036
+      ]
+    },
+    "mount_right": {
+      "anchor": "tr",
+      "source_box": [
+        1398,
+        118,
+        1452,
+        160
+      ],
+      "offset": [
+        0.325,
+        -0.313
+      ],
+      "size": [
+        17.55,
+        13.157
+      ]
+    },
+    "fabric_1": {
+      "anchor": "tl",
+      "source_box": [
+        30,
+        168,
+        137,
+        372
+      ],
+      "offset": [
+        -36.075,
+        15.349
+      ],
+      "size": [
+        34.775,
+        63.904
+      ],
+      "pivot": [
+        18.85,
+        0.0
+      ]
+    },
+    "fabric_2": {
+      "anchor": "tl",
+      "source_box": [
+        30,
+        368,
+        137,
+        540
+      ],
+      "offset": [
+        0.0,
+        62.651
+      ],
+      "size": [
+        34.775,
+        53.88
+      ],
+      "pivot": [
+        18.85,
+        0.0
+      ],
+      "parent": "fabric_1"
+    },
+    "fabric_3": {
+      "anchor": "tl",
+      "source_box": [
+        30,
+        536,
+        137,
+        716
+      ],
+      "offset": [
+        0.0,
+        52.627
+      ],
+      "size": [
+        34.775,
+        56.386
+      ],
+      "pivot": [
+        17.875,
+        0.0
+      ],
+      "parent": "fabric_2"
+    },
+    "crane_1": {
+      "anchor": "tr",
+      "source_box": [
+        1400,
+        152,
+        1516,
+        316
+      ],
+      "offset": [
+        0.975,
+        10.337
+      ],
+      "size": [
+        37.7,
+        51.373
+      ],
+      "pivot": [
+        11.7,
+        0.0
+      ]
+    },
+    "crane_2": {
+      "anchor": "tl",
+      "source_box": [
+        1400,
+        312,
+        1516,
+        432
+      ],
+      "offset": [
+        0.0,
+        50.12
+      ],
+      "size": [
+        37.7,
+        37.59
+      ],
+      "pivot": [
+        15.6,
+        0.0
+      ],
+      "parent": "crane_1"
+    },
+    "crane_3": {
+      "anchor": "tl",
+      "source_box": [
+        1400,
+        430,
+        1516,
+        552
+      ],
+      "offset": [
+        0.0,
+        36.964
+      ],
+      "size": [
+        37.7,
+        38.217
+      ],
+      "pivot": [
+        15.925,
+        0.0
+      ],
+      "parent": "crane_2"
+    }
+  },
+  "omitted_source_objects": [
+    "the concept's lower-right/bottom exterior feet stay inside the corner cells; no ornament was replaced by a painted liner or padding"
+  ],
+  "not_claimed": "runtime placement, hit-testing, alpha compositing, adaptive joins and all-size behaviour are unverified; this file is provenance plus authored geometry, not a renderer proof",
+  "builder": "tools/build-rainlit-09.py"
+}

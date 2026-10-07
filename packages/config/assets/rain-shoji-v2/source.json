@@ -1,0 +1,442 @@
+{
+  "generation": {
+    "provider": "openai-codex",
+    "model": "gpt-image-2-codex",
+    "catalog": "openai-codex/gpt-image-2",
+    "phase": "static"
+  },
+  "source": {
+    "master": "master.webp",
+    "master_sha256": "be2e2c033aaefba45eaaa411299774ba118fc9ff32883884d50908f3a06f8d55",
+    "master_size": [
+      1536,
+      1024
+    ],
+    "alpha_authority": "embedded master alpha",
+    "alpha_channel_sha256": "8c7f704e6d3712e3f441b13cf420cab14e9f1be57918270bd000aff62a0d73ca",
+    "alpha_range": [
+      0,
+      254
+    ],
+    "note": "alpha is the extracted source alpha; the transparent central opening is genuine and the hidden RGB under it is not used as backing"
+  },
+  "outputs": {
+    "frame_atlas": "frame-atlas.png",
+    "frame_atlas_sha256": "be3b064f3d2dc96a1d782328be24b798a154c0832081aac469a6766473ea59ed",
+    "frame_atlas_size": [
+      1024,
+      1024
+    ],
+    "content_lantern": "content-lantern.png",
+    "content_lantern_sha256": "84c336b87318166e4e5bd87040a59ecd7f3e495b0fff39a81a664079390c7c0d",
+    "content_lantern_size": [
+      512,
+      1024
+    ],
+    "master_copy": "master.webp",
+    "master_copy_sha256": "be2e2c033aaefba45eaaa411299774ba118fc9ff32883884d50908f3a06f8d55",
+    "lantern_master_copy": "lantern-master.webp",
+    "lantern_master_copy_sha256": "6fc9be34aff1b1de9b8c41b268d4c0205477769c042ad522351f75be6b640abf",
+    "atlas_alpha": "straight RGBA; RGB zeroed exactly where alpha is zero"
+  },
+  "layout": {
+    "atlas_scale": "4 atlas px per logical px",
+    "rail_logical_px": 26,
+    "corner_logical_px": 42,
+    "rail_profile_atlas_px": 104,
+    "corner_atlas_px": 168,
+    "lamp_logical_px": [
+      26,
+      52
+    ],
+    "min_root_assumption": [
+      320,
+      240
+    ],
+    "rendering_scale_note": "rail transverse cells are 104 atlas px (26 logical, 52 device px at 2x); the atlas is sampled at native resolution and never shipped as a resized copy"
+  },
+  "resampling": {
+    "filter": "Pillow LANCZOS (high quality)",
+    "rail_transverse": "source full rail profile resampled to 104 atlas px; 85-95 original source px per cross axis (>=52)",
+    "rail_longitudinal": "seamless run resampled to the cell length (1024 top/bottom, 512 left/right)",
+    "fittings": "uniform (isotropic) resize preserving the fitting's natural offset from the measured outer corner; the corner's outer rim stays rail material",
+    "lamp": "one uniform fit of the whole lantern crop into the cell's inner 96x200 box, centred; straight-RGBA LANCZOS with the original alpha preserved"
+  },
+  "endpoint_method": {
+    "type": "wrap cross-fade",
+    "seam_source_px": 28,
+    "note": "the trailing source pixels are cross-faded into the leading source pixels so the cell's last column is the source column immediately before the first; no mirroring of grain or carving and no repeated corner fittings"
+  },
+  "rails": {
+    "top": {
+      "source_crop": [
+        250,
+        64,
+        1213,
+        159
+      ],
+      "source_size": [
+        95,
+        935
+      ],
+      "seam_source_px": 28,
+      "atlas_size": [
+        1024,
+        104
+      ]
+    },
+    "bottom": {
+      "source_crop": [
+        250,
+        824,
+        1184,
+        916
+      ],
+      "source_size": [
+        92,
+        906
+      ],
+      "seam_source_px": 28,
+      "atlas_size": [
+        1024,
+        104
+      ]
+    },
+    "left": {
+      "source_crop": [
+        60,
+        260,
+        146,
+        711
+      ],
+      "source_size": [
+        86,
+        423
+      ],
+      "seam_source_px": 28,
+      "atlas_size": [
+        104,
+        512
+      ]
+    },
+    "right": {
+      "source_crop": [
+        1373,
+        240,
+        1458,
+        687
+      ],
+      "source_size": [
+        85,
+        419
+      ],
+      "seam_source_px": 28,
+      "atlas_size": [
+        104,
+        512
+      ]
+    }
+  },
+  "corners": {
+    "TL": {
+      "fitting_source_crop": [
+        70,
+        82,
+        168,
+        182
+      ],
+      "fitting_source_size": [
+        98,
+        100
+      ],
+      "fitting_cell_rect": [
+        34,
+        37,
+        107,
+        109
+      ],
+      "outer_corner_source": [
+        39,
+        48
+      ],
+      "material_scale": 1.094737,
+      "profile_atlas_px": 104,
+      "cell_atlas_px": 168,
+      "mitre": "diagonal nearest-outer-contour selection: horizontal material where distance-to-horizontal-edge < distance-to-vertical-edge, vertical otherwise, so both perimeter contours stay continuous",
+      "mitre_aa_atlas_px": 1.5,
+      "support": "L-shaped stationary support built from the corresponding horizontal and vertical rail cross-sections and combined by a real mitre; outer rim is rail material, inner 64x64 atlas px square (the cap's inner 16 logical px) is transparent"
+    },
+    "TR": {
+      "fitting_source_crop": [
+        1352,
+        82,
+        1455,
+        182
+      ],
+      "fitting_source_size": [
+        103,
+        100
+      ],
+      "fitting_cell_rect": [
+        30,
+        37,
+        113,
+        109
+      ],
+      "outer_corner_source": [
+        1478,
+        48
+      ],
+      "material_scale": 1.094737,
+      "profile_atlas_px": 104,
+      "cell_atlas_px": 168,
+      "mitre": "diagonal nearest-outer-contour selection: horizontal material where distance-to-horizontal-edge < distance-to-vertical-edge, vertical otherwise, so both perimeter contours stay continuous",
+      "mitre_aa_atlas_px": 1.5,
+      "support": "L-shaped stationary support built from the corresponding horizontal and vertical rail cross-sections and combined by a real mitre; outer rim is rail material, inner 64x64 atlas px square (the cap's inner 16 logical px) is transparent"
+    },
+    "BL": {
+      "fitting_source_crop": [
+        70,
+        803,
+        168,
+        905
+      ],
+      "fitting_source_size": [
+        98,
+        102
+      ],
+      "fitting_cell_rect": [
+        34,
+        25,
+        107,
+        112
+      ],
+      "outer_corner_source": [
+        39,
+        933
+      ],
+      "material_scale": 1.094737,
+      "profile_atlas_px": 104,
+      "cell_atlas_px": 168,
+      "mitre": "diagonal nearest-outer-contour selection: horizontal material where distance-to-horizontal-edge < distance-to-vertical-edge, vertical otherwise, so both perimeter contours stay continuous",
+      "mitre_aa_atlas_px": 1.5,
+      "support": "L-shaped stationary support built from the corresponding horizontal and vertical rail cross-sections and combined by a real mitre; outer rim is rail material, inner 64x64 atlas px square (the cap's inner 16 logical px) is transparent"
+    },
+    "BR": {
+      "fitting_source_crop": [
+        1352,
+        803,
+        1446,
+        905
+      ],
+      "fitting_source_size": [
+        94,
+        102
+      ],
+      "fitting_cell_rect": [
+        30,
+        25,
+        103,
+        112
+      ],
+      "outer_corner_source": [
+        1478,
+        933
+      ],
+      "material_scale": 1.094737,
+      "profile_atlas_px": 104,
+      "cell_atlas_px": 168,
+      "mitre": "diagonal nearest-outer-contour selection: horizontal material where distance-to-horizontal-edge < distance-to-vertical-edge, vertical otherwise, so both perimeter contours stay continuous",
+      "mitre_aa_atlas_px": 1.5,
+      "support": "L-shaped stationary support built from the corresponding horizontal and vertical rail cross-sections and combined by a real mitre; outer rim is rail material, inner 64x64 atlas px square (the cap's inner 16 logical px) is transparent"
+    }
+  },
+  "lamp": {
+    "source": "lantern-master.webp",
+    "source_sha256": "6fc9be34aff1b1de9b8c41b268d4c0205477769c042ad522351f75be6b640abf",
+    "source_size": [
+      1024,
+      1536
+    ],
+    "replaces": "the previous paper-lantern object, formerly cropped from master.webp at LAMP_SOURCE (1430,692,1534,897) and packed top-aligned; the base atlas lamp cell is rewritten only when --replace-cells includes lamp (default: only when the rebuilt cell differs from the base)",
+    "source_crop": [
+      248,
+      48,
+      796,
+      1472
+    ],
+    "source_crop_size": [
+      548,
+      1424
+    ],
+    "cell_atlas_px": [
+      104,
+      208
+    ],
+    "fit_box_atlas_px": [
+      96,
+      200
+    ],
+    "scale": 0.14044944,
+    "resized_atlas_px": [
+      77,
+      200
+    ],
+    "offset_in_cell": [
+      13,
+      4
+    ],
+    "padding_atlas_px": [
+      13,
+      4,
+      14,
+      4
+    ],
+    "transform": "atlas_px = [cell_x + offset_x + (source_x - crop_x0) * scale, cell_y + offset_y + (source_y - crop_y0) * scale]",
+    "resampling": "Pillow LANCZOS over straight RGBA; the alpha channel is resampled with the colour, so original alpha and antialiased edges survive; hidden RGB under alpha 0 is purged by the atlas-wide alpha-0 zeroing",
+    "luminous_pane_source_centre": [
+      523.4,
+      947.7
+    ],
+    "luminous_pane_cell_centre": [
+      51.68,
+      130.36
+    ],
+    "luminous_pane_atlas_centre": [
+      619.68,
+      346.36
+    ],
+    "packing": "isotropic fit inside the cell with transparent padding on all four sides; the lantern is never stretched to fill the cell"
+  },
+  "content_lantern": {
+    "source": "lantern-master.webp",
+    "source_sha256": "6fc9be34aff1b1de9b8c41b268d4c0205477769c042ad522351f75be6b640abf",
+    "source_size": [
+      1024,
+      1536
+    ],
+    "file": "content-lantern.png",
+    "canvas": [
+      512,
+      1024
+    ],
+    "fit_box": [
+      464,
+      976
+    ],
+    "source_crop": [
+      248,
+      48,
+      796,
+      1472
+    ],
+    "source_crop_size": [
+      548,
+      1424
+    ],
+    "scale": 0.68539326,
+    "resized_size": [
+      376,
+      976
+    ],
+    "offset": [
+      68,
+      24
+    ],
+    "padding": [
+      68,
+      24,
+      68,
+      24
+    ],
+    "transform": "sprite_px = [offset_x + (source_x - crop_x0) * scale, offset_y + (source_y - crop_y0) * scale]",
+    "pane_source_centre": [
+      523.4,
+      947.7
+    ],
+    "pane_sprite_centre": [
+      256.76,
+      640.65
+    ],
+    "pane_normalized_centre": [
+      0.501479,
+      0.625633
+    ],
+    "resampling": "Pillow LANCZOS over straight RGBA; alpha is resampled with the colour so the original alpha and antialiased edges survive; hidden RGB under alpha 0 is purged on output",
+    "packing": "isotropic fit of the whole object crop inside the fit box, centred; never stretched and never filled with a background plane"
+  },
+  "correction": {
+    "base_atlas": ".superpowers/assets/visible-scene-repair-20261005T223258/candidate-before/assets/rain-shoji-v2/frame-atlas.png",
+    "requested_cells": [
+      "corners"
+    ],
+    "replaced_cells": [
+      "TL",
+      "TR",
+      "BL",
+      "BR"
+    ],
+    "preserved": "every base pixel outside the replaced cells, byte-for-byte"
+  },
+  "packed_cells": {
+    "top": [
+      0,
+      0,
+      1024,
+      104
+    ],
+    "bottom": [
+      0,
+      108,
+      1024,
+      104
+    ],
+    "left": [
+      0,
+      216,
+      104,
+      512
+    ],
+    "right": [
+      108,
+      216,
+      104,
+      512
+    ],
+    "TL": [
+      224,
+      216,
+      168,
+      168
+    ],
+    "TR": [
+      396,
+      216,
+      168,
+      168
+    ],
+    "BL": [
+      224,
+      388,
+      168,
+      168
+    ],
+    "BR": [
+      396,
+      388,
+      168,
+      168
+    ],
+    "lamp": [
+      568,
+      216,
+      104,
+      208
+    ]
+  },
+  "omitted_source_objects": [
+    "the original inward concave wooden scroll-braces are omitted as whole elements, not cropped off; the candidate opening is strictly rectangular"
+  ],
+  "not_claimed": "full-master preservation; the atlas rebuilds the frame as a layered structural design from source material",
+  "runtime": "provenance only; no renderer fields are implied"
+}

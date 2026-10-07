@@ -24,12 +24,23 @@ import {
   type DisplayConfigDraft,
   compilePopupEffect,
   popupSource,
+  animationVariable,
+  signal,
 } from "shoji_wm";
-import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
+import type {
+  CompiledEffectHandle,
+  CompositionRenderable,
+  MaybeSignal,
+  ManagedWindowRect,
+  WindowEffectAssignment,
+  WindowEffectHandle,
+} from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
 import {
   HybridWindowManager,
   TITLEBAR_HEIGHT,
+  type HybridWindowManagerSnapshot,
+  type WindowDecorationOutsets,
   WINDOW_BORDER_PX,
   WINDOW_STATE_FULLSCREEN,
   WINDOW_STATE_MINIMIZED,
@@ -45,6 +56,40 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 import { ISLAND_GLASS } from "./effect/island-glass";
+import { createAmbientGlassEffect } from "./effect/ambient-content";
+import {
+  ACTIVE_COMPOSITION,
+  AMBIENT_PERIOD_MS,
+} from "./effect/ambient-composition";
+import { createRainFrameEffect } from "./effect/rain-frame";
+import { createRainWeatherEffect } from "./effect/rain-weather";
+import { RAIN_BORDER_PX } from "./effect/rain-layout";
+import {
+  RainCloseButton,
+  RainMaximizeButton,
+  RainMinimizeButton,
+} from "./effect/rain-controls";
+// Rainlit frame packs: the runtime module imports the four authored pack
+// modules purely (no asset loading, no effect compilation, no selection side
+// effects at load). Pack 02 is the declared startup default; an explicit
+// `{ id: null }` selection keeps the legacy pipeline below.
+import {
+  headerPadding,
+  rainlitFor,
+  rainlitForgetInspection,
+  rainlitSceneInspect,
+  rainlitSelection,
+  rainlitStatus,
+  rainlitStop,
+  selectedRainlitPack,
+  setRainlitSelection,
+  type RainlitEdges,
+  type RainlitFrameId,
+} from "./effect/rainlit/runtime";
+import {
+  RainlitDollControls,
+  RainlitWoodControls,
+} from "./effect/rainlit/controls";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -71,30 +116,225 @@ COMPOSITOR.window.decoration.configure((_window, context) => {
   return { mode: context.clientPreference ?? "server" };
 });
 
-const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
+const ZERO_DECORATION_OUTSETS: WindowDecorationOutsets = {
+  left: 0,
+  right: 0,
+  top: 0,
+  bottom: 0,
+};
+
+/**
+ * External decoration footprint per window: the selected Rainlit pack's
+ * authored outsets for currently recognized targets, zero otherwise
+ * (non-target apps, null selection, fullscreen). Derived from the selected
+ * pack only — never from the rain-art toggle — so target geometry stays
+ * stable when the art is switched off.
+ */
+function decorationOutsetsFor(window: WaylandWindow): WindowDecorationOutsets {
+  if (
+    window.isFullscreen() ||
+    window.state[WINDOW_STATE_FULLSCREEN]() ||
+    rainVariantFor(window.appId()) === undefined
+  ) {
+    return ZERO_DECORATION_OUTSETS;
+  }
+  return selectedRainlitPack()?.outsets ?? ZERO_DECORATION_OUTSETS;
+}
+
+const HYBRID_WINDOW_MANAGER = new HybridWindowManager(
+  naturalRootRect,
+  decorationOutsetsFor,
+);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 const FULLSCREEN_Z_INDEX = 2_000_000_000;
 const FLOATING_WINDOW_Z_INDEX_BASE = 1_500_000_000;
 const WINDOW_STACK_Z_INDEX_RANGE = 100_000_000;
 const FOCUSED_TILED_WINDOW_Z_INDEX = 1_000_000_000;
 const REORDERING_TILED_WINDOW_Z_INDEX = -2_000_000_000;
+const RAIN_EFFECTS_STATE = "config.rain-effects-enabled";
+// Own reload key for the explicit Rainlit frame selection. The value is the
+// full `{ id, reducedMotion }` policy; the startup default is pack "02", and a
+// restored `id: null` keeps the legacy frame. Only `rainlit.frames.select`
+// (or the restore of a previously persisted selection) changes it.
+const RAINLIT_SELECTION_STATE = "config.rainlit-selection";
+const rainEffectsEnabled = signal(true);
+const ambientPhase = animationVariable("ambient-shoji-phase");
+const rainFrameCache = new WeakMap<
+  WaylandWindow,
+  {
+    variant: RainVariant;
+    titlebarHeight: number;
+    assignment: WindowEffectAssignment;
+  }
+>();
+const ambientGlassCache = new WeakMap<
+  WaylandWindow,
+  Record<string, CompiledEffectHandle>
+>();
+const legacyWeatherCache = new WeakMap<WaylandWindow, WindowEffectHandle>();
+const legacyAmbientAssignmentCache =
+  new WeakMap<WaylandWindow, WindowEffectAssignment>();
+
+/**
+ * App-surface identity: Kitty owns a compositor backdrop; Zen owns browser CSS.
+ * Both share the same static structural frame.
+ */
+type RainVariant = "terminal" | "browser";
+
+function rainVariantFor(appId: string | undefined): RainVariant | undefined {
+  switch (appId?.toLowerCase()) {
+    case "kitty":
+      return "terminal";
+    case "zen":
+      return "browser";
+    default:
+      return undefined;
+  }
+}
+
+/** Exact `rainlit.frames.select` / restore id validation (no coercion). */
+function isRainlitFrameId(value: unknown): value is RainlitFrameId {
+  return value === "02" || value === "06" || value === "07" || value === "09";
+}
+
+/**
+ * Logical root insets for the unified frame come from the selected pack's
+ * authored insets (52px for 02, 26px for 06/09, and 48px top for 07);
+ * this constant is the legacy 26px ring used when the selection is null.
+ * Geometry is deliberately independent of the rain-art toggle, so
+ * native chrome and the reserved opening never move when art is switched off.
+ */
+const LEGACY_RAIN_INSETS: RainlitEdges = {
+  left: RAIN_BORDER_PX,
+  right: RAIN_BORDER_PX,
+  top: RAIN_BORDER_PX,
+  bottom: RAIN_BORDER_PX,
+};
+
+/**
+ * Compiled ambient backdrop handle for one window and one content-inset
+ * bucket, created once and reused for that window's whole lifetime. The
+ * per-window native animation signal is bound at creation; the parent only
+ * starts/stops that signal, so no per-frame compilation or allocation happens
+ * here.
+ *
+ * The bucket key is the inset totals (horizontal x vertical): a 26px <-> 52px
+ * selection change resolves a different cached handle instead of rebuilding,
+ * and — critically — each cached graph's mapped size proxies capture the
+ * inset math of ITS bucket, so a callback can never read a later selection's
+ * geometry from an earlier graph. At most two buckets are ever live per
+ * window.
+ */
+function ambientGlassFor(
+  window: WaylandWindow,
+  insets: RainlitEdges,
+): CompiledEffectHandle {
+  const key = `${insets.left + insets.right}:${insets.top + insets.bottom}`;
+  let buckets = ambientGlassCache.get(window);
+  if (!buckets) {
+    buckets = {};
+    ambientGlassCache.set(window, buckets);
+  }
+  let glass = buckets[key];
+  if (!glass) {
+    // The ambient ShaderEffect (and the client opening it backs) sits inside
+    // the frame's reserved rails, so its logical rect is the root minus the
+    // selected pack's authored insets — 104 x 104 for pack 02's 52px timber on
+    // every side, 52 x 52 for the legacy 26px ring plus 26px header row.
+    // Mapped proxies, never cached values, so resizes keep flowing into the
+    // uniform without recompiling; clamped to 1 so a degenerate rect can never
+    // invert the lantern box or the rain grid.
+    const contentSize = [
+      window.state[WINDOW_STATE_RECT]((rect) =>
+        Math.max(1, read(rect.width) - (insets.left + insets.right)),
+      ),
+      window.state[WINDOW_STATE_RECT]((rect) =>
+        Math.max(1, read(rect.height) - (insets.top + insets.bottom)),
+      ),
+    ] as [MaybeSignal<number>, MaybeSignal<number>];
+    glass = createAmbientGlassEffect(
+      window.animation.variable(ambientPhase),
+      ACTIVE_COMPOSITION,
+      contentSize,
+    );
+    buckets[key] = glass;
+  }
+  return glass;
+}
+
+/**
+ * Compiled legacy weather handle for one window (pack 02 Kitty only). The
+ * approved S-tier restoration reuses the original content-aware droplet optics
+ * as the pack's `replace` assignment, compiled once per window with the same
+ * stable mapped root-size proxies the legacy branch binds — never per tick.
+ * `borderPx` is the reserved rail width the shaders keep clear of: pack 02
+ * passes its authored 52px instead of the legacy 26px ring.
+ */
+function legacyWeatherFor(
+  window: WaylandWindow,
+  borderPx: number,
+): WindowEffectHandle {
+  let weather = legacyWeatherCache.get(window);
+  if (!weather) {
+    const frameSize = [
+      window.state[WINDOW_STATE_RECT]((rect) => read(rect.width)),
+      window.state[WINDOW_STATE_RECT]((rect) => read(rect.height)),
+    ] as [MaybeSignal<number>, MaybeSignal<number>];
+    weather = createRainWeatherEffect(
+      window.animation.variable(ambientPhase),
+      ACTIVE_COMPOSITION,
+      frameSize,
+      borderPx,
+    );
+    legacyWeatherCache.set(window, weather);
+  }
+  return weather;
+}
 
 COMPOSITOR.onDisable((event) => {
   if (event.isReloading) {
     const snapshot = HYBRID_WINDOW_MANAGER.snapshot();
     event.persist(HOT_RELOAD_WINDOW_MANAGER_STATE, snapshot);
+    event.persist(RAIN_EFFECTS_STATE, rainEffectsEnabled.peek());
+    // Persist the explicit frame policy; a `null` id persists as legacy.
+    event.persist(RAINLIT_SELECTION_STATE, rainlitSelection.peek());
   }
   HYBRID_WINDOW_MANAGER.dispose();
 });
 
 COMPOSITOR.onEnable((event) => {
   if (event.isReloading) {
-    const snapshot = event.restore<
-      ReturnType<typeof HYBRID_WINDOW_MANAGER.snapshot>
-    >(HOT_RELOAD_WINDOW_MANAGER_STATE);
+    // Rain policy first: every restored window's root insets and decoration
+    // outsets derive from the selected pack, so the selection must be in
+    // place before the manager snapshot re-applies any geometry.
+    const rainEnabled = event.restore<boolean>(RAIN_EFFECTS_STATE);
+    if (rainEnabled !== undefined) {
+      rainEffectsEnabled.set(rainEnabled);
+    }
+    // Restore only a valid policy. Missing or malformed state keeps startup
+    // pack 02; an explicit null remains the legacy alternative.
+    const restoredSelection = event.restore<unknown>(RAINLIT_SELECTION_STATE);
+    if (restoredSelection && typeof restoredSelection === "object") {
+      const { id, reducedMotion } = restoredSelection as {
+        id?: unknown;
+        reducedMotion?: unknown;
+      };
+      if (
+        (id === null || isRainlitFrameId(id)) &&
+        typeof reducedMotion === "boolean"
+      ) {
+        setRainlitSelection(id, reducedMotion);
+      }
+    }
+    const snapshot = event.restore<HybridWindowManagerSnapshot>(
+      HOT_RELOAD_WINDOW_MANAGER_STATE,
+    );
     if (snapshot) {
       HYBRID_WINDOW_MANAGER.restore(snapshot);
     }
+    // Re-fit restored tiled/maximized/snapped roots with the restored pack's
+    // insets and outsets; owner state (floats, restore rects, focus) is kept.
+    HYBRID_WINDOW_MANAGER.refreshUsableAreaLayouts(true);
   }
 });
 
@@ -199,6 +439,94 @@ WORKSPACE_IPC.handle("windows.activate", (params) => {
     HYBRID_WINDOW_MANAGER.activateWindowById(windowId);
     scheduleWorkspaceBroadcast();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Rainlit frame selection (bounded native API on the existing IPC server):
+//   rainlit.frames.get     -> RainlitStatus  (configured selection + authored
+//                            catalog; runtimeVerified is always false)
+//   rainlit.frames.select  { id: null|'02'|'06'|'07'|'09', reducedMotion?: bool }
+//                          (command) -> RainlitStatus
+// Pack 02 is the cold-start default. IPC selections survive hot reload only;
+// no picker or frame-selection keybinding is registered here.
+// ---------------------------------------------------------------------------
+WORKSPACE_IPC.handle("rainlit.frames.get", () => rainlitStatus());
+WORKSPACE_IPC.handle("rainlit.frames.select", (params) => {
+  const request = params as { id?: unknown; reducedMotion?: unknown } | undefined;
+  if (!request || typeof request !== "object" || !("id" in request)) {
+    throw new Error(
+      "rainlit.frames.select: params must be an object with an id of null or 02/06/07/09",
+    );
+  }
+  const { id, reducedMotion } = request;
+  if (id !== null && !isRainlitFrameId(id)) {
+    throw new Error(
+      "rainlit.frames.select: id must be null or one of 02/06/07/09",
+    );
+  }
+  if (reducedMotion !== undefined && typeof reducedMotion !== "boolean") {
+    throw new Error(
+      "rainlit.frames.select: reducedMotion must be a boolean when present",
+    );
+  }
+  const current = rainlitSelection();
+  // An omitted reducedMotion retains the current policy; on the very first
+  // selection that is the default `false`.
+  const nextReducedMotion =
+    reducedMotion === undefined ? current.reducedMotion : reducedMotion;
+  if (current.id !== id || current.reducedMotion !== nextReducedMotion) {
+    setRainlitSelection(id, nextReducedMotion);
+    // Re-apply window layouts so the new pack's insets AND per-window
+    // decoration outsets take effect on already-open windows. `force` bypasses
+    // the unchanged-tile-viewport optimization: a selection change alters
+    // window geometry even when the viewport rect did not move.
+    HYBRID_WINDOW_MANAGER.refreshUsableAreaLayouts(true);
+  }
+  return rainlitStatus();
+});
+
+// ---------------------------------------------------------------------------
+//   rainlit.scene.inspect -> { scenes: RainlitSceneInspect & { output }[] }
+// Read-only observation of ALREADY CACHED scene runtimes: native story-clock
+// seconds/phase plus root/client/capture rects in GLOBAL OUTPUT logical
+// coordinates (capture includes the pack's decoration outsets, ready for a
+// scoped grim -g of the named window) and the carrying output's bounds and
+// scale. No titles/text/palette, no runtime construction, no seek/control
+// API; the inspector never changes selection.
+// ---------------------------------------------------------------------------
+WORKSPACE_IPC.handle("rainlit.scene.inspect", () => {
+  const scenes = [];
+  for (const window of HYBRID_WINDOW_MANAGER.listWindows()) {
+    const info = rainlitSceneInspect(window);
+    if (!info) continue;
+    // Resolve the carrying output by the window centre in global logical
+    // coordinates; `resolution / scale` is the logical size (see OutputInfo).
+    const centerX = info.root.x + info.root.width / 2;
+    const centerY = info.root.y + info.root.height / 2;
+    let output: {
+      name: string;
+      scale: number;
+      rect: { x: number; y: number; width: number; height: number };
+    } | null = null;
+    for (const name of COMPOSITOR.output.list) {
+      const candidate = COMPOSITOR.output.current[name];
+      if (!candidate?.resolution) continue;
+      const ox = candidate.position.x;
+      const oy = candidate.position.y;
+      const ow = candidate.resolution.width / candidate.scale;
+      const oh = candidate.resolution.height / candidate.scale;
+      if (centerX >= ox && centerX < ox + ow && centerY >= oy && centerY < oy + oh) {
+        output = {
+          name,
+          scale: candidate.scale,
+          rect: { x: ox, y: oy, width: ow, height: oh },
+        };
+        break;
+      }
+    }
+    scenes.push({ ...info, output });
+  }
+  return { scenes };
 });
 
 // ---------------------------------------------------------------------------
@@ -460,6 +788,10 @@ COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
   COMPOSITOR.debug.enableProfile(profileEnabled);
 });
 
+COMPOSITOR.key.bind("rain-effects-toggle", "Super+Alt+E", () => {
+  rainEffectsEnabled.update((enabled) => !enabled);
+});
+
 COMPOSITOR.output.configure((context) => {
   const display: DisplayConfigDraft = {};
 
@@ -630,6 +962,149 @@ COMPOSITOR.effect.popup = (popup) => {
   };
 };
 
+COMPOSITOR.effect.window = (window) => {
+  const variant = rainVariantFor(window.appId());
+  const selectedPack = selectedRainlitPack();
+  const visible =
+    window.state[WINDOW_STATE_WORKSPACE_VISIBLE]() ||
+    window.state[WINDOW_STATE_TILE_DRAGGING]();
+  if (
+    !variant ||
+    !rainEffectsEnabled() ||
+    window.isFullscreen() ||
+    window.state[WINDOW_STATE_FULLSCREEN]() ||
+    window.state[WINDOW_STATE_MINIMIZED]() ||
+    window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE]() ||
+    !visible
+  ) {
+    // Disabled/hidden/fullscreen/minimized targets own no moving art: stop
+    // the legacy ambient clock and every Rainlit pack track. `rainlitStop`
+    // stops the owned tracks but KEEPS the bounded cached graphs, so
+    // re-showing resumes the remaining phase instead of rebuilding.
+    window.animation.stop(ambientPhase);
+    rainlitStop(window);
+    return null;
+  }
+
+  // A selected pack owns the unified frame: its runtime supplies the in-front
+  // frame assignment and its own native motion tracks. Pack 02 Kitty is the
+  // exception by owner imperative: it restores the approved S-tier ambient —
+  // the ORIGINAL 96s ambient clock (started below) driving the legacy ambient
+  // backdrop composed in `ambientGlassFor`, plus the legacy content-aware
+  // weather `replace` compiled at pack 02's 52px rail width. The pack's own
+  // 120s frame/story clock stays a SEPARATE intentional clock inside
+  // `runtime.sync`. Every other selected pack keeps its tracks stopped and
+  // returns the runtime assignment unchanged.
+  if (selectedPack) {
+    const runtime = rainlitFor(window);
+    if (runtime) {
+      // Focus is read here so this effect re-runs on focus changes and feeds
+      // the runtime's smooth native focus track; `terminal` only marks the
+      // Kitty interior as relevant (frame motion is app-independent).
+      runtime.sync(visible, window.isFocused(), variant === "terminal");
+      if (selectedPack.id === "02" && variant === "terminal") {
+        // Reduced motion freezes the ambient clock: the frozen phase still
+        // renders the static lantern/rain backdrop, exactly like the
+        // runtime's own stopped rest snapshot.
+        if (rainlitSelection().reducedMotion) {
+          window.animation.stop(ambientPhase);
+        } else if (!window.animation.running(ambientPhase)) {
+          window.animation.start(ambientPhase, {
+            duration: AMBIENT_PERIOD_MS,
+            from: 0,
+            to: 1,
+            repeat: "loop",
+          });
+        }
+        // The composed assignment is cached so its identity stays stable
+        // across sync calls (the compositor is handed the same object, and
+        // the weather handle is compiled once per window).
+        let assignment = legacyAmbientAssignmentCache.get(window);
+        if (!assignment) {
+          assignment = {
+            inFront: runtime.assignment.inFront,
+            replace:
+              ACTIVE_COMPOSITION !== "moonlit-ink"
+                ? legacyWeatherFor(window, selectedPack.insets.left)
+                : null,
+          };
+          legacyAmbientAssignmentCache.set(window, assignment);
+        }
+        return assignment;
+      }
+      window.animation.stop(ambientPhase);
+      return runtime.assignment;
+    }
+    return null;
+  }
+
+  // Legacy selection (null): stop any pack runtime left over from a previous
+  // selection, then continue the unchanged legacy pipeline below.
+  rainlitStop(window);
+
+  // One 96s ambient clock per visible Kitty target, driving the inner backdrop
+  // composition. Zen has no compositor ambient, so its clock is always
+  // stopped. The parent starts the clock here — before the backdrop handle is
+  // selected in `ambientGlassFor` — and stops it under the disabled/hidden/
+  // fullscreen/minimized gates above.
+  if (variant === "terminal") {
+    if (!window.animation.running(ambientPhase)) {
+      window.animation.start(ambientPhase, {
+        duration: AMBIENT_PERIOD_MS,
+        from: 0,
+        to: 1,
+        repeat: "loop",
+      });
+    }
+  } else {
+    window.animation.stop(ambientPhase);
+  }
+
+  // Every window reaching this branch is a unified-frame target: the client
+  // opening always starts at the 26px border with a 26px native header above
+  // it, so the frame reserves titlebar 0 for both CSD and SSD targets.
+  const titlebarHeight = 0;
+  let cached = rainFrameCache.get(window);
+  if (!cached || cached.variant !== variant || cached.titlebarHeight !== titlebarHeight) {
+    // Mapped WINDOW_STATE_RECT proxies, never cached computed values.
+    const frameSize = [
+      window.state[WINDOW_STATE_RECT]((rect) => read(rect.width)),
+      window.state[WINDOW_STATE_RECT]((rect) => read(rect.height)),
+    ] as [MaybeSignal<number>, MaybeSignal<number>];
+    // The assignment retains this handle for the window's lifetime. Kitty
+    // alone gets local weather, sharing the frame's mapped geometry; Zen and
+    // moonlit-ink keep their existing client rendering.
+    const weather =
+      variant === "terminal" && ACTIVE_COMPOSITION !== "moonlit-ink"
+        ? createRainWeatherEffect(
+            window.animation.variable(ambientPhase),
+            ACTIVE_COMPOSITION,
+            frameSize,
+          )
+        : null;
+    cached = {
+      variant,
+      titlebarHeight,
+      // The native foreground frame is static: it is composited in front of
+      // the client, never replacing it, and is never animated. The ambient
+      // motion lives in the inner backdrop ShaderEffect (`ambientGlassFor`).
+      // Only Kitty additionally carries `replace`, which swaps the captured
+      // client surface for the lamp-lit, rain-lensed version while keeping
+      // the original alpha; the rain shaders only distort their local areas
+      // inside the client opening.
+      assignment: {
+        inFront: createRainFrameEffect(
+          window.isFocused((focused) => (focused ? 1 : 0)),
+          frameSize,
+        ),
+        replace: weather,
+      },
+    };
+    rainFrameCache.set(window, cached);
+  }
+  return cached.assignment;
+};
+
 // Chromium-family clients repaint their CSD shadow margins as transparent
 // black — while still declaring the whole surface opaque — the moment they
 // send set_minimized, assuming the surface will never be shown again. Honoring
@@ -685,6 +1160,9 @@ COMPOSITOR.event.onStartClose((window) => {
 
 COMPOSITOR.event.onClose((window) => {
   HYBRID_WINDOW_MANAGER.onClose(window);
+  // Drop the inspection registry entry for the closed id so a same-id window
+  // created later starts from a clean slate (bounded lifetime, one per id).
+  rainlitForgetInspection(window.id);
   scheduleWorkspaceBroadcast();
 });
 
@@ -767,6 +1245,21 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
 
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
+  if (rainVariantFor(window.appId()) !== undefined) {
+    // Unified frame: the selected pack's authored material ring (52px for 02,
+    // 26px for 06/09, 48px top for 07), or the legacy 26px ring while the
+    // selection is null. Positive L/R/B insets
+    // reserve the rails and the native header occupies the top inset, so the
+    // total overhead is left+right by top+bottom — and this is independent of
+    // the rain-art toggle so target geometry never changes when art is off.
+    const insets = selectedRainlitPack()?.insets ?? LEGACY_RAIN_INSETS;
+    return {
+      x: client.x - insets.left,
+      y: client.y - insets.top,
+      width: client.width + insets.left + insets.right,
+      height: client.height + insets.top + insets.bottom,
+    };
+  }
   return {
     x: client.x - WINDOW_BORDER_PX,
     y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
@@ -826,6 +1319,37 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const inactive = computed(
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
   );
+
+  // Target identity is independent of the rain-art toggle: kitty/zen always
+  // carry the unified frame and its native header, whether or not the
+  // painted rain art is enabled. `rainDecorated` below only decides art.
+  const targetVariant = rainVariantFor(window.appId());
+  const targetChrome = targetVariant !== undefined;
+  const rainDecorated = computed(
+    () => rainEffectsEnabled() && rainVariantFor(window.appId()) !== undefined,
+  );
+  // Selected Rainlit pack: its authored root insets drive the unified-frame
+  // geometry independently of the art toggle (`rootInsets` below); a null
+  // selection keeps LEGACY_RAIN_INSETS.
+  const selectedPack = selectedRainlitPack();
+  const rootInsets = selectedPack?.insets ?? LEGACY_RAIN_INSETS;
+
+  // Kitty's inner backdrop is the animated ambient glass, but only while the
+  // effects toggle is on; with the toggle off Kitty renders a bare
+  // ClientWindow like any other app. `null` doubles as the "do not wrap"
+  // signal in the unified-frame branch below. The ambient handle is used by
+  // the legacy (null) selection AND by pack 02, whose approved S-tier
+  // restoration puts the original two-lamp/rain backdrop back inside its
+  // timber ring; every other selected pack keeps its own runtime interior
+  // glass (and no longer compiles an interior for 02 at all). The sizes are
+  // keyed by the selected pack's actual insets, so the 26px legacy ring and
+  // pack 02's 52px timber never share a cached graph.
+  const rainTerminal =
+    rainDecorated() && rainVariantFor(window.appId()) === "terminal";
+  const ambientGlass =
+    rainTerminal && (selectedPack === null || selectedPack.id === "02")
+      ? ambientGlassFor(window, selectedPack?.insets ?? LEGACY_RAIN_INSETS)
+      : null;
 
   const borderColor = window.isFocused((focused) =>
     focused ? "#d7ba7d" : "#4f5666",
@@ -948,6 +1472,130 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         allowTearing={true}
       >
         <ClientWindow />
+      </ManagedWindow>
+    );
+  }
+
+  // Unified frame: the selected pack's authored insets on the sides, bottom
+  // and top (52px for 02's substantial timber, 48px top for 07, 26px for the
+  // legacy ring and other packs), all covered by the same painted material. The header
+  // carries only the always-visible native close/min/max controls (no app
+  // icon, no title) and is real captured native UI, so the frame shader can
+  // paint it over the wood rail. It is deliberately independent of
+  // `rainEffectsEnabled`: Zen's profile CSS hides its own window buttons, so
+  // toggling the rain art off may only switch the rails to plain wooden
+  // colours — it must never remove the controls or the reserved geometry.
+  if (targetChrome) {
+    const artActive = rainDecorated();
+    const rootWidth = window.state[WINDOW_STATE_RECT]((rect) => read(rect.width));
+    const headerStyle: SSDStyle = {
+      height: rootInsets.top,
+      // 02's physical brass controls sit left of its one-shot corner joinery.
+      // Narrow roots return padding before the stable 120px control row clips;
+      // other packs retain the original shared eye-reflection layout.
+      paddingX: selectedPack?.id === "02" && artActive
+        ? rootWidth((width) =>
+            Math.min(64, Math.max(8, (width - rootInsets.left - rootInsets.right - 120) / 2)),
+          )
+        : rootWidth(headerPadding),
+      gap: rootWidth((width) => (width < 190 ? 2 : 4)),
+      alignItems: "center",
+      background: artActive ? "#00000000" : "#49363F",
+    };
+    // The pack runtime is built only for a visible, non-fullscreen,
+    // non-minimized target with art active — the same gates
+    // `COMPOSITOR.effect.window` uses — so a hidden or fullscreen pass never
+    // compiles effects. `runtime.glass` is non-null only for Kitty.
+    const rainlitVisible =
+      window.state[WINDOW_STATE_WORKSPACE_VISIBLE]() ||
+      window.state[WINDOW_STATE_TILE_DRAGGING]();
+    const rainlitRuntime =
+      selectedPack !== null &&
+      artActive &&
+      rainlitVisible &&
+      !window.isFullscreen() &&
+      !window.state[WINDOW_STATE_MINIMIZED]() &&
+      !window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE]()
+        ? rainlitFor(window)
+        : null;
+    const rainlitGlass = rainlitRuntime?.glass ?? null;
+    // Selected art uses its material-matched native controls; toggle-off and
+    // the other packs retain the standard plaques and their stable hit boxes.
+    const headerControls: CompositionRenderable[] =
+      artActive && selectedPack?.id === "07" && rainlitRuntime
+        ? [<RainlitDollControls window={window} runtime={rainlitRuntime} />]
+        : artActive && selectedPack?.id === "02" && rainlitRuntime
+          ? [<RainlitWoodControls window={window} runtime={rainlitRuntime} />]
+          : [
+              <RainMinimizeButton window={window} />,
+              <RainMaximizeButton window={window} />,
+              <RainCloseButton window={window} />,
+            ];
+
+    return (
+      <ManagedWindow
+        rect={managedRect}
+        zIndex={zIndex}
+        visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
+        opacity={workspaceOpacity}
+        forceRectSize={forceRectSize}
+        tiled={tiled}
+        idle={inactive}
+        interactive={inactive((value) => !value)}
+      >
+        <WindowBorder
+          style={{
+            // Per-edge border widths are not implemented by this runtime.
+            // Reserve the painted rails with supported positive insets instead;
+            // the top is fully covered by the native header above the client.
+            border: { px: 0, color: "#00000000" },
+            paddingLeft: rootInsets.left,
+            paddingRight: rootInsets.right,
+            paddingBottom: rootInsets.bottom,
+            paddingTop: 0,
+            borderRadius: 0,
+            background: artActive ? "#00000000" : "#49363F",
+          }}
+          interaction={{
+            // A small resize band only: button actions win hit-testing, and
+            // the rest of the 26px header stays draggable rather than acting
+            // as a full-width resize surface.
+            resizeHitArea: { edgePx: 4, cornerPx: 32 },
+          }}
+        >
+          <Box direction="column">
+            <Box direction="row" style={headerStyle}>
+              {/* No icon or title for the unified-frame targets: a flexible
+                  spacer keeps the genuine min/max/close controls flush right. */}
+              <Box style={{ flexGrow: 1 }} />
+              {headerControls}
+            </Box>
+            {rainlitGlass ? (
+              // Selected pack (other than 02), Kitty only: the pack runtime's
+              // own interior backdrop wraps the client exactly like the legacy
+              // ambient handle. Pack 02 falls through to the approved legacy
+              // ambient glass below, because its runtime interior is no longer
+              // compiled.
+              <ShaderEffect
+                shader={rainlitGlass}
+                direction="column"
+                style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}
+              >
+                <ClientWindow />
+              </ShaderEffect>
+            ) : ambientGlass ? (
+              <ShaderEffect
+                shader={ambientGlass}
+                direction="column"
+                style={{ flexGrow: 1, flexShrink: 1, minHeight: 0 }}
+              >
+                <ClientWindow />
+              </ShaderEffect>
+            ) : (
+              <ClientWindow />
+            )}
+          </Box>
+        </WindowBorder>
       </ManagedWindow>
     );
   }

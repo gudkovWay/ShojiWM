@@ -1,0 +1,412 @@
+{
+  "pack": "06",
+  "title": "Rainlit bronze, celadon and ceramic lamp",
+  "design": {
+    "master": "06-painterly.webp",
+    "generator": {
+      "provider": "openai-codex",
+      "model": "gpt-image-2-codex",
+      "catalog": "openai-codex/gpt-image-2",
+      "quality": "low",
+      "record": ".superpowers/assets/rainlit-frame-concepts/painterly-generation-record.json"
+    },
+    "authority": "design refined from the retained 06 bronze/ceramic concept per .superpowers/assets/rainlit-frame-concepts/selection.md"
+  },
+  "source": {
+    "master": "master.webp",
+    "master_sha256": "e0b3d26b0f68cb9cf96158d884a5568a87487f2c5f9bb5649671f7a610cf7cec",
+    "master_size": [
+      1536,
+      1024
+    ],
+    "master_mode": "RGB",
+    "alpha_authority": "none embedded; honest alpha is derived here by semantic segmentation (material vs opening/background) and, for the corners, replaced by the square native L-mask",
+    "note": "the approved master is RGB without an alpha channel; the transparent client opening is authored here, not extracted"
+  },
+  "measured_geometry_px": {
+    "note": "measured from the master by radial inner-edge detection and directional scans; NOT certified masks",
+    "outer": [
+      123.0,
+      114.0,
+      1361.0,
+      835.0
+    ],
+    "inner_square": [
+      166.0,
+      163.0,
+      1314.0,
+      786.0
+    ],
+    "band_thickness": {
+      "top": 49.0,
+      "bottom": 49.0,
+      "left": 43.0,
+      "right": 47.0
+    },
+    "inner_corner_rounding": {
+      "note": "the source painterly master rounds the inner opening at the corners; the inner contour measured by radial rays pulls away from the square corner especially at top-right and bottom-right",
+      "corner_repair": "the square native L-mask (26 logical arm) is forced; the rounded fillet and any dark pocket inside the material are filled by edge-extension inpainting from real adjacent material, never by a dark liner or padding"
+    }
+  },
+  "atlas": {
+    "cell": "frame-atlas.png",
+    "sha256": "0a616dd0da7ce0feb582659bb5513476c5feab59e2576f72fc7e262e0cf49941",
+    "size": [
+      2048,
+      2048
+    ],
+    "scale_px_per_logical": 4,
+    "gutter_px": 2,
+    "alpha": "straight RGBA; RGB zeroed exactly where alpha is zero; transparent gutters"
+  },
+  "cells": {
+    "rail_top": {
+      "rect": [
+        0,
+        0,
+        1024,
+        104
+      ],
+      "logical_size": [
+        256,
+        26
+      ]
+    },
+    "rail_bottom": {
+      "rect": [
+        0,
+        108,
+        1024,
+        104
+      ],
+      "logical_size": [
+        256,
+        26
+      ]
+    },
+    "rail_left": {
+      "rect": [
+        0,
+        216,
+        104,
+        512
+      ],
+      "logical_size": [
+        26,
+        128
+      ]
+    },
+    "rail_right": {
+      "rect": [
+        108,
+        216,
+        104,
+        512
+      ],
+      "logical_size": [
+        26,
+        128
+      ]
+    },
+    "corner_tl": {
+      "rect": [
+        0,
+        732,
+        168,
+        168
+      ],
+      "logical_size": [
+        42,
+        42
+      ]
+    },
+    "corner_tr": {
+      "rect": [
+        172,
+        732,
+        168,
+        168
+      ],
+      "logical_size": [
+        42,
+        42
+      ]
+    },
+    "corner_bl": {
+      "rect": [
+        0,
+        904,
+        168,
+        168
+      ],
+      "logical_size": [
+        42,
+        42
+      ]
+    },
+    "corner_br": {
+      "rect": [
+        172,
+        904,
+        168,
+        168
+      ],
+      "logical_size": [
+        42,
+        42
+      ]
+    },
+    "pendant_hook": {
+      "rect": [
+        344,
+        732,
+        92,
+        204
+      ],
+      "logical_size": [
+        23,
+        51
+      ]
+    },
+    "pendant": {
+      "rect": [
+        344,
+        940,
+        132,
+        500
+      ],
+      "logical_size": [
+        33,
+        125
+      ]
+    },
+    "lamp": {
+      "rect": [
+        480,
+        732,
+        368,
+        624
+      ],
+      "logical_size": [
+        92,
+        156
+      ]
+    },
+    "lamp_slits": {
+      "rect": [
+        852,
+        732,
+        368,
+        624
+      ],
+      "logical_size": [
+        92,
+        156
+      ]
+    },
+    "lamp_sheen": {
+      "rect": [
+        1224,
+        732,
+        368,
+        624
+      ],
+      "logical_size": [
+        92,
+        156
+      ]
+    }
+  },
+  "logical_contract": {
+    "insets": {
+      "left": 26,
+      "right": 26,
+      "top": 26,
+      "bottom": 26
+    },
+    "outsets": {
+      "left": 39,
+      "right": 94,
+      "top": 1,
+      "bottom": 52
+    },
+    "corner_size": {
+      "top": [
+        42,
+        42
+      ],
+      "bottom": [
+        42,
+        42
+      ]
+    },
+    "rail_period": {
+      "horizontal": 256,
+      "vertical": 128
+    },
+    "minimum_root": [
+      240,
+      160
+    ],
+    "atlas_path": "./assets/rainlit-frames/06/frame-atlas.png",
+    "anchor_semantics": "anchor is a frame-corner point; tl=(0,0), tr=(rootWidth,0), bl=(0,rootHeight), br=(rootWidth,rootHeight); offset translates the layer top-left from that point (+x right, +y down, no automatic size subtraction); pivot is a local logical point from the layer top-left; angle is radians",
+    "emission_semantics": "the emission channel is an RGB light gain around 1.0 that preserves the overlay mask alpha; overlay cells carry the real region alpha of the lit apertures / material sheen, never a full rectangle",
+    "unused_atlas_space": "ignored by the renderer; only the referenced rail/corner/layer cells are drawn"
+  },
+  "layers": {
+    "pendant_hook": {
+      "role": "fixed patinated bracket that the paper pendant hangs from",
+      "offset": [
+        -23,
+        0
+      ],
+      "logical_size": [
+        23,
+        51
+      ],
+      "static": true
+    },
+    "pendant": {
+      "role": "left paper pendant with its cord, pivots about the cord attachment",
+      "offset": [
+        -35,
+        17
+      ],
+      "logical_size": [
+        33,
+        125
+      ],
+      "pivot": [
+        12,
+        3
+      ],
+      "angle_channel": "pendant"
+    },
+    "lamp": {
+      "role": "celadon ceramic lamp on its existing mount, fixed; the sculpture neither swings nor breathes",
+      "offset": [
+        1,
+        -105
+      ],
+      "logical_size": [
+        92,
+        156
+      ],
+      "static": true
+    },
+    "lamp_slits": {
+      "role": "emissive overlay: the three real lit apertures of the lamp",
+      "offset": [
+        1,
+        -105
+      ],
+      "logical_size": [
+        92,
+        156
+      ],
+      "emission_channel": "slit"
+    },
+    "lamp_sheen": {
+      "role": "weak local warm reflection on the celadon and nearby bronze",
+      "offset": [
+        1,
+        -105
+      ],
+      "logical_size": [
+        92,
+        156
+      ],
+      "emission_channel": "sheen"
+    }
+  },
+  "lamp_apertures": {
+    "note": "measured amber-lit apertures of the ceramic lamp; each carries its own relative gain so one lamp drives three apertures of different brightness rather than three unrelated lights",
+    "crop_origin_px": [
+      1362,
+      648
+    ],
+    "measurement": "warmth(R-B)>=70 and luminance>=130 within the lamp crop; at that threshold the two celadon ribs keep the three apertures separate (a looser threshold merges them into one blob)",
+    "components": [
+      {
+        "component": [
+          40,
+          144,
+          83,
+          224
+        ],
+        "source_area_px": 1517,
+        "touches_crop_border": false,
+        "relative_gain": 0.971
+      },
+      {
+        "component": [
+          84,
+          144,
+          113,
+          219
+        ],
+        "source_area_px": 1224,
+        "touches_crop_border": false,
+        "relative_gain": 0.988
+      },
+      {
+        "component": [
+          115,
+          144,
+          128,
+          213
+        ],
+        "source_area_px": 798,
+        "touches_crop_border": false,
+        "relative_gain": 1.0
+      }
+    ]
+  },
+  "provenance": {
+    "builder": "tools/build-rainlit-06.py",
+    "source_crops_px": {
+      "rail_top_span": [
+        230,
+        1180
+      ],
+      "rail_bottom_span": [
+        250,
+        1200
+      ],
+      "rail_left_span": [
+        220,
+        760
+      ],
+      "rail_right_span": [
+        281,
+        670
+      ],
+      "pendant_hook": [
+        82,
+        114,
+        122,
+        205
+      ],
+      "pendant": [
+        60,
+        145,
+        118,
+        368
+      ],
+      "lamp": [
+        1362,
+        648,
+        1526,
+        926
+      ]
+    },
+    "resampling": "each cell is resized from its measured source span; rails are cross-faded at their longitudinal endpoints so the repeating tile is seamless; ornament art is scaled isotropically at 1.78 source px per logical px",
+    "originals_preserved": "the approved master is retained unchanged in .superpowers/assets/rainlit-frame-concepts/ and copied here byte-identically"
+  },
+  "not_claimed": [
+    "no embedded alpha existed in the master; derived alpha is a segmentation result and visual correctness is unverified",
+    "native render, joins, seams, alpha, hit-testing, adaptive sizing and reduced-motion are unverified",
+    "the lamp aperture count and per-aperture gains are measurements of the painterly master, not a claim about any real lamp"
+  ],
+  "unverified": true
+}
