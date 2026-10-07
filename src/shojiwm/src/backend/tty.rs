@@ -2,7 +2,8 @@ use std::hash::{Hash, Hasher};
 
 use crate::backend::signature::{SignatureHasher, hash_debug};
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, hash_map::Entry},
     os::fd::AsRawFd,
     path::Path,
     sync::{
@@ -29,7 +30,8 @@ use smithay::{
         },
         egl::{EGLContext, EGLDisplay, context::ContextPriority},
         renderer::{
-            Bind, Color32F, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen, Renderer,
+            Bind, Color32F, ContextId, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen,
+            Renderer,
             Texture,
             damage::OutputDamageTracker,
             element::{
@@ -9114,6 +9116,264 @@ fn log_gap_readback_edge_probes(
     }
 }
 
+/// A window effect's captured source is reclaimed once it has gone unused for
+/// this long, but reclamation is lazy: the deadline is evaluated when the cache
+/// is next touched by a window effect capture (lookup or insert), not by an idle
+/// timer. Entries left behind by closed windows, closed popups and retitled
+/// layers therefore linger until the next capture sweeps the cache, and a
+/// quiescent session keeps them; the entry-count and texture-byte budgets below
+/// still bound idle memory, so the cache cannot grow without a capture to sweep.
+const WINDOW_EFFECT_SOURCE_CACHE_TTL: Duration = Duration::from_secs(2);
+const WINDOW_EFFECT_SOURCE_CACHE_MAX_ENTRIES: usize = 128;
+/// Retained captured-source texture budget (RGBA8, 4 bytes per pixel). A single
+/// capture larger than the whole budget is used uncached rather than being kept.
+const WINDOW_EFFECT_SOURCE_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+struct WindowEffectSourceCacheEntry {
+    /// Output connector name. Owned so lookups compare borrowed names without
+    /// allocating on a hit.
+    output_name: String,
+    /// Window subject id. Owned for the same reason.
+    window_id: String,
+    /// Effect slot placement, a compile-time constant.
+    placement: &'static str,
+    snapshot: snapshot::LiveWindowSnapshot,
+    tracker: OutputDamageTracker,
+    /// The expanded capture rect the snapshot was taken for. A location or size
+    /// change here forces a full redraw so aged damage cannot go stale.
+    rect: crate::ssd::LogicalRect,
+    scale: Scale<f64>,
+    /// Output geometry the capture origin was derived from; a move forces a full
+    /// redraw for the same reason as `rect`.
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    /// `snapshot::render_element_scene_signature` of the captured elements.
+    source_signature: u64,
+    /// Shader program reload epoch the capture belongs to. A reload invalidates
+    /// the captured pixels even when the source scene is itself unchanged.
+    reload_epoch: u64,
+    context_id: ContextId<GlesTexture>,
+    last_used: Instant,
+    texture_bytes: usize,
+}
+
+thread_local! {
+    /// Bounded per-thread source capture cache for window effect slots. Keyed by
+    /// (output, subject id, placement); captures are never shared across
+    /// placements because each placement captures its own expanded rect and
+    /// element set (frame outsets differ per slot, so e.g. a frame lens and the
+    /// underlying window source must not alias). A flat vec is enough: the cache
+    /// holds a handful of entries in practice and is hard capped below, so a
+    /// linear scan beats a hashed key that would allocate on every lookup.
+    static WINDOW_EFFECT_SOURCE_CAPTURES: RefCell<Vec<WindowEffectSourceCacheEntry>> =
+        RefCell::new(Vec::new());
+}
+
+fn sweep_window_effect_source_caches(now: Instant) {
+    WINDOW_EFFECT_SOURCE_CAPTURES.with(|cache| {
+        cache
+            .borrow_mut()
+            .retain(|entry| now.duration_since(entry.last_used) <= WINDOW_EFFECT_SOURCE_CACHE_TTL);
+    });
+}
+
+fn purge_window_effect_source_caches_for_output(output_name: &str) {
+    WINDOW_EFFECT_SOURCE_CAPTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let before = cache.len();
+        cache.retain(|entry| entry.output_name != output_name);
+        let removed = before - cache.len();
+        if removed > 0 {
+            debug!(
+                output_name,
+                removed,
+                "purged window effect source captures for output"
+            );
+        }
+    });
+}
+
+fn evict_window_effect_source_entries(
+    cache: &mut Vec<WindowEffectSourceCacheEntry>,
+    reserved_bytes: usize,
+) {
+    let total_bytes = |cache: &[WindowEffectSourceCacheEntry]| {
+        cache.iter().map(|entry| entry.texture_bytes).sum::<usize>()
+    };
+    while cache.len() + 1 > WINDOW_EFFECT_SOURCE_CACHE_MAX_ENTRIES
+        || total_bytes(&cache[..]) + reserved_bytes > WINDOW_EFFECT_SOURCE_CACHE_BUDGET_BYTES
+    {
+        // Evict by least-recent use; removing by index with `swap_remove` moves
+        // the owned key fields out with the entry, so no key clone is needed.
+        let Some(victim) = cache
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        cache.swap_remove(victim);
+    }
+}
+
+/// Captures the source scene for a window effect slot, reusing the previous
+/// frame's captured texture when the subject is unchanged (same renderer
+/// context, capture rect, scale, output geometry, shader reload epoch and source
+/// scene signature). An unchanged source is not recaptured even when the
+/// effect's shader phase differs — shader phase changes are handled by the
+/// effect pipeline cache, not here. On a changed subject the previous snapshot
+/// texture and its damage tracker are handed back to
+/// [`capture_snapshot_from_output_elements`] so an unchanged-size recapture
+/// reuses the buffer; a changed size is reallocated by the capture machinery.
+/// The damage tracker is reset to a zero-sized one whenever the capture rect,
+/// scale, output geometry or shader reload epoch changes, which forces a full
+/// redraw and clears aged damage that could otherwise leave stale regions. A
+/// renderer context mismatch discards both the texture and the tracker.
+#[allow(clippy::too_many_arguments)]
+fn window_effect_source_snapshot(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    rect: crate::ssd::LogicalRect,
+    scale: Scale<f64>,
+    window_id: &str,
+    placement: &'static str,
+    source_signature: u64,
+    window_elements: &[TtyRenderElements],
+) -> Result<Option<snapshot::LiveWindowSnapshot>, GlesError> {
+    let context_id = renderer.context_id();
+    // `Output::name` returns an owned `String`; call it once and reuse it for
+    // both the lookup and, only on a brand-new entry, the stored key.
+    let output_name = output.name();
+    let now = Instant::now();
+    sweep_window_effect_source_caches(now);
+    let reload_epoch = crate::backend::shader_effect::shader_program_reload_epoch();
+
+    let reused = WINDOW_EFFECT_SOURCE_CAPTURES.with(|cache| -> Option<snapshot::LiveWindowSnapshot> {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|entry| {
+            entry.output_name == output_name
+                && entry.window_id == window_id
+                && entry.placement == placement
+        })?;
+        let is_hit = {
+            let entry = &cache[index];
+            entry.context_id == context_id
+                && entry.rect == rect
+                && entry.scale == scale
+                && entry.output_geo == output_geo
+                && entry.source_signature == source_signature
+                && entry.reload_epoch == reload_epoch
+        };
+        if !is_hit {
+            return None;
+        }
+        cache[index].last_used = now;
+        Some(cache[index].snapshot.clone())
+    });
+    if let Some(snapshot) = reused {
+        return Ok(Some(snapshot));
+    }
+
+    // Take the existing entry for this key, if any, so its owned key fields and
+    // damage tracker are reused instead of reallocated.
+    let existing_entry = WINDOW_EFFECT_SOURCE_CAPTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|entry| {
+            entry.output_name == output_name
+                && entry.window_id == window_id
+                && entry.placement == placement
+        });
+        index.map(|index| cache.swap_remove(index))
+    });
+    let (entry_output_name, entry_window_id, existing, mut tracker) = match existing_entry {
+        Some(entry) => {
+            let WindowEffectSourceCacheEntry {
+                output_name: key_output_name,
+                window_id: key_window_id,
+                snapshot,
+                tracker,
+                rect: entry_rect,
+                scale: entry_scale,
+                output_geo: entry_output_geo,
+                reload_epoch: entry_reload_epoch,
+                context_id: entry_context_id,
+                ..
+            } = entry;
+            if entry_context_id == context_id {
+                // Same context: keep the texture buffer. The tracker is carried
+                // over only while the capture geometry and shader epoch are
+                // unchanged; any change forces a fresh zero-sized tracker, which
+                // makes `capture_snapshot` take the full-redraw path and drop
+                // aged damage.
+                let geometry_or_epoch_changed = entry_rect != rect
+                    || entry_scale != scale
+                    || entry_output_geo != output_geo
+                    || entry_reload_epoch != reload_epoch;
+                let tracker = if geometry_or_epoch_changed {
+                    OutputDamageTracker::new((0, 0), 1.0, Transform::Normal)
+                } else {
+                    tracker
+                };
+                (key_output_name, key_window_id, Some(snapshot), tracker)
+            } else {
+                // Renderer context mismatch evicts the texture and tracker
+                // entirely: they belong to the old context. A fresh tracker makes
+                // the next capture a full redraw, so aged damage can never go
+                // stale.
+                (
+                    key_output_name,
+                    key_window_id,
+                    None,
+                    OutputDamageTracker::new((0, 0), 1.0, Transform::Normal),
+                )
+            }
+        }
+        None => (
+            output_name,
+            window_id.to_string(),
+            None,
+            OutputDamageTracker::new((0, 0), 1.0, Transform::Normal),
+        ),
+    };
+    let Some(snapshot) = capture_snapshot_from_output_elements(
+        renderer,
+        output_geo,
+        rect,
+        scale,
+        existing,
+        &mut tracker,
+        window_elements,
+    )?
+    else {
+        return Ok(None);
+    };
+    let size = snapshot.texture.size();
+    let texture_bytes = size.w as usize * size.h as usize * 4;
+    if texture_bytes <= WINDOW_EFFECT_SOURCE_CACHE_BUDGET_BYTES {
+        WINDOW_EFFECT_SOURCE_CAPTURES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            evict_window_effect_source_entries(&mut cache, texture_bytes);
+            cache.push(WindowEffectSourceCacheEntry {
+                output_name: entry_output_name,
+                window_id: entry_window_id,
+                placement,
+                snapshot: snapshot.clone(),
+                tracker,
+                rect,
+                scale,
+                output_geo,
+                source_signature,
+                reload_epoch,
+                context_id,
+                last_used: now,
+                texture_bytes,
+            });
+        });
+    }
+    Ok(Some(snapshot))
+}
+
 #[allow(dead_code)]
 fn capture_snapshot_from_output_elements(
     renderer: &mut GlesRenderer,
@@ -9392,18 +9652,16 @@ fn window_effect_elements_in_frame(
         );
     }
 
-    let mut tracker = smithay::backend::renderer::damage::OutputDamageTracker::new(
-        (0, 0),
-        1.0,
-        Transform::Normal,
-    );
-    let Some(source) = capture_snapshot_from_output_elements(
+    let source_signature = snapshot::render_element_scene_signature(window_elements, scale);
+    let Some(source) = window_effect_source_snapshot(
         renderer,
+        output,
         output_geo,
         rect,
         scale,
-        None,
-        &mut tracker,
+        window_id,
+        placement,
+        source_signature,
         window_elements,
     )
     .map_err(crate::backend::shader_effect::ShaderEffectError::Gles)?
@@ -9443,10 +9701,7 @@ fn window_effect_elements_in_frame(
                 placement
             ),
             source.texture,
-            Some(crate::backend::snapshot::render_element_scene_signature(
-                window_elements,
-                scale,
-            )),
+            Some(source_signature),
             (texture_size.w, texture_size.h),
             None,
             Some((texture_size.w, texture_size.h)),
@@ -13868,6 +14123,7 @@ fn connector_disconnected(
     state.remove_output_global(&output);
     state.screencopy_state.remove_output(&output);
     state.output_capture_mirrors.remove(&output_name);
+    purge_window_effect_source_caches_for_output(&output_name);
     // Output configuration belongs to the connector name, not to this short-lived Output
     // instance. Keep it across hot-unplug so a reconnected connector receives its mode, scale,
     // and position immediately. The TS runtime suppresses unchanged configuration payloads, so

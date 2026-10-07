@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::{
+    borrow::Cow,
     cmp::max,
     collections::{HashMap, HashSet, VecDeque},
     ffi::{CStr, CString},
@@ -1364,6 +1365,12 @@ struct TextureStageProgramCache(Mutex<HashMap<String, GlesTexProgram>>);
 #[derive(Debug, Default)]
 struct ShaderProgramCacheEpoch(Mutex<u64>);
 
+/// Current shader program reload epoch, for caches keyed on shader reloads. Reflects
+/// `SHADER_PROGRAM_RELOAD_EPOCH` without allocating or mutating state.
+pub(crate) fn shader_program_reload_epoch() -> u64 {
+    SHADER_PROGRAM_RELOAD_EPOCH.with(Cell::get)
+}
+
 fn refresh_shader_program_caches(data: &UserDataMap) {
     data.insert_if_missing(ShaderProgramCacheEpoch::default);
     let mut applied = data.get::<ShaderProgramCacheEpoch>().unwrap().0.lock().unwrap();
@@ -1381,6 +1388,17 @@ fn refresh_shader_program_caches(data: &UserDataMap) {
     }
     if let Some(cache) = data.get::<MultiTextureStageProgramCache>() {
         cache.programs.lock().unwrap().clear();
+    }
+    // Image assets too: a config reload may point at a changed file, and the decoded source,
+    // intrinsic texture and size variants are all keyed by path only. Clearing them here is
+    // what makes the cache reload-safe without stat-ing every image on every frame.
+    if let Some(cache) = data.get::<ImageTextureCache>() {
+        let mut image_cache = cache.inner.lock().unwrap();
+        image_cache.decoded.clear();
+        image_cache.intrinsic.clear();
+        image_cache.variants.clear();
+        image_cache.variant_order.clear();
+        image_cache.variant_bytes = 0;
     }
     *applied = epoch;
 }
@@ -1436,8 +1454,47 @@ struct NoiseSaltProgram(GlesTexProgram);
 struct OpaqueFinishProgram(GlesTexProgram);
 #[derive(Debug)]
 struct AlphaPreservingFinishProgram(GlesTexProgram);
+/// Upper bounds for the requested-size GPU image variants (the primary image input and
+/// SVG textures). A continuously resizing window would otherwise retain one texture per
+/// intermediate size for the whole session. A single variant larger than the byte cap is
+/// returned uncached so it is freed as soon as the caller drops it.
+const IMAGE_VARIANT_MAX_ENTRIES: usize = 64;
+const IMAGE_VARIANT_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Bytes of an RGBA texture of the given size, for the variant cache accounting.
+fn rgba_texture_bytes(size: (i32, i32)) -> usize {
+    size.0.max(0) as usize * size.1.max(0) as usize * 4
+}
+
+/// Decoded intrinsic-resolution RGBA pixels of one raster image. Shared by the intrinsic
+/// texture and every requested-size variant so a resizing window never re-reads or
+/// re-decodes the file.
+#[derive(Debug)]
+struct DecodedImageSource {
+    width: i32,
+    height: i32,
+    rgba: Vec<u8>,
+}
+
+/// Per-context image caches, attached to the renderer's EGL context.
 #[derive(Debug, Default)]
-struct ImageTextureCache(Mutex<HashMap<(String, i32, i32), GlesTexture>>);
+struct ImageTextureCache {
+    inner: Mutex<ImageTextureCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct ImageTextureCacheInner {
+    /// `path ->` decoded intrinsic RGBA (raster images only; SVG is size-dependent).
+    decoded: HashMap<String, Arc<DecodedImageSource>>,
+    /// `path ->` intrinsic-resolution GPU texture bound by auxiliary shader textures.
+    intrinsic: HashMap<String, GlesTexture>,
+    /// `(path, width, height) ->` requested-size GPU texture (primary input and SVG).
+    variants: HashMap<(String, i32, i32), GlesTexture>,
+    /// Insertion order of `variants` keys, oldest first, for bounded eviction.
+    variant_order: VecDeque<(String, i32, i32)>,
+    /// Summed GPU bytes of `variants` textures.
+    variant_bytes: usize,
+}
 
 struct EffectExecutionContext {
     backdrop: GlesTexture,
@@ -4977,6 +5034,38 @@ fn resolve_effect_input(
     align_effect_input_texture(renderer, texture, requested_size, ctx.content_rect)
 }
 
+/// Resolve one auxiliary texture of a shader stage (`stage.textures`).
+///
+/// Raster images (PNG and the PNG fallback) bind at their intrinsic resolution so a window
+/// that resizes reuses a single texture per path instead of decoding and uploading one per
+/// window size. The shaders sample these inputs with normalized UV, so the atlas layout is
+/// preserved without any requested-size alignment or CPU resize. SVG stays size-dependent and
+/// is resolved exactly like the primary input, and every non-image input keeps the usual
+/// requested-size alignment.
+fn resolve_shader_stage_texture(
+    renderer: &mut GlesRenderer,
+    input: &EffectInput,
+    ctx: &mut EffectExecutionContext,
+    size: (i32, i32),
+    cache: Option<&mut EffectPipelineCache>,
+) -> Result<GlesTexture, ShaderEffectError> {
+    if let EffectInput::Image(path) = input
+        && !image_path_is_svg(path)
+    {
+        return load_intrinsic_image_texture(renderer, path);
+    }
+    resolve_effect_input(renderer, input, ctx, size, cache)
+}
+
+/// True for the raster image formats decoded through the PNG path (`.png` and any
+/// unrecognized extension used as the PNG fallback). SVG is rendered per requested size.
+fn image_path_is_svg(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+}
+
 /// Maps a rect in a `from`-sized working texture into a `to`-sized one covering the same area.
 fn scale_effect_rect(
     rect: Rectangle<i32, Buffer>,
@@ -5100,7 +5189,9 @@ fn align_effect_input_texture(
         1,
         Transform::Normal,
         Some(1.0),
-        None,
+        Some(Rectangle::from_size(
+            texture_size.to_logical(1, Transform::Normal).to_f64(),
+        )),
         Some((content_rect.size.w, content_rect.size.h).into()),
         None,
         Kind::Unspecified,
@@ -5149,7 +5240,7 @@ fn apply_texture_shader_stage(
         for (name, input) in &stage.textures {
             textures.push((
                 name.clone(),
-                resolve_effect_input(renderer, input, ctx, size, cache.as_deref_mut())?,
+                resolve_shader_stage_texture(renderer, input, ctx, size, cache.as_deref_mut())?,
             ));
         }
         return apply_multi_texture_shader_stage(
@@ -5567,11 +5658,8 @@ pub fn solid_white_texture(renderer: &mut GlesRenderer) -> Result<GlesTexture, S
     Ok(texture)
 }
 
-fn load_image_texture(
-    renderer: &mut GlesRenderer,
-    path: &str,
-    size: (i32, i32),
-) -> Result<GlesTexture, ShaderEffectError> {
+/// Ensure the per-context image caches exist on this renderer.
+fn ensure_image_texture_cache(renderer: &GlesRenderer) {
     if renderer
         .egl_context()
         .user_data()
@@ -5583,53 +5671,215 @@ fn load_image_texture(
             .user_data()
             .insert_if_missing(ImageTextureCache::default);
     }
+}
 
-    let cache_key = (path.to_string(), size.0, size.1);
+/// Load an image as a texture at the requested size. Used by the primary image input and by
+/// SVG auxiliary textures, whose rendering stays size-dependent: raster PNGs reuse a decoded
+/// intrinsic source (scaled on the CPU once per requested size and cached), SVG is rasterized
+/// at the requested size as before.
+fn load_image_texture(
+    renderer: &mut GlesRenderer,
+    path: &str,
+    size: (i32, i32),
+) -> Result<GlesTexture, ShaderEffectError> {
+    refresh_shader_program_caches(renderer.egl_context().user_data());
+    ensure_image_texture_cache(renderer);
+
+    if let Some(texture) = cached_image_variant(renderer, path, size) {
+        return Ok(texture);
+    }
+
+    // Keep the decoded source alive while an exact-size PNG borrows its pixels.
+    let source = if image_path_is_svg(path) {
+        None
+    } else {
+        Some(decoded_image_source(renderer, path)?)
+    };
+    let rgba: Cow<'_, [u8]> = match source.as_deref() {
+        Some(source) if source.width == size.0 && source.height == size.1 => {
+            Cow::Borrowed(source.rgba.as_slice())
+        }
+        Some(source) => Cow::Owned(scale_rgba(
+            &source.rgba,
+            source.width,
+            source.height,
+            size.0,
+            size.1,
+        )),
+        None => {
+            let bytes = fs::read(path).map_err(|source| ShaderEffectError::ReadShader {
+                path: path.to_string(),
+                source,
+            })?;
+            Cow::Owned(
+                decode_svg_and_scale(&bytes, size.0, size.1)
+                    .ok_or_else(|| ShaderEffectError::ImageDecode {
+                        path: path.to_string(),
+                    })?,
+            )
+        }
+    };
+
+    let texture = renderer.import_memory(&rgba, Fourcc::Abgr8888, size.into(), false)?;
+    store_image_variant(renderer, path, size, texture.clone());
+    Ok(texture)
+}
+
+/// Bind a raster image at its intrinsic resolution, uploaded once per context and reload
+/// epoch. Auxiliary shader textures sample it with normalized UV, so no requested-size
+/// alignment or CPU resize is needed and the texture never grows with the window.
+fn load_intrinsic_image_texture(
+    renderer: &mut GlesRenderer,
+    path: &str,
+) -> Result<GlesTexture, ShaderEffectError> {
+    refresh_shader_program_caches(renderer.egl_context().user_data());
+    ensure_image_texture_cache(renderer);
+
     if let Some(texture) = renderer
         .egl_context()
         .user_data()
         .get::<ImageTextureCache>()
         .expect("image texture cache should exist")
-        .0
+        .inner
         .lock()
         .unwrap()
-        .get(&cache_key)
+        .intrinsic
+        .get(path)
         .cloned()
     {
         return Ok(texture);
+    }
+
+    let source = decoded_image_source(renderer, path)?;
+    let texture = renderer.import_memory(
+        &source.rgba,
+        Fourcc::Abgr8888,
+        (source.width, source.height).into(),
+        false,
+    )?;
+    renderer
+        .egl_context()
+        .user_data()
+        .get::<ImageTextureCache>()
+        .expect("image texture cache should exist")
+        .inner
+        .lock()
+        .unwrap()
+        .intrinsic
+        .insert(path.to_string(), texture.clone());
+    Ok(texture)
+}
+
+/// Decode a raster image's intrinsic RGBA source once per context and reload epoch. The
+/// decoded pixels are shared by the intrinsic texture and every requested-size variant, so a
+/// resizing window never re-reads or re-decodes the file.
+fn decoded_image_source(
+    renderer: &mut GlesRenderer,
+    path: &str,
+) -> Result<Arc<DecodedImageSource>, ShaderEffectError> {
+    if let Some(source) = renderer
+        .egl_context()
+        .user_data()
+        .get::<ImageTextureCache>()
+        .expect("image texture cache should exist")
+        .inner
+        .lock()
+        .unwrap()
+        .decoded
+        .get(path)
+        .cloned()
+    {
+        return Ok(source);
     }
 
     let bytes = fs::read(path).map_err(|source| ShaderEffectError::ReadShader {
         path: path.to_string(),
         source,
     })?;
-    let extension = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    let rgba = match extension.as_deref() {
-        Some("png") => decode_png_and_scale(&bytes, size.0, size.1),
-        Some("svg") => decode_svg_and_scale(&bytes, size.0, size.1),
-        _ => decode_png_and_scale(&bytes, size.0, size.1),
-    }
-    .ok_or_else(|| ShaderEffectError::ImageDecode {
+    let decoded = Arc::new(decode_png_to_rgba(&bytes).ok_or_else(|| ShaderEffectError::ImageDecode {
         path: path.to_string(),
-    })?;
-
-    let texture = renderer.import_memory(&rgba, Fourcc::Abgr8888, size.into(), false)?;
+    })?);
     renderer
         .egl_context()
         .user_data()
         .get::<ImageTextureCache>()
         .expect("image texture cache should exist")
-        .0
+        .inner
         .lock()
         .unwrap()
-        .insert(cache_key, texture.clone());
-    Ok(texture)
+        .decoded
+        .insert(path.to_string(), decoded.clone());
+    Ok(decoded)
 }
 
-fn decode_png_and_scale(bytes: &[u8], target_width: i32, target_height: i32) -> Option<Vec<u8>> {
+/// Look up a requested-size GPU variant of an image.
+fn cached_image_variant(
+    renderer: &GlesRenderer,
+    path: &str,
+    size: (i32, i32),
+) -> Option<GlesTexture> {
+    renderer
+        .egl_context()
+        .user_data()
+        .get::<ImageTextureCache>()
+        .expect("image texture cache should exist")
+        .inner
+        .lock()
+        .unwrap()
+        .variants
+        .get(&(path.to_string(), size.0, size.1))
+        .cloned()
+}
+
+/// Store a requested-size GPU variant, evicting the oldest entries until the variant fits
+/// both the entry and byte budget. A single variant larger than the byte budget is returned
+/// uncached (the caller's clone keeps it alive for the frame), so no size can retain
+/// unbounded VRAM.
+fn store_image_variant(
+    renderer: &GlesRenderer,
+    path: &str,
+    size: (i32, i32),
+    texture: GlesTexture,
+) {
+    let key = (path.to_string(), size.0, size.1);
+    let bytes = rgba_texture_bytes(size);
+    let mut cache = renderer
+        .egl_context()
+        .user_data()
+        .get::<ImageTextureCache>()
+        .expect("image texture cache should exist")
+        .inner
+        .lock()
+        .unwrap();
+    if cache.variants.contains_key(&key) {
+        return;
+    }
+    // A single variant larger than the byte budget is never cached and must not evict the
+    // working set: it is returned uncached (the caller's clone keeps it alive for the frame).
+    if bytes > IMAGE_VARIANT_MAX_BYTES {
+        return;
+    }
+    while !cache.variant_order.is_empty()
+        && (cache.variants.len() >= IMAGE_VARIANT_MAX_ENTRIES
+            || cache.variant_bytes + bytes > IMAGE_VARIANT_MAX_BYTES)
+    {
+        let oldest = cache.variant_order.pop_front().expect("order is non-empty");
+        if let Some(evicted) = cache.variants.remove(&oldest) {
+            let evicted_size = evicted.size();
+            cache.variant_bytes = cache
+                .variant_bytes
+                .saturating_sub(rgba_texture_bytes((evicted_size.w, evicted_size.h)));
+        }
+    }
+    if cache.variants.len() >= IMAGE_VARIANT_MAX_ENTRIES {
+        return;
+    }
+    cache.variant_bytes += bytes;
+    cache.variant_order.push_back(key.clone());
+    cache.variants.insert(key, texture);
+}
+
+fn decode_png_to_rgba(bytes: &[u8]) -> Option<DecodedImageSource> {
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder.read_info().ok()?;
     let mut buffer = vec![0; reader.output_buffer_size()];
@@ -5652,13 +5902,11 @@ fn decode_png_and_scale(bytes: &[u8], target_width: i32, target_height: i32) -> 
         _ => return None,
     };
 
-    Some(scale_rgba(
-        &rgba,
-        info.width as i32,
-        info.height as i32,
-        target_width,
-        target_height,
-    ))
+    Some(DecodedImageSource {
+        width: info.width as i32,
+        height: info.height as i32,
+        rgba,
+    })
 }
 
 fn decode_svg_and_scale(bytes: &[u8], target_width: i32, target_height: i32) -> Option<Vec<u8>> {
