@@ -531,6 +531,16 @@ pub struct ShojiWM {
     pub popup_lifecycle_debug_entries: BTreeMap<u32, PopupLifecycleDebugEntry>,
     pub right_click_debug: RightClickDebugState,
     pub tty_session_active: bool,
+    /// Native DRM output power lease (Screen Off). Independent of
+    /// `tty_session_active`: while `is_off()` every render, cursor, deferred
+    /// and mode-change commit must be suppressed. See `crate::output_power`.
+    pub output_power: crate::output_power::OutputPowerState,
+    /// Global native color temperature target (whole-output DRM CTM). Applies
+    /// to every tty output; `Identity` restores each output's original
+    /// transform. Set by the native endpoint and reapplied at output creation,
+    /// surface rebuild, mode change, VT resume and Screen Off wake. See
+    /// `crate::night_color`.
+    pub night_color_target: crate::night_color::ColorTarget,
     /// DRM nodes whose udev change events arrived while the tty session was
     /// paused (VT switch / suspend). Scanning connectors on a paused device
     /// consumes the scanner's connect/disconnect events but cannot touch the
@@ -1758,6 +1768,14 @@ impl ShojiWM {
 
         // Setup a wayland socket that will be used to accept clients
         let socket_name = Self::init_wayland_listener(display, event_loop);
+        // The Screen Off lease endpoint is named after the actual Wayland
+        // display chosen above. Failing to register it must not stop the
+        // compositor: the client then fails closed with the screens lit.
+        if let Err(error) =
+            crate::output_power::register_output_power_endpoint(event_loop, &socket_name)
+        {
+            warn!(?error, "failed to register output power lease endpoint");
+        }
         Self::init_runtime_scheduler(event_loop);
 
         // Get the loop signal, used to stop the event loop
@@ -2046,6 +2064,8 @@ impl ShojiWM {
                 location: None,
             },
             tty_session_active: true,
+            output_power: Default::default(),
+            night_color_target: Default::default(),
             pending_tty_device_changes: Vec::new(),
             pending_connector_retries: Vec::new(),
 

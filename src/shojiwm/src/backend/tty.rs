@@ -1064,6 +1064,14 @@ struct SurfaceData {
     /// cursor fast path patches the staged frame instead of committing.
     deferred_submit: Option<DeferredSubmit>,
     deferred_submit_generation: u64,
+    /// A mode selected while the outputs were dark. Applying it would commit
+    /// the CRTC and light the panel, so it is deferred until
+    /// `apply_output_power_on`.
+    pending_mode: Option<smithay::reexports::drm::control::Mode>,
+    /// Native whole-output color temperature state for this CRTC: the CTM
+    /// property, the applied target, the blobs this module owns and the
+    /// snapshot of the driver's original transform. See `crate::night_color`.
+    night_color: crate::night_color::OutputColorState,
     dmabuf_feedback: SurfaceDmabufFeedback,
 }
 
@@ -1088,6 +1096,10 @@ pub fn pause_tty_session(state: &mut ShojiWM) {
 }
 
 pub fn resume_tty_session(state: &mut ShojiWM) {
+    // The Screen Off lease is independent of the VT/suspend state: a resume
+    // must not accidentally light a lease-dark output. Keep the surfaces idle
+    // and re-apply the clear after master is re-acquired.
+    let power_off = state.output_power.is_off();
     for (node, backend) in state.tty_backends.iter_mut() {
         if let Err(err) = backend.drm_output_manager.lock().activate(false) {
             warn!(
@@ -1097,7 +1109,11 @@ pub fn resume_tty_session(state: &mut ShojiWM) {
             );
         }
         for surface in backend.surfaces.values_mut() {
-            reset_surface_after_tty_resume(surface);
+            if power_off {
+                reset_surface_after_tty_pause(surface);
+            } else {
+                reset_surface_after_tty_resume(surface);
+            }
         }
     }
     // Connector changes that arrived while the session was paused were
@@ -1152,6 +1168,21 @@ pub fn resume_tty_session(state: &mut ShojiWM) {
     }
     retry_pending_connectors(state);
 
+    if power_off {
+        // DRM master re-acquisition can restore CRTC state, so re-apply the
+        // clear and do not queue a redraw.
+        if let Err(message) = apply_output_power_off(state) {
+            warn!(
+                %message,
+                "failed to keep tty outputs dark after session resume",
+            );
+        }
+        return;
+    }
+
+    // DRM master re-acquisition can replace the CRTC's atomic state, so put
+    // the native color target back before the first frame after resume.
+    reapply_night_color(state, "tty-session-resume");
     state.force_full_damage = true;
     state.request_tty_maintenance("tty-session-resume");
     state.schedule_redraw();
@@ -1245,6 +1276,210 @@ fn reset_surface_after_tty_pause(surface: &mut SurfaceData) {
 fn reset_surface_after_tty_resume(surface: &mut SurfaceData) {
     reset_surface_after_tty_pause(surface);
     surface.redraw_state = TtyRedrawState::Queued;
+}
+
+/// Power every DRM output down for the Screen Off lease.
+///
+/// Uses `DrmCompositor::clear()` through `DrmOutput::with_compositor`, which
+/// sets DPMS off and disables all planes without changing the configured mode
+/// or the output topology (the `wl_output` globals stay). No render, cursor or
+/// mode commit is allowed while `OutputPowerState::is_off`.
+///
+/// The native "off" state may only be published once this returns `Ok`: a
+/// partial failure rolls the outputs back (they are queued for a full redraw,
+/// which re-enables DPMS) and returns the error, so the client fails closed
+/// with the screens lit.
+pub fn apply_output_power_off(state: &mut ShojiWM) -> Result<(), String> {
+    // Only a compositor that currently owns DRM master and drives at least one
+    // real output can honour a darkness lease. Anything else must fail closed
+    // with the screens lit.
+    if !state.tty_session_active {
+        return Err("tty session is not active".to_string());
+    }
+    let output_count: usize = state
+        .tty_backends
+        .values()
+        .map(|backend| backend.surfaces.len())
+        .sum();
+    if output_count == 0 {
+        return Err("no drm outputs".to_string());
+    }
+
+    let mut failure: Option<String> = None;
+    'backends: for backend in state.tty_backends.values() {
+        for surface in backend.surfaces.values() {
+            if let Err(err) = surface
+                .drm_output
+                .with_compositor(|compositor| compositor.clear())
+            {
+                failure = Some(err.to_string());
+                break 'backends;
+            }
+        }
+    }
+
+    if let Some(message) = failure {
+        restore_outputs_after_failed_power_change(state);
+        return Err(message);
+    }
+
+    for backend in state.tty_backends.values_mut() {
+        for surface in backend.surfaces.values_mut() {
+            // `clear()` dropped the compositor's own pending/queued frames;
+            // mirror that in our bookkeeping so nothing waits on a flip that
+            // will never be reaped and no commit is attempted while dark.
+            reset_surface_after_tty_pause(surface);
+        }
+    }
+    state.output_overlays.clear();
+    state.needs_redraw = false;
+    info!("tty outputs cleared for screen-off");
+    Ok(())
+}
+
+/// Power the DRM outputs back up after a Screen Off lease ends.
+///
+/// `DrmCompositor::clear()` left the surface disabled; the next real commit
+/// re-enables it. Reset the swapchain and queue a full redraw so that happens
+/// on the next render, and apply any mode that was deferred while dark.
+///
+/// Unlike `apply_output_power_off`, this never fails: restoring power when
+/// there is nothing to restore (every output unplugged while dark) is still a
+/// completed restore, and the next hotplug must be allowed to light up.
+pub fn apply_output_power_on(state: &mut ShojiWM) -> Result<(), String> {
+    for backend in state.tty_backends.values_mut() {
+        for surface in backend.surfaces.values_mut() {
+            let pending_mode = surface.pending_mode.take();
+            surface.drm_output.reset_buffers();
+            reset_surface_after_tty_pause(surface);
+            if let Some(mode) = pending_mode {
+                match surface.drm_output.use_mode::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>(
+                    mode,
+                    &mut backend.renderer,
+                    &DrmOutputRenderElements::default(),
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        // The advertised wl_output mode was already updated when
+                        // the change arrived, so do not lose it: keep it pending
+                        // and retry on the next power-on attempt.
+                        warn!(
+                            output = %surface.output.name(),
+                            ?err,
+                            "failed to apply mode deferred while outputs were dark"
+                        );
+                        surface.pending_mode = Some(mode);
+                    }
+                }
+            }
+            surface.redraw_state = TtyRedrawState::Queued;
+        }
+    }
+    // The Screen Off wake is a lifecycle point: a mode that was refused and
+    // kept pending above may have left the CRTC state stale, so force the
+    // native color target back onto every output before the first frame.
+    reapply_night_color(state, "output-power-on");
+    state.force_full_damage = true;
+    state.request_tty_maintenance("output-power-on");
+    state.schedule_redraw();
+    Ok(())
+}
+
+/// Queue a full redraw for every output after a failed power-off. The next
+/// render commits a frame, which re-enables any CRTC `clear()` already
+/// disabled, so the screens stay lit as the caller reports the failure.
+fn restore_outputs_after_failed_power_change(state: &mut ShojiWM) {
+    for backend in state.tty_backends.values_mut() {
+        for surface in backend.surfaces.values_mut() {
+            surface.drm_output.reset_buffers();
+            reset_surface_after_tty_pause(surface);
+            surface.redraw_state = TtyRedrawState::Queued;
+        }
+    }
+    state.force_full_damage = true;
+    state.request_tty_maintenance("output-power-restore");
+    state.schedule_redraw();
+}
+
+/// Number of tty outputs currently driving a DRM surface.
+pub fn tty_output_color_count(state: &ShojiWM) -> usize {
+    state
+        .tty_backends
+        .values()
+        .map(|backend| backend.surfaces.len())
+        .sum()
+}
+
+/// Apply a native color temperature target to every connected tty output.
+///
+/// The rollback policy is the *previously requested* global target, captured
+/// before the first write: on any failure every output is put back to it
+/// (outputs already at that target are skipped without touching the hardware),
+/// so a half-applied transform can never be published as success. This also
+/// covers outputs whose cached state is unknown after a failed lifecycle
+/// reapply, where assuming `Identity` would silently drop the user's target.
+pub fn apply_night_color_target(
+    state: &mut ShojiWM,
+    target: crate::night_color::ColorTarget,
+) -> Result<(), String> {
+    let previous = state.night_color_target;
+    let mut failure: Option<String> = None;
+
+    'backends: for (_, backend) in state.tty_backends.iter_mut() {
+        for surface in backend.surfaces.values_mut() {
+            if surface.night_color.is_applied(target) {
+                continue;
+            }
+            if let Err(message) = surface.night_color.apply(target) {
+                failure = Some(format!("{message} (output {})", surface.output.name()));
+                break 'backends;
+            }
+        }
+    }
+
+    let Some(message) = failure else {
+        return Ok(());
+    };
+
+    for (_, backend) in state.tty_backends.iter_mut() {
+        for surface in backend.surfaces.values_mut() {
+            if surface.night_color.is_applied(previous) {
+                continue;
+            }
+            if let Err(err) = surface.night_color.apply(previous) {
+                warn!(
+                    output = %surface.output.name(),
+                    %err,
+                    "failed to roll back native night color to the previous target"
+                );
+            }
+        }
+    }
+    Err(message)
+}
+
+/// Force-invalidate every output's cached color state and reapply the global
+/// target. Used at lifecycle points (VT resume, Screen Off wake) where the
+/// driver's atomic state may not be what the cache assumes.
+///
+/// Deliberately per-output: a lifecycle event must not undo a working output
+/// because a sibling refused the property, so failures are logged per output
+/// and never propagated or rolled back across outputs.
+pub fn reapply_night_color(state: &mut ShojiWM, reason: &'static str) {
+    let target = state.night_color_target;
+    for backend in state.tty_backends.values_mut() {
+        for surface in backend.surfaces.values_mut() {
+            surface.night_color.invalidate();
+            if let Err(message) = surface.night_color.apply(target) {
+                warn!(
+                    output = %surface.output.name(),
+                    %message,
+                    reason,
+                    "failed to reapply native night color after a lifecycle event"
+                );
+            }
+        }
+    }
 }
 
 enum RenderSurfaceOutcome {
@@ -1688,6 +1923,17 @@ fn frame_finish(
         warn!(?node, ?crtc, "frame_finish without surface");
         return;
     };
+    if state.output_power.is_off() {
+        // A vblank that raced the Screen Off lease must not start a render,
+        // a deferred/cursor submit or any other commit. Reap whatever the
+        // compositor still tracks (normally nothing: `clear()` dropped its
+        // frames) and leave the surface idle.
+        let _ = surface.drm_output.frame_submitted();
+        surface.frame_pending = false;
+        surface.held_client_buffers.clear();
+        surface.redraw_state = TtyRedrawState::Idle;
+        return;
+    }
     let output_name = surface.output.name();
     // Present-rate diagnostic (SHOJI_PRESENT_RATE_DEBUG): frame_finish runs once
     // per completed flip = once per present, so counting it gives the real
@@ -2067,6 +2313,11 @@ fn submit_deferred_frame(
     crtc: crtc::Handle,
     generation: u64,
 ) {
+    // The lease clears and resets every surface, but defend the invariant here
+    // too: a deferred queue_frame is a real commit.
+    if state.output_power.is_off() {
+        return;
+    }
     {
         let Some(surface) = state
             .tty_backends
@@ -2198,6 +2449,10 @@ fn fast_cursor_move_inner(
     allow_defer: bool,
 ) -> bool {
     if !cursor_fast_path_enabled() {
+        return false;
+    }
+    // A cursor-plane commit is still a DRM commit: never while dark.
+    if state.output_power.is_off() {
         return false;
     }
     let ShojiWM {
@@ -2377,6 +2632,15 @@ pub fn render_if_needed(
     }
     if !state.tty_session_active {
         trace!("skipping tty redraw while session is inactive");
+        return Ok(());
+    }
+    if state.output_power.is_off() {
+        // Dark outputs consume no damage and must not commit. Drop the pending
+        // redraw so the loop does not re-enter here on every dispatch;
+        // `apply_output_power_on` forces a full redraw when the lease ends.
+        trace!("skipping tty redraw while outputs are powered off");
+        state.needs_redraw = false;
+        state.clear_source_damage();
         return Ok(());
     }
 
@@ -3214,6 +3478,12 @@ fn render_surface(
     node: DrmNode,
     crtc: crtc::Handle,
 ) -> Result<RenderSurfaceOutcome, Box<dyn std::error::Error>> {
+    // No commit may be issued while the Screen Off lease is dark. This is the
+    // single choke point every render path (main loop, frame_finish follow-up,
+    // estimated-vblank/commit-timing timers) funnels through.
+    if state.output_power.is_off() {
+        return Ok(RenderSurfaceOutcome::Skipped);
+    }
     let frame_started_at = Instant::now();
     // Latency diagnostic (`SHOJI_LATENCY_TRACE`): anchor pair for the input-to-photon
     // measurement. Both readings are CLOCK_MONOTONIC, so a later `Instant`
@@ -13890,9 +14160,32 @@ fn connector_connected(
         }
     };
 
+    let power_off = state.output_power.is_off();
+    let color_target = state.night_color_target;
     let backend = state.tty_backends.get_mut(&node).unwrap();
 
     let supports_async_flip = drm_output.supports_async_page_flip();
+    // A CRTC that already owns a surface (a `Disconnected` scan event whose
+    // CRTC mapping is gone leaves a stale one behind, and a later scan can hand
+    // the reused CRTC straight back here) still knows the driver's original
+    // transform. The live CTM blob may already carry this module's own applied
+    // transform, so inherit that capture instead of re-reading it; the surface
+    // itself is replaced by the `insert` below, whose `Drop` restores the
+    // original.
+    let inherited_color_capture = backend
+        .surfaces
+        .get(&crtc)
+        .and_then(|surface| surface.night_color.captured_ctm());
+    // Native night color state for this CRTC. The device fd comes from the
+    // compositor that drives this output (an `Arc` clone of the same fd the
+    // backend uses), so no second DRM device is opened.
+    let color_device =
+        drm_output.with_compositor(|compositor| compositor.surface().device_fd().clone());
+    let night_color = crate::night_color::OutputColorState::new(
+        color_device,
+        crtc,
+        inherited_color_capture,
+    );
     info!(
         ?node,
         ?crtc,
@@ -13941,11 +14234,41 @@ fn connector_connected(
         cursor_margin_window_misses: 0,
         deferred_submit: None,
         deferred_submit_generation: 0,
+        pending_mode: None,
+        night_color,
         dmabuf_feedback,
     };
     backend.surfaces.insert(crtc, surface);
     debug!(?node, ?crtc, "stored tty surface");
-    if let Some(surface) = backend.surfaces.get_mut(&crtc) {
+    if power_off {
+        // A hotplug/reconnect while the lease is dark must not light the new
+        // CRTC: surface initialization just performed a modeset, so clear it
+        // again and leave the surface idle instead of queuing a frame.
+        if let Some(surface) = backend.surfaces.get_mut(&crtc) {
+            if let Err(err) =
+                surface
+                    .drm_output
+                    .with_compositor(|compositor| compositor.clear())
+            {
+                warn!(?node, ?crtc, ?err, "failed to keep reconnected output dark");
+            }
+            reset_surface_after_tty_pause(surface);
+            surface.redraw_state = TtyRedrawState::Idle;
+        }
+    } else if let Some(surface) = backend.surfaces.get_mut(&crtc) {
+        // A newly connected output carries the driver's default transform or,
+        // after a rebuild, may have lost the property: apply the global target
+        // now. `identity` writes nothing when the probe already recorded the
+        // current state (or when the driver has no CTM at all); a real
+        // temperature target on a driver without CTM is logged, not hidden.
+        if let Err(message) = surface.night_color.apply(color_target) {
+            warn!(
+                ?node,
+                ?crtc,
+                %message,
+                "failed to apply night color to a new tty output"
+            );
+        }
         surface.redraw_state = TtyRedrawState::Queued;
     }
     state.apply_runtime_display_configuration();
@@ -14243,6 +14566,11 @@ pub fn apply_tty_output_mode(
     output_name: &str,
     mode: WlMode,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // A mode change is a commit that re-enables DPMS, so while the Screen Off
+    // lease is dark it is deferred rather than dropped: `apply_output_power_on`
+    // applies it when the lease ends.
+    let power_off = state.output_power.is_off();
+    let color_target = state.night_color_target;
     for backend in state.tty_backends.values_mut() {
         for surface in backend.surfaces.values_mut() {
             if surface.output.name() != output_name {
@@ -14254,6 +14582,11 @@ pub fn apply_tty_output_mode(
             }) else {
                 return Ok(false);
             };
+            if power_off {
+                surface.pending_mode = Some(drm_mode);
+                surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
+                return Ok(true);
+            }
             surface
                 .drm_output
                 .use_mode::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>(
@@ -14263,6 +14596,16 @@ pub fn apply_tty_output_mode(
                 )?;
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
             surface.redraw_state = TtyRedrawState::Queued;
+            // A mode change rebuilds the CRTC state; force the color target
+            // back so the CTM is known to match on the new mode.
+            surface.night_color.invalidate();
+            if let Err(message) = surface.night_color.apply(color_target) {
+                warn!(
+                    output = %surface.output.name(),
+                    %message,
+                    "failed to reapply night color after a mode change"
+                );
+            }
             return Ok(true);
         }
     }
