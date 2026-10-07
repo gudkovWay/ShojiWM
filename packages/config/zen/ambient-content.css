@@ -1,0 +1,38 @@
+@import url("profiles/rainlit-shoji.css");
+/* ShojiWM ambient composition — native Home content adapter.
+ *
+ * Decorates ONLY the native Firefox Home documents (about:newtab and
+ * about:home) by layering the selected ambient profile behind
+ * body.activity-stream's own background colour. Ordinary websites, the
+ * custom loopback homepage and every other document are never matched.
+ * Layers are background-images under the existing content: nothing sits
+ * above text and nothing intercepts clicks. Palette text/base tokens are
+ * untouched — blossom-content.css keeps owning colour and typography.
+ *
+ * Selection: the FIRST @import below is the single source of profile
+ * selection. tools/ambient-composition.py --apply rewrites it and nothing
+ * else in this section.
+ */
+
+@-moz-document url("about:newtab"), url("about:home") {
+  body.activity-stream {
+    background-image: var(--amb-content-image) !important;
+    background-repeat: var(--amb-content-repeat) !important;
+    background-size: var(--amb-content-size) !important;
+    background-position: var(--amb-content-pos);
+    animation: var(--amb-content-anim);
+  }
+
+  /* Fullscreen Home: drop the decoration with the rest of the chrome. */
+  :root:is([inDOMFullscreen="true"], [inFullscreen="true"], :fullscreen) body.activity-stream {
+    background-image: none !important;
+    animation: none !important;
+  }
+
+  /* Reduced motion: static first frame only. */
+  @media (prefers-reduced-motion: reduce) {
+    body.activity-stream {
+      animation: none !important;
+    }
+  }
+}

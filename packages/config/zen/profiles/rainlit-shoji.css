@@ -1,0 +1,172 @@
+/* ShojiWM ambient composition — rainlit-shoji.
+ *
+ * One complete lantern (the shared 1:2 content sprite, ../assets relative to
+ * this file) hangs in the upper-right of the vertical toolbox and of the
+ * native Home, with a warm glow anchored to its pane centre. The short top
+ * navbar cannot fit the lamp without severe clipping, so there the selectors
+ * below swap to cool rain-only layers. Rain is real slanted streaks at two
+ * depths, tiled as low-density wide-panel SVGs with unequal positions,
+ * lengths and opacities; each depth loops by an exact multiple of its own
+ * tile height, so the endpoints match seamlessly at seconds-scale speeds.
+ * No global colour fog, no candles, no breathing.
+ *
+ * Consumed by ambient-chrome.css and ambient-content.css, which read the
+ * --amb-* variables below and the amb-*-move keyframes. Only one profile is
+ * ever imported at a time, so the keyframe names are unambiguous in the
+ * cascade.
+ */
+
+:root {
+  --amb-composition: "rainlit-shoji";
+
+  /* Chrome (vertical toolbox / sidebar): lantern + local glow + two rain
+   * depths. The lamp layer stays fixed; only the rain tiles descend. */
+  --amb-chrome-image:
+    url("../assets/content-lantern.png"),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(245, 163, 61, 0.11),
+      rgba(245, 163, 61, 0.05) 45%,
+      rgba(245, 163, 61, 0) 72%
+    ),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='260'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='64' y1='30' x2='71' y2='54' stroke-opacity='0.09'/%3E%3Cline x1='150' y1='150' x2='156' y2='168' stroke-opacity='0.06'/%3E%3Cline x1='252' y1='60' x2='259' y2='90' stroke-opacity='0.08'/%3E%3Cline x1='390' y1='190' x2='396' y2='212' stroke-opacity='0.10'/%3E%3Cline x1='44' y1='200' x2='49' y2='222' stroke-opacity='0.05'/%3E%3C/g%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='360' height='200'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='40' y1='24' x2='48' y2='58' stroke-opacity='0.16'/%3E%3Cline x1='128' y1='110' x2='135' y2='140' stroke-opacity='0.12'/%3E%3Cline x1='220' y1='40' x2='228' y2='76' stroke-opacity='0.18'/%3E%3Cline x1='310' y1='140' x2='316' y2='168' stroke-opacity='0.13'/%3E%3Cline x1='180' y1='170' x2='186' y2='192' stroke-opacity='0.10'/%3E%3C/g%3E%3C/svg%3E");
+  --amb-chrome-repeat: no-repeat, no-repeat, repeat, repeat;
+  --amb-chrome-size:
+    min(64px, 12vw, 30vh) auto,
+    160px 160px,
+    480px 260px,
+    360px 200px;
+  --amb-chrome-pos:
+    right 14px top 12px,
+    right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+      top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+    0 0,
+    0 0;
+  --amb-chrome-anim: amb-chrome-move 6s linear infinite;
+
+  /* Short top navbar: the lamp cannot fit — cool rain reflection only,
+   * two depths plus a faint static sheen, no lantern layer. */
+  --amb-navbar-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='260'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='64' y1='30' x2='71' y2='54' stroke-opacity='0.07'/%3E%3Cline x1='150' y1='150' x2='156' y2='168' stroke-opacity='0.05'/%3E%3Cline x1='252' y1='60' x2='259' y2='90' stroke-opacity='0.06'/%3E%3Cline x1='390' y1='190' x2='396' y2='212' stroke-opacity='0.08'/%3E%3Cline x1='44' y1='200' x2='49' y2='222' stroke-opacity='0.04'/%3E%3C/g%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='360' height='200'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='40' y1='24' x2='48' y2='58' stroke-opacity='0.12'/%3E%3Cline x1='128' y1='110' x2='135' y2='140' stroke-opacity='0.09'/%3E%3Cline x1='220' y1='40' x2='228' y2='76' stroke-opacity='0.14'/%3E%3Cline x1='310' y1='140' x2='316' y2='168' stroke-opacity='0.10'/%3E%3Cline x1='180' y1='170' x2='186' y2='192' stroke-opacity='0.08'/%3E%3C/g%3E%3C/svg%3E"),
+    linear-gradient(
+      to bottom,
+      rgba(156, 203, 213, 0.05),
+      rgba(156, 203, 213, 0) 70%
+    );
+  --amb-navbar-repeat: repeat, repeat, no-repeat;
+  --amb-navbar-size:
+    480px 260px,
+    360px 200px,
+    100% 100%;
+  --amb-navbar-pos:
+    0 0,
+    0 0,
+    0 0;
+  --amb-navbar-anim: amb-navbar-move 6s linear infinite;
+
+  /* Native Home: the full scene — lamp upper-right with warm spill, both
+   * rain depths across the whole panel. */
+  --amb-content-image:
+    url("../assets/content-lantern.png"),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(245, 163, 61, 0.09),
+      rgba(245, 163, 61, 0.04) 45%,
+      rgba(245, 163, 61, 0) 72%
+    ),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='260'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='64' y1='30' x2='71' y2='54' stroke-opacity='0.08'/%3E%3Cline x1='150' y1='150' x2='156' y2='168' stroke-opacity='0.05'/%3E%3Cline x1='252' y1='60' x2='259' y2='90' stroke-opacity='0.07'/%3E%3Cline x1='390' y1='190' x2='396' y2='212' stroke-opacity='0.09'/%3E%3Cline x1='44' y1='200' x2='49' y2='222' stroke-opacity='0.05'/%3E%3C/g%3E%3C/svg%3E"),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='360' height='200'%3E%3Cg stroke='%239ccbd5' stroke-linecap='round'%3E%3Cline x1='40' y1='24' x2='48' y2='58' stroke-opacity='0.14'/%3E%3Cline x1='128' y1='110' x2='135' y2='140' stroke-opacity='0.10'/%3E%3Cline x1='220' y1='40' x2='228' y2='76' stroke-opacity='0.16'/%3E%3Cline x1='310' y1='140' x2='316' y2='168' stroke-opacity='0.12'/%3E%3Cline x1='180' y1='170' x2='186' y2='192' stroke-opacity='0.09'/%3E%3C/g%3E%3C/svg%3E");
+  --amb-content-repeat: no-repeat, no-repeat, repeat, repeat;
+  --amb-content-size:
+    min(150px, 24vw, 30vh) auto,
+    280px 280px,
+    480px 260px,
+    360px 200px;
+  --amb-content-pos:
+    right 26px top 26px,
+    right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+      top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+    0 0,
+    0 0;
+  --amb-content-anim: amb-content-move 6s linear infinite;
+}
+
+/* The short navbar containers get rain-only decoration: higher specificity
+ * plus !important so this wins over the generic adapter rule, while the
+ * fullscreen suppression (higher specificity) still strips everything. */
+:root #zen-appcontent-navbar-wrapper,
+:root #zen-appcontent-navbar-container {
+  background-image: var(--amb-navbar-image) !important;
+  background-repeat: var(--amb-navbar-repeat) !important;
+  background-size: var(--amb-navbar-size) !important;
+  background-position: var(--amb-navbar-pos);
+  animation: var(--amb-navbar-anim) !important;
+}
+
+/* Lantern and glow are fixed anchors; each rain depth travels an exact
+ * multiple of its tile height (260px, 4 x 200px) so the loop is seamless at
+ * visibly different speeds (43 px/s vs 133 px/s over 6s). */
+@keyframes amb-chrome-move {
+  from {
+    background-position:
+      right 14px top 12px,
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      0 0,
+      0 0;
+  }
+  to {
+    background-position:
+      right 14px top 12px,
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      0 260px,
+      0 800px;
+  }
+}
+
+@keyframes amb-navbar-move {
+  from {
+    background-position:
+      0 0,
+      0 0,
+      0 0;
+  }
+  to {
+    background-position:
+      0 260px,
+      0 800px,
+      0 0;
+  }
+}
+
+@keyframes amb-content-move {
+  from {
+    background-position:
+      right 26px top 26px,
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      0 0,
+      0 0;
+  }
+  to {
+    background-position:
+      right 26px top 26px,
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      0 260px,
+      0 800px;
+  }
+}
+
+/* The navbar override above outranks the adapter's generic reduced-motion
+ * rule on specificity; restate it at matching specificity so the existing
+ * reduced-motion contract still holds for the rain-only navbar layers. */
+@media (prefers-reduced-motion: reduce) {
+  :root #zen-appcontent-navbar-wrapper,
+  :root #zen-appcontent-navbar-container {
+    animation: none !important;
+  }
+}

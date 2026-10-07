@@ -1,0 +1,65 @@
+@import url("profiles/rainlit-shoji.css");
+/* ShojiWM ambient composition — chrome adapter.
+ *
+ * Paints the selected ambient profile's background layers onto proven Zen
+ * chrome containers only: the vertical toolbox / sidebar and the separate top
+ * navbar. Ordinary websites are never matched. Layers are plain
+ * background-images painted beneath the existing content, so no overlay sits
+ * above text and nothing intercepts clicks. Control geometry, favicon rules
+ * and the palette-owned background colours are left to blossom-chrome.css;
+ * this file only adds decoration layers on top of those colours.
+ *
+ * The decorative ZEN pseudo-logo from blossom-chrome.css is suppressed here;
+ * real favicons and tab labels are untouched.
+ *
+ * Selection: the FIRST @import below is the single source of profile
+ * selection. tools/ambient-composition.py --apply rewrites it and nothing
+ * else in this section.
+ */
+
+/* --- Ambient layers on proven chrome containers ------------------------- */
+
+#navigator-toolbox,
+#zen-appcontent-navbar-wrapper,
+#zen-appcontent-navbar-container,
+#sidebar-box {
+  background-image: var(--amb-chrome-image) !important;
+  background-repeat: var(--amb-chrome-repeat) !important;
+  background-size: var(--amb-chrome-size) !important;
+  background-position: var(--amb-chrome-pos);
+  animation: var(--amb-chrome-anim);
+}
+
+/* --- Decorative pseudo-logo suppression --------------------------------- */
+
+/* blossom-chrome.css draws a "ZEN" mark + wordmark as
+ * #navigator-toolbox[zen-sidebar-expanded="true"]::before. The owner asked
+ * for no browser logo. This removes only that pseudo-element; the real
+ * favicons and tab titles stay exactly as the tab rules render them. */
+#navigator-toolbox[zen-sidebar-expanded="true"]::before {
+  content: none !important;
+  background-image: none !important;
+  border-bottom: 0 !important;
+}
+
+/* --- Suppression windows ------------------------------------------------ */
+
+/* Native fullscreen collapses the chrome anyway; make the decoration
+ * explicitly absent so nothing decorative is composited there. */
+:root:is([inDOMFullscreen="true"], [inFullscreen="true"]) #navigator-toolbox,
+:root:is([inDOMFullscreen="true"], [inFullscreen="true"]) #zen-appcontent-navbar-wrapper,
+:root:is([inDOMFullscreen="true"], [inFullscreen="true"]) #zen-appcontent-navbar-container,
+:root:is([inDOMFullscreen="true"], [inFullscreen="true"]) #sidebar-box {
+  background-image: none !important;
+  animation: none !important;
+}
+
+/* Reduced motion: keep the static first frame, drop all animation. */
+@media (prefers-reduced-motion: reduce) {
+  #navigator-toolbox,
+  #zen-appcontent-navbar-wrapper,
+  #zen-appcontent-navbar-container,
+  #sidebar-box {
+    animation: none !important;
+  }
+}

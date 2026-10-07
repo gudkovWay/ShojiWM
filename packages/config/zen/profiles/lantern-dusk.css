@@ -1,0 +1,172 @@
+/* ShojiWM ambient composition — lantern-dusk.
+ *
+ * One complete lantern (the shared 1:2 content sprite, ../assets relative to
+ * this file) hangs in the upper-right of the vertical toolbox and of the
+ * native Home, matching the Kitty composition. A steady amber pool spills
+ * from the pane centre with a narrow cool teal rim where the metal edge
+ * catches light. The glow is static — no breathing, no global wash. Rare
+ * dust specks exist only inside the lit footprint and drift within it in a
+ * closed, non-repeating-reset loop. The short top navbar cannot fit the lamp
+ * without severe clipping, so there the selectors below keep only the
+ * bounded glow and rim, no lantern image.
+ *
+ * Consumed by ambient-chrome.css and ambient-content.css, which read the
+ * --amb-* variables below and the amb-*-move keyframes. Only one profile is
+ * ever imported at a time, so the keyframe names are unambiguous in the
+ * cascade.
+ */
+
+:root {
+  --amb-composition: "lantern-dusk";
+
+  /* Chrome (vertical toolbox / sidebar): lamp sprite, local amber pool,
+   * teal rim, and one small dust sheet confined to the lit footprint. */
+  --amb-chrome-image:
+    url("../assets/content-lantern.png"),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(232, 178, 96, 0.13),
+      rgba(214, 144, 64, 0.05) 55%,
+      rgba(214, 144, 64, 0) 75%
+    ),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(0, 0, 0, 0) 58%,
+      rgba(96, 158, 158, 0.05) 68%,
+      rgba(96, 158, 158, 0) 76%
+    ),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='240'%3E%3Ccircle cx='120' cy='96' r='1.1' fill='%23e8c98a' fill-opacity='0.28'/%3E%3Ccircle cx='92' cy='140' r='0.9' fill='%23e8c98a' fill-opacity='0.20'/%3E%3Ccircle cx='142' cy='58' r='0.8' fill='%23f0d7aa' fill-opacity='0.16'/%3E%3C/svg%3E");
+  --amb-chrome-repeat: no-repeat, no-repeat, no-repeat, no-repeat;
+  --amb-chrome-size:
+    min(64px, 12vw, 30vh) auto,
+    160px 160px,
+    160px 160px,
+    160px 160px;
+  --amb-chrome-pos:
+    right 14px top 12px,
+    right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+      top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+    right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+      top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+    right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+      top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px);
+  --amb-chrome-anim: amb-chrome-move 96s ease-in-out infinite;
+
+  /* Short top navbar: no room for the lamp — bounded glow + rim only. */
+  --amb-navbar-image:
+    radial-gradient(
+      circle at 100% 50%,
+      rgba(232, 178, 96, 0.10),
+      rgba(214, 144, 64, 0.04) 55%,
+      rgba(214, 144, 64, 0) 75%
+    ),
+    radial-gradient(
+      circle at 100% 50%,
+      rgba(0, 0, 0, 0) 55%,
+      rgba(96, 158, 158, 0.04) 68%,
+      rgba(96, 158, 158, 0) 78%
+    );
+  --amb-navbar-repeat: no-repeat, no-repeat;
+  --amb-navbar-size:
+    220px 100%,
+    220px 100%;
+  --amb-navbar-pos:
+    100% 50%,
+    100% 50%;
+  --amb-navbar-anim: none;
+
+  /* Native Home: the pool reaches further into the room, dust stays faint. */
+  --amb-content-image:
+    url("../assets/content-lantern.png"),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(232, 178, 96, 0.10),
+      rgba(214, 144, 64, 0.04) 55%,
+      rgba(214, 144, 64, 0) 75%
+    ),
+    radial-gradient(
+      circle at 50% 50%,
+      rgba(0, 0, 0, 0) 60%,
+      rgba(96, 158, 158, 0.04) 70%,
+      rgba(96, 158, 158, 0) 78%
+    ),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='300'%3E%3Ccircle cx='150' cy='128' r='1.0' fill='%23e8c98a' fill-opacity='0.22'/%3E%3Ccircle cx='118' cy='182' r='0.9' fill='%23e8c98a' fill-opacity='0.16'/%3E%3Ccircle cx='178' cy='88' r='0.8' fill='%23f0d7aa' fill-opacity='0.12'/%3E%3C/svg%3E");
+  --amb-content-repeat: no-repeat, no-repeat, no-repeat, no-repeat;
+  --amb-content-size:
+    min(150px, 24vw, 30vh) auto,
+    280px 280px,
+    280px 280px,
+    280px 280px;
+  --amb-content-pos:
+    right 26px top 26px,
+    right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+      top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+    right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+      top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+    right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+      top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px);
+  --amb-content-anim: amb-content-move 96s ease-in-out infinite;
+}
+
+/* The short navbar containers keep the bounded glow/rim, never the lamp
+ * sprite: higher specificity plus !important beats the generic adapter rule,
+ * while the fullscreen suppression (higher still) strips everything. */
+:root #zen-appcontent-navbar-wrapper,
+:root #zen-appcontent-navbar-container {
+  background-image: var(--amb-navbar-image) !important;
+  background-repeat: var(--amb-navbar-repeat) !important;
+  background-size: var(--amb-navbar-size) !important;
+  background-position: var(--amb-navbar-pos) !important;
+  animation: var(--amb-navbar-anim) !important;
+}
+
+/* The lamp, pool, rim and dust footprint stay anchored in every frame via
+ * right/top edge offsets (percent positions would resolve leftover space,
+ * not container coordinates); only the dust sheet drifts a few pixels
+ * inside the lit footprint (rest -> deflection -> rest). Identical 0%/100%
+ * endpoints avoid any reset. */
+@keyframes amb-chrome-move {
+  0%, 100% {
+    background-position:
+      right 14px top 12px,
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px);
+  }
+  50% {
+    background-position:
+      right 14px top 12px,
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 66px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 68px),
+      right calc(min(64px, 12vw, 30vh) * 0.498521 - 69px)
+        top calc(min(64px, 12vw, 30vh) * 1.251266 - 71px);
+  }
+}
+
+@keyframes amb-content-move {
+  0%, 100% {
+    background-position:
+      right 26px top 26px,
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px);
+  }
+  50% {
+    background-position:
+      right 26px top 26px,
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 114px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 114px),
+      right calc(min(150px, 24vw, 30vh) * 0.498521 - 117px)
+        top calc(min(150px, 24vw, 30vh) * 1.251266 - 117px);
+  }
+}

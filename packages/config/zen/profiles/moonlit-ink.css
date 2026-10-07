@@ -1,0 +1,105 @@
+/* ShojiWM ambient composition — moonlit-ink.
+ *
+ * Broad, slow leaf-shadow shapes cast across the surface by unseen foliage,
+ * under a restrained low-contrast mist. Movement is horizontal and glacial;
+ * contrast stays low so text over the surfaces remains primary.
+ *
+ * Consumed by ambient-chrome.css and ambient-content.css, which read the
+ * --amb-* variables below and the amb-chrome-move / amb-content-move
+ * keyframes. Only one profile is ever imported at a time.
+ */
+
+:root {
+  --amb-composition: "moonlit-ink";
+
+  /* Chrome: two large soft shadow ellipses drifting at different speeds, one
+   * broad mist band easing between them. */
+  --amb-chrome-image:
+    radial-gradient(
+      42% 60% at 30% 40%,
+      rgba(8, 12, 18, 0.16),
+      rgba(8, 12, 18, 0) 70%
+    ),
+    linear-gradient(
+      100deg,
+      rgba(156, 203, 213, 0) 20%,
+      rgba(156, 203, 213, 0.045) 50%,
+      rgba(156, 203, 213, 0) 80%
+    ),
+    radial-gradient(
+      55% 80% at 80% 70%,
+      rgba(8, 12, 18, 0.12),
+      rgba(8, 12, 18, 0) 72%
+    );
+  --amb-chrome-repeat: no-repeat, no-repeat, no-repeat;
+  --amb-chrome-size:
+    140% 160%,
+    200% 100%,
+    160% 200%;
+  --amb-chrome-pos:
+    -20% -30%,
+    -50% 0%,
+    10% -50%;
+  --amb-chrome-anim: amb-chrome-move 90s ease-in-out infinite;
+
+  /* Native Home: mist wider and louder, shadows softer still. */
+  --amb-content-image:
+    radial-gradient(
+      50% 70% at 70% 30%,
+      rgba(8, 12, 18, 0.10),
+      rgba(8, 12, 18, 0) 72%
+    ),
+    linear-gradient(
+      95deg,
+      rgba(156, 203, 213, 0) 15%,
+      rgba(156, 203, 213, 0.05) 50%,
+      rgba(156, 203, 213, 0) 85%
+    ),
+    radial-gradient(
+      40% 55% at 20% 80%,
+      rgba(8, 12, 18, 0.08),
+      rgba(8, 12, 18, 0) 70%
+    );
+  --amb-content-repeat: no-repeat, no-repeat, no-repeat;
+  --amb-content-size:
+    170% 180%,
+    220% 100%,
+    150% 160%;
+  --amb-content-pos:
+    15% -40%,
+    -60% 0%,
+    5% 10%;
+  --amb-content-anim: amb-content-move 96s ease-in-out infinite;
+}
+
+/* Non-repeating shadows and mist drift out and return to the same resting
+ * positions; identical endpoints avoid a visible reset. */
+@keyframes amb-chrome-move {
+  0%, 100% {
+    background-position:
+      -20% -30%,
+      -50% 0%,
+      10% -50%;
+  }
+  50% {
+    background-position:
+      -70% -30%,
+      50% 0%,
+      60% -50%;
+  }
+}
+
+@keyframes amb-content-move {
+  0%, 100% {
+    background-position:
+      15% -40%,
+      -60% 0%,
+      5% 10%;
+  }
+  50% {
+    background-position:
+      -35% -40%,
+      40% 0%,
+      55% 10%;
+  }
+}
