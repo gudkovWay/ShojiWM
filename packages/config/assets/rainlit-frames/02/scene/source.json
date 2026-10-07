@@ -15,7 +15,7 @@
     "sheets": [
       {
         "name": "walk",
-        "path": ".superpowers/assets/rainlit02-bamboo-girl/walk-master.webp",
+        "path": "assets/rainlit-frames/02/scene/source/walk-master.webp",
         "sha256": "754a9a6fbb36b88289ed7a4104f7e4ede55a4727659faf1ba466a3950c388826",
         "size": [
           1536,
@@ -25,7 +25,7 @@
       },
       {
         "name": "action",
-        "path": ".superpowers/assets/rainlit02-bamboo-girl/actions-master.webp",
+        "path": "assets/rainlit-frames/02/scene/source/actions-master.webp",
         "sha256": "0658797cc0baa586918f41ef0ce67168805e1cd1fd064433951e8a8bdb280a39",
         "size": [
           1536,

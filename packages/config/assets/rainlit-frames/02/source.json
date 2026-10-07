@@ -17,7 +17,7 @@
   "source": {
     "master": "master.webp",
     "master_sha256": "a58cb8ed7f7f26365ee9a9a3e5e13cc95e44bba5ebff783a0b454df6f21ba58e",
-    "approved_master": ".superpowers/assets/rainlit-frame-concepts/02-painterly.webp",
+    "approved_master": "master.webp",
     "approved_master_sha256": "a58cb8ed7f7f26365ee9a9a3e5e13cc95e44bba5ebff783a0b454df6f21ba58e",
     "master_size": [
       1536,

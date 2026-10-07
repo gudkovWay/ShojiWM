@@ -2,7 +2,7 @@
   "pack": "06",
   "title": "Rainlit bronze, celadon and ceramic lamp",
   "design": {
-    "master": "06-painterly.webp",
+    "master": "master.webp",
     "generator": {
       "provider": "openai-codex",
       "model": "gpt-image-2-codex",
@@ -401,7 +401,7 @@
       ]
     },
     "resampling": "each cell is resized from its measured source span; rails are cross-faded at their longitudinal endpoints so the repeating tile is seamless; ornament art is scaled isotropically at 1.78 source px per logical px",
-    "originals_preserved": "the approved master is retained unchanged in .superpowers/assets/rainlit-frame-concepts/ and copied here byte-identically"
+    "originals_preserved": "the approved master is retained unchanged as the sibling master.webp and read byte-identically from there"
   },
   "not_claimed": [
     "no embedded alpha existed in the master; derived alpha is a segmentation result and visual correctness is unverified",

@@ -15,7 +15,7 @@
       1536,
       1024
     ],
-    "approved_master": "09-painterly.webp",
+    "approved_master": "master.webp",
     "approved_master_sha256": "1f44c287907277f765b21f49868f9f0b335b88bfc5470e8cd30945a35ab4d838",
     "alpha_authority": "measured: no embedded alpha in the RGB master; alpha derived from backdrop connectivity (background/opening components of the flat backdrop colour are transparent, enclosed painted darks stay opaque). No global dark-key.",
     "backdrop_rgb": [
