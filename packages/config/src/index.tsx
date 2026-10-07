@@ -73,8 +73,8 @@ import {
 } from "./effect/rain-controls";
 // Rainlit frame packs: the runtime module imports the four authored pack
 // modules purely (no asset loading, no effect compilation, no selection side
-// effects at load). With the default `{ id: null }` selection nothing here
-// resolves a pack, so the legacy pipeline below is bit-for-bit unchanged.
+// effects at import). Pack 02 is the declared startup default, so a cold start
+// resolves pack 02 while an explicit `{ id: null }` keeps the legacy pipeline.
 import {
   headerPadding,
   rainlitFor,
@@ -148,11 +148,15 @@ const WINDOW_STACK_Z_INDEX_RANGE = 100_000_000;
 const FOCUSED_TILED_WINDOW_Z_INDEX = 1_000_000_000;
 const REORDERING_TILED_WINDOW_Z_INDEX = -2_000_000_000;
 const RAIN_EFFECTS_STATE = "config.rain-effects-enabled";
-// Own reload key for the explicit Rainlit frame selection. The value is the
-// full `{ id, reducedMotion }` policy; a restored `id: null` keeps the legacy
-// frame. Nothing is auto-selected: only `rainlit.frames.select` (or the
-// restore of a previously persisted selection) changes it.
-const RAINLIT_SELECTION_STATE = "config.rainlit-selection";
+// Own reload keys for the explicit Rainlit frame selection. The live value is
+// the full `{ id, reducedMotion }` policy and is persisted under the versioned
+// v2 key; the pre-v2 key stays readable for a one-time migration (a valid
+// non-null legacy id is kept, while a legacy `null` becomes the declared
+// startup default 02). A restored `id: null` under v2 keeps the legacy frame.
+// Nothing is auto-selected: only `rainlit.frames.select` (or the restore of a
+// previously persisted selection) changes it.
+const RAINLIT_SELECTION_STATE = "config.rainlit-selection.v2";
+const LEGACY_RAINLIT_SELECTION_STATE = "config.rainlit-selection";
 const rainEffectsEnabled = signal(true);
 const ambientPhase = animationVariable("ambient-shoji-phase");
 const rainFrameCache = new WeakMap<
@@ -194,10 +198,35 @@ function isRainlitFrameId(value: unknown): value is RainlitFrameId {
 }
 
 /**
+ * Validates a persisted selection payload (`{ id, reducedMotion }`) exactly,
+ * with no coercion: `id` must be `null` or a known frame, and `reducedMotion`
+ * must be a boolean. Returns `undefined` for anything else so the caller can
+ * fall through to the legacy key or the runtime's startup default.
+ */
+function readRainlitSelection(
+  value: unknown,
+): { id: RainlitFrameId | null; reducedMotion: boolean } | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const { id, reducedMotion } = value as {
+    id?: unknown;
+    reducedMotion?: unknown;
+  };
+  if (
+    (id === null || isRainlitFrameId(id)) &&
+    typeof reducedMotion === "boolean"
+  ) {
+    return { id, reducedMotion };
+  }
+  return undefined;
+}
+
+/**
  * Logical root insets for the unified frame come from the selected pack's
- * authored insets (26px sides/bottom, top 26 for 02/06/09 and 48 for the 07
- * beam); this constant is the legacy fixed 26px ring used when the selection
- * is null. Geometry is deliberately independent of the rain-art toggle, so
+ * authored insets (52px for 02, 26px for 06/09, and 48px top for 07);
+ * this constant is the legacy 26px ring used when the selection is null.
+ * Geometry is deliberately independent of the rain-art toggle, so
  * native chrome and the reserved opening never move when art is switched off.
  */
 const LEGACY_RAIN_INSETS: RainlitEdges = {
@@ -292,7 +321,8 @@ COMPOSITOR.onDisable((event) => {
     const snapshot = HYBRID_WINDOW_MANAGER.snapshot();
     event.persist(HOT_RELOAD_WINDOW_MANAGER_STATE, snapshot);
     event.persist(RAIN_EFFECTS_STATE, rainEffectsEnabled.peek());
-    // Persist the explicit frame policy; a `null` id persists as legacy.
+    // Persist the explicit frame policy under the versioned v2 key; a `null`
+    // id persists as-is and still means the legacy frame on restore.
     event.persist(RAINLIT_SELECTION_STATE, rainlitSelection.peek());
   }
   HYBRID_WINDOW_MANAGER.dispose();
@@ -307,19 +337,28 @@ COMPOSITOR.onEnable((event) => {
     if (rainEnabled !== undefined) {
       rainEffectsEnabled.set(rainEnabled);
     }
-    // Restore the known selection only if it validates exactly; a stale or
-    // malformed value (or the previous `null`) leaves the legacy default.
-    const restoredSelection = event.restore<unknown>(RAINLIT_SELECTION_STATE);
-    if (restoredSelection && typeof restoredSelection === "object") {
-      const { id, reducedMotion } = restoredSelection as {
-        id?: unknown;
-        reducedMotion?: unknown;
-      };
-      if (
-        (id === null || isRainlitFrameId(id)) &&
-        typeof reducedMotion === "boolean"
-      ) {
-        setRainlitSelection(id, reducedMotion);
+    // Restore the persisted v2 selection exactly, including an explicit
+    // `null`. If v2 is absent or malformed, fall back once to the pre-v2 key:
+    // a valid non-null legacy id and its reducedMotion are kept unchanged,
+    // while a legacy `null` migrates to the declared startup default 02. When
+    // neither validates, the runtime's startup default 02 stands.
+    const restoredSelection = readRainlitSelection(
+      event.restore<unknown>(RAINLIT_SELECTION_STATE),
+    );
+    if (restoredSelection) {
+      setRainlitSelection(
+        restoredSelection.id,
+        restoredSelection.reducedMotion,
+      );
+    } else {
+      const legacySelection = readRainlitSelection(
+        event.restore<unknown>(LEGACY_RAINLIT_SELECTION_STATE),
+      );
+      if (legacySelection) {
+        setRainlitSelection(
+          legacySelection.id ?? "02",
+          legacySelection.reducedMotion,
+        );
       }
     }
     const snapshot = event.restore<HybridWindowManagerSnapshot>(
@@ -478,8 +517,8 @@ WORKSPACE_IPC.handle("windows.activate", (params) => {
 //                            catalog; runtimeVerified is always false)
 //   rainlit.frames.select  { id: null|'02'|'06'|'07'|'09', reducedMotion?: bool }
 //                          (command) -> RainlitStatus
-// Selection is configuration only: it is never auto-applied, no keybinding is
-// registered, and no picker UI lives here (that is a later workstream).
+// Pack 02 is the cold-start default. IPC selections survive hot reload only;
+// no picker or frame-selection keybinding is registered here.
 // ---------------------------------------------------------------------------
 WORKSPACE_IPC.handle("rainlit.frames.get", () => rainlitStatus());
 WORKSPACE_IPC.handle("rainlit.frames.select", (params) => {
@@ -1417,9 +1456,9 @@ function usesClientDecoration(window: WaylandWindow): boolean {
 function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
   const client = window.position;
   if (rainVariantFor(window.appId()) !== undefined) {
-    // Unified frame: the selected pack's authored material ring (26px sides
-    // and bottom; top 26 for 02/06/09, 48 for the 07 beam), or the legacy
-    // fixed 26px ring while the selection is null. Positive L/R/B insets
+    // Unified frame: the selected pack's authored material ring (52px for 02,
+    // 26px for 06/09, 48px top for 07), or the legacy 26px ring while the
+    // selection is null. Positive L/R/B insets
     // reserve the rails and the native header occupies the top inset, so the
     // total overhead is left+right by top+bottom — and this is independent of
     // the rain-art toggle so target geometry never changes when art is off.
