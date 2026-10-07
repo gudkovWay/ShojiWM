@@ -1,9 +1,10 @@
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-            GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
-            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device as SmithayInputDevice,
+            Event, GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputBackend,
+            InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+            PointerMotionEvent,
         },
         session::Session,
     },
@@ -321,7 +322,7 @@ impl ShojiWM {
     /// Invoke a runtime key binding handler by id and apply the resulting
     /// runtime config/state changes. Shared by the normal (intercepted) key
     /// path and the modifier-tap (forwarded) path.
-    fn run_runtime_key_binding(&mut self, binding_id: &str) {
+    pub(crate) fn run_runtime_key_binding(&mut self, binding_id: &str) {
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
         match self
@@ -508,6 +509,30 @@ impl ShojiWM {
                 };
                 let runtime_key_bindings = self.runtime_key_bindings.clone();
 
+                // Stop a held-key repeat on the *physical* release of the key
+                // that armed it, before binding matching and regardless of the
+                // modifier state at release (the user may have let go of a
+                // modifier first). The raw key code avoids depending on xkb
+                // `Keycode` internals, and the device key is computed only when
+                // a repeat is actually active for this key.
+                let key_code = event.key_code().raw();
+                if key_phase == crate::runtime_key_binding::RuntimeKeyBindingPhase::Release
+                    && self
+                        .held_key_repeat
+                        .as_ref()
+                        .is_some_and(|repeat| repeat.key_code == key_code)
+                {
+                    let device_matches = self.held_key_repeat.as_ref().is_some_and(|repeat| {
+                        match repeat.device_key.as_deref() {
+                            None => true,
+                            Some(key) => key == device.id().as_str(),
+                        }
+                    });
+                    if device_matches {
+                        self.cancel_held_key_repeat();
+                    }
+                }
+
                 let action = self
                     .seat
                     .get_keyboard()
@@ -659,6 +684,22 @@ impl ShojiWM {
                     KeyboardAction::Quit => self.shutdown(),
                     KeyboardAction::ReloadConfig => self.reload_decoration_runtime(),
                     KeyboardAction::RuntimeKeyBinding(binding_id) => {
+                        // Arm repeat before running the handler: if the handler
+                        // reloads the config, the replacement cancels this run
+                        // instead of being overridden by a post-handler start.
+                        let repeat = self
+                            .runtime_key_bindings
+                            .iter()
+                            .find(|binding| binding.id == binding_id)
+                            .and_then(|binding| binding.repeat);
+                        if let Some(repeat) = repeat {
+                            self.start_held_key_repeat(
+                                binding_id.clone(),
+                                key_code,
+                                Some(device.id()),
+                                repeat,
+                            );
+                        }
                         self.run_runtime_key_binding(&binding_id);
                     }
                     KeyboardAction::LogMarker(digit) => {
@@ -1792,12 +1833,38 @@ impl ShojiWM {
                     timestamp,
                 });
             }
+            InputEvent::DeviceRemoved { device, .. } => {
+                // A removed keyboard can never deliver the release that would
+                // end a held repeat; stop it now. Identity is computed only
+                // when a repeat is actually active; an unknown tracked device
+                // is treated as matching any removal.
+                let tracked_removed = self.held_key_repeat.as_ref().is_some_and(|repeat| {
+                    match repeat.device_key.as_deref() {
+                        None => true,
+                        Some(key) => key == device.id().as_str(),
+                    }
+                });
+                if tracked_removed {
+                    self.cancel_held_key_repeat();
+                }
+            }
             _ => {}
         }
     }
 
     pub(crate) fn apply_runtime_window_actions(&mut self, actions: Vec<RuntimeWindowAction>) {
         for runtime_action in actions {
+            // Handled before any window-id lookup: `clearFocus` carries no
+            // window. It cancels a deferred explicit focus and clears the seat
+            // window target without electing a successor.
+            if matches!(
+                runtime_action.action,
+                crate::ssd::WaylandWindowAction::ClearFocus
+            ) {
+                self.clear_window_keyboard_focus();
+                self.schedule_redraw();
+                continue;
+            }
             if matches!(
                 runtime_action.action,
                 crate::ssd::WaylandWindowAction::FinalizeClose
@@ -1816,6 +1883,11 @@ impl ShojiWM {
                     .remove(&runtime_action.window_id);
                 self.pending_initial_focus_window_ids
                     .remove(&runtime_action.window_id);
+                if self.pending_explicit_focus_window_id.as_deref()
+                    == Some(runtime_action.window_id.as_str())
+                {
+                    self.pending_explicit_focus_window_id = None;
+                }
                 self.pending_xdg_state_configure_window_ids
                     .remove(&runtime_action.window_id);
                 self.snapshot_dirty_window_ids
@@ -1830,6 +1902,19 @@ impl ShojiWM {
                 self.runtime_node_only_window_ids
                     .remove(&runtime_action.window_id);
                 self.schedule_redraw();
+                continue;
+            }
+
+            // Also handled before the window-id lookup: `warpPointer` carries no
+            // window. It moves the real seat pointer; it must not synthesize a
+            // runtime PointerMove or device relative motion.
+            if matches!(
+                runtime_action.action,
+                crate::ssd::WaylandWindowAction::WarpPointer
+            ) {
+                if let Some(position) = runtime_action.position {
+                    self.warp_pointer(position);
+                }
                 continue;
             }
 
@@ -1890,9 +1975,10 @@ impl ShojiWM {
                     );
                 }
                 crate::ssd::WaylandWindowAction::Focus => {
-                    let serial = SERIAL_COUNTER.next_serial();
-                    self.focus_window(&window, serial);
+                    self.request_window_keyboard_focus(&window);
                 }
+                crate::ssd::WaylandWindowAction::ClearFocus => {}
+                crate::ssd::WaylandWindowAction::WarpPointer => {}
                 crate::ssd::WaylandWindowAction::FinalizeClose => {}
                 crate::ssd::WaylandWindowAction::ScheduleAnimation
                 | crate::ssd::WaylandWindowAction::CancelAnimation => {}
@@ -2987,6 +3073,82 @@ impl ShojiWM {
                 constraint.activate();
             }
         });
+    }
+
+    /// Move the real seat pointer to a global logical position. This is the
+    /// keyboard-focus cursor-follow path: it mirrors the visual state a physical
+    /// motion would produce (pointer focus, hover, cursor icon, redraw) but
+    /// deliberately does not synthesize relative device motion or dispatch a
+    /// runtime `PointerMove` — those belong to real input and to
+    /// `keyboardNavigationMonitor`.
+    fn warp_pointer(&mut self, position: PointerMovePointSnapshot) {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return;
+        }
+        if self.session_lock_active {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if pointer.is_grabbed() {
+            return;
+        }
+
+        // An active locked or confined constraint owns the pointer's motion for
+        // its current focus surface; warping out from under it would break the
+        // client's contract.
+        if let Some((surface, surface_origin)) = self.pointer_contents.surface.clone()
+            && pointer.current_focus().as_ref() == Some(&surface)
+        {
+            let location = pointer.current_location();
+            let constrained = with_pointer_constraint(&surface, &pointer, |constraint| {
+                constraint.is_some_and(|constraint| {
+                    constraint.is_active()
+                        && matches!(
+                            &*constraint,
+                            PointerConstraint::Locked(_) | PointerConstraint::Confined(_)
+                        )
+                        && constraint.region().is_none_or(|region| {
+                            region.contains((location - surface_origin).to_i32_floor())
+                        })
+                })
+            });
+            if constrained {
+                return;
+            }
+        }
+
+        let Some(pos) = constrain_pointer_location_to_outputs(
+            Point::from((position.x, position.y)),
+            self.space
+                .outputs()
+                .filter_map(|output| self.space.output_geometry(output)),
+        ) else {
+            return;
+        };
+
+        let serial = SERIAL_COUNTER.next_serial();
+        self.pointer_contents = self.pointer_contents_at(pos);
+        let under = self.pointer_contents.surface.clone();
+        let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
+
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        self.activate_pointer_constraint_at(pos);
+        self.update_decoration_hover_target(pos);
+        if !pointer.is_grabbed() {
+            self.update_decoration_cursor_icon(pos);
+        }
+        self.request_redraw_for_pointer_motion();
     }
 }
 

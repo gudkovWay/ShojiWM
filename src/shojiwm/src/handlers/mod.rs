@@ -239,6 +239,11 @@ impl SessionLockHandler for ShojiWM {
         self.output_overlays.clear();
         self.session_lock_active = true;
         self.layer_shell_on_demand_focus = None;
+        // A held repeat must not survive the lock (and its handler must not run
+        // behind the lock screen); a deferred explicit focus must not grant
+        // stale focus at unlock.
+        self.cancel_held_key_repeat();
+        self.pending_explicit_focus_window_id = None;
         // Park the focus owner rather than dropping it: `unlock` restores it.
         // Taken directly instead of through
         // `set_window_keyboard_focus_target_surface` so the lock is not

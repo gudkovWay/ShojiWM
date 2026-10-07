@@ -1073,6 +1073,10 @@ struct SurfaceDmabufFeedback {
 }
 
 pub fn pause_tty_session(state: &mut ShojiWM) {
+    // The VT is going away, so a held key's release can never arrive. Stop any
+    // held repeat now rather than letting it survive until the timer's own
+    // session guard, which would miss a pause+resume before the deadline.
+    state.cancel_held_key_repeat();
     crate::backend::overlay::close_all("Session paused");
     state.output_overlays.clear();
     for backend in state.tty_backends.values_mut() {

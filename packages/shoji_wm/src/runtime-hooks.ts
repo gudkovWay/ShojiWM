@@ -1,4 +1,5 @@
 import type {
+  CursorWarpPosition,
   SSDRebuildSuppressionHandle,
   SSDRebuildSuppressionOptions,
   SSDRebuildSuppressionViolationPolicy,
@@ -9,6 +10,8 @@ interface RuntimeHooks {
   markWindowDirty(windowId: string): void;
   markLayerDirty(layerId: string): void;
   wakeRuntime(): void;
+  requestWindowFocusClear(): void;
+  requestPointerWarp(position: CursorWarpPosition): void;
 }
 
 let hooks: RuntimeHooks | null = null;
@@ -486,6 +489,14 @@ export function markLayerDirty(layerId: string): void {
 
 export function wakeRuntime(): void {
   hooks?.wakeRuntime();
+}
+
+export function requestWindowFocusClear(): void {
+  hooks?.requestWindowFocusClear();
+}
+
+export function requestPointerWarp(position: CursorWarpPosition): void {
+  hooks?.requestPointerWarp(position);
 }
 
 export function enterWindowDependencyScope(windowId: string): void {

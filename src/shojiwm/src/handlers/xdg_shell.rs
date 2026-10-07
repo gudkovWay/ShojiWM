@@ -211,6 +211,12 @@ impl XdgShellHandler for ShojiWM {
             return;
         };
 
+        let focus_output = self
+            .window_keyboard_focus_owner
+            .as_ref()
+            .filter(|root| Self::window_matches_root_surface(&window, root))
+            .and_then(|_| self.output_for_window(&window));
+
         let decoration = self.window_decorations.get(&window).cloned();
         // The runtime knows a window by its stable id from its FIRST evaluation, which happens
         // on the buffer-less initial commit, before any decoration entry exists. So the id
@@ -260,10 +266,9 @@ impl XdgShellHandler for ShojiWM {
         {
             warn!(window_id, ?error, "failed to report destroyed xdg toplevel to the runtime");
         }
-        // Elect a successor now that the window is out of the space. Nothing
-        // else on the close path touches keyboard focus, so the dead target
-        // used to survive until some unrelated event ran
-        // `update_keyboard_focus` — and no replacement was ever chosen.
+        // Keep automatic close fallback on the dying owner's output, after
+        // callbacks have had a chance to select an explicit successor.
+        self.restore_focus_after_window_close(&window, focus_output.as_ref());
         self.update_keyboard_focus(smithay::utils::SERIAL_COUNTER.next_serial());
         self.remove_window_decoration_negotiation(wl_surface);
         self.request_tty_maintenance("xdg-toplevel-destroyed");

@@ -98,8 +98,8 @@ use crate::runtime_input::{
     snapshot_for_libinput_device,
 };
 use crate::runtime_key_binding::{
-    CompiledRuntimeKeyBinding, RuntimeKeyBindingConfigUpdate, RuntimeKeyBindingEntry,
-    compile_runtime_key_bindings,
+    CompiledKeyRepeat, CompiledRuntimeKeyBinding, RuntimeKeyBindingConfigUpdate,
+    RuntimeKeyBindingEntry, compile_runtime_key_bindings,
 };
 use crate::runtime_pointer::{
     RuntimePointerConfigUpdate, RuntimePointerModifier, parse_runtime_pointer_modifier,
@@ -209,6 +209,19 @@ impl TrackedDecorationInteractionTarget {
     pub fn same_node(&self, other: &Self) -> bool {
         self.window_id == other.window_id && self.target.node_id == other.target.node_id
     }
+}
+
+/// A held-key repeat run. `binding_id` is moved in and out of `state` each
+/// tick rather than cloned, so a repeat timer performs no per-tick allocation.
+/// `timer` is the calloop registration, removed on cancel so a released key
+/// leaves no orphan timer behind.
+#[derive(Clone, Debug)]
+pub struct HeldKeyRepeat {
+    pub binding_id: String,
+    pub key_code: u32,
+    pub device_key: Option<String>,
+    pub interval_ms: u64,
+    pub timer: smithay::reexports::calloop::RegistrationToken,
 }
 
 #[derive(Clone)]
@@ -473,6 +486,23 @@ pub struct ShojiWM {
     /// most recent windows swapped places (issue #92).
     pub session_lock_focus_owner: Option<WlSurface>,
     pub window_keyboard_focus: Option<WlSurface>,
+    /// An explicit config focus request (`COMPOSITOR.window.focus`) whose
+    /// managed target is still hidden because its queued visibility update has
+    /// not been applied yet. Flushed after managed window updates land and
+    /// before focus reconciliation; the last request wins, and a `clearFocus`
+    /// action cancels it.
+    pub pending_explicit_focus_window_id: Option<String>,
+    /// Whether the deferred explicit focus was requested while user input was
+    /// in flight. Restored around the deferred grant so `focus_window`'s
+    /// supersede rule treats it exactly as it would have at request time.
+    pub pending_explicit_focus_user_input: bool,
+    /// Active held-key repeat, if any.
+    pub held_key_repeat: Option<HeldKeyRepeat>,
+    /// Bumped whenever a repeat run starts or is cancelled. A fired calloop
+    /// timer compares its captured generation against this to decide whether it
+    /// still owns the run — this is what makes stale timers harmless across
+    /// release, reload, lock and device removal.
+    pub held_key_repeat_generation: u64,
     /// Root surfaces of the windows the user has actually *used*, most recent
     /// first.
     ///
@@ -1002,6 +1032,20 @@ impl ShojiWM {
             .is_none_or(|decoration| decoration.managed_window_allows_input())
     }
 
+    // Preserve first-paint focus deferral, but never exempt a pending window
+    // that the workspace policy has hidden or made noninteractive.
+    fn window_allows_keyboard_focus(&self, window: &Window) -> bool {
+        self.window_decorations.get(window).is_none_or(|decoration| {
+            decoration.managed_window_allows_input()
+                || (self
+                    .pending_initial_focus_window_ids
+                    .contains(&decoration.snapshot.id)
+                    && decoration.managed_window.interactive
+                    && (!decoration.managed_window.managed
+                        || decoration.managed_window.visible))
+        })
+    }
+
     fn window_was_used_by_user(&self, window: &Window) -> bool {
         Self::window_root_surface(window)
             .is_some_and(|root| self.focus_chain.contains(&root))
@@ -1109,6 +1153,13 @@ impl ShojiWM {
     /// command into from a window an application opened beside it moments later,
     /// and a key press produces no event the config can observe.
     pub(crate) fn elect_focus_successor(&self) -> Option<Window> {
+        self.elect_focus_successor_for_output(None)
+    }
+
+    fn elect_focus_successor_for_output(&self, output: Option<&Output>) -> Option<Window> {
+        let on_output = |window: &Window| {
+            output.is_none_or(|output| self.output_for_window(window).as_ref() == Some(output))
+        };
         // A window still waiting for its open-time focus delivery (granted at
         // `onOpen`, parked until first paint) is the freshest statement of
         // intent and outranks the focus chain. Some clients map short-lived
@@ -1130,6 +1181,8 @@ impl ShojiWM {
             .filter(|window| {
                 self.pending_initial_focus_window_ids
                     .contains(&self.snapshot_window(window).id)
+                    && self.window_allows_keyboard_focus(window)
+                    && on_output(window)
             })
             .max_by_key(|window| window.id())
             .cloned()
@@ -1148,6 +1201,7 @@ impl ShojiWM {
             .filter(|root| root.alive())
             .and_then(|root| self.window_for_root_surface(root))
             .filter(|window| self.window_allows_input(window))
+            .filter(|window| on_output(window))
             .cloned()
         {
             return Some(window);
@@ -1156,7 +1210,7 @@ impl ShojiWM {
         for root in &self.focus_chain {
             if let Some(window) = self
                 .window_for_root_surface(root)
-                .filter(|window| self.window_allows_input(window))
+                .filter(|window| self.window_allows_input(window) && on_output(window))
             {
                 return Some(window.clone());
             }
@@ -1167,9 +1221,31 @@ impl ShojiWM {
         self.windows_top_to_bottom()
             .into_iter()
             .find(|window| {
-                self.window_allows_input(window) && !self.excluded_from_automatic_focus(window)
+                self.window_allows_input(window)
+                    && !self.excluded_from_automatic_focus(window)
+                    && on_output(window)
             })
             .cloned()
+    }
+
+    /// A close must not move selection to another monitor. The output is
+    /// captured before unmapping; an explicit config focus granted during
+    /// the close callback wins over this fallback.
+    pub(crate) fn restore_focus_after_window_close(
+        &mut self,
+        window: &Window,
+        output: Option<&Output>,
+    ) {
+        if !self
+            .window_keyboard_focus_owner
+            .as_ref()
+            .is_some_and(|root| Self::window_matches_root_surface(window, root))
+        {
+            return;
+        }
+        let successor =
+            output.and_then(|output| self.elect_focus_successor_for_output(Some(output)));
+        self.set_window_keyboard_focus_target(successor.as_ref());
     }
 
     /// Desktop pets stay above other windows but must only get keyboard focus
@@ -1177,6 +1253,168 @@ impl ShojiWM {
     /// fallback. Local fork: replace with a per-window config flag upstream.
     fn excluded_from_automatic_focus(&self, window: &Window) -> bool {
         self.snapshot_window(window).app_id.as_deref() == Some("MateEngineX.x86_64")
+    }
+
+    /// Clear seat window focus without electing a successor.
+    ///
+    /// Backs `COMPOSITOR.window.focus(null)` for an empty workspace. Cancels
+    /// any deferred explicit focus so a stale grant cannot land later;
+    /// first-paint (initial focus) deferral and layer/lock priority remain with
+    /// `update_keyboard_focus`, which with no window target sets the keyboard
+    /// focus to `None` (or to a layer/lock surface).
+    pub(crate) fn clear_window_keyboard_focus(&mut self) {
+        self.pending_explicit_focus_window_id = None;
+        self.window_keyboard_focus_owner = None;
+        self.window_keyboard_focus = None;
+        self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
+    }
+
+    /// Record an explicit focus request that cannot be delivered yet because a
+    /// managed target is still hidden pending its visibility refresh. The last
+    /// request wins. A target that is available now is focused immediately.
+    pub(crate) fn request_window_keyboard_focus(&mut self, window: &Window) {
+        let window_id = self.snapshot_window(window).id;
+        let is_managed = self
+            .window_decorations
+            .get(window)
+            .is_some_and(|decoration| decoration.managed_window.managed);
+        let hidden_pending_refresh = is_managed
+            && !self.window_allows_keyboard_focus(window)
+            && (self.runtime_dirty_window_ids.contains(&window_id)
+                || self.runtime_managed_only_window_ids.contains(&window_id));
+        if hidden_pending_refresh {
+            self.pending_explicit_focus_window_id = Some(window_id);
+            self.pending_explicit_focus_user_input = self.user_input_in_flight;
+            return;
+        }
+        self.pending_explicit_focus_window_id = None;
+        self.focus_window(window, SERIAL_COUNTER.next_serial());
+    }
+
+    /// Deliver a deferred explicit focus once managed window updates have been
+    /// applied. Called before focus reconciliation in the decoration refresh so
+    /// visibility that landed in this pass is honored. A target that is closed,
+    /// was refreshed this pass yet remains unavailable, or is no longer queued
+    /// is dropped rather than left to grant stale focus; a target whose refresh
+    /// is still queued is restored and keeps waiting.
+    pub(crate) fn flush_pending_explicit_focus(
+        &mut self,
+        processed_window_ids: &std::collections::HashSet<String>,
+    ) {
+        let Some(window_id) = self.pending_explicit_focus_window_id.take() else {
+            return;
+        };
+        // Match on the already-cached decoration snapshot id instead of
+        // building a full window snapshot for every candidate.
+        let target = self
+            .window_decorations
+            .iter()
+            .find(|(_, decoration)| decoration.snapshot.id == window_id)
+            .map(|(window, _)| window.clone());
+        let Some(window) = target else {
+            return;
+        };
+        if self.window_allows_keyboard_focus(&window) {
+            let from_user_input = self.pending_explicit_focus_user_input;
+            let previous = std::mem::replace(&mut self.user_input_in_flight, from_user_input);
+            self.focus_window(&window, SERIAL_COUNTER.next_serial());
+            self.user_input_in_flight = previous;
+        } else if !processed_window_ids.contains(&window_id)
+            && (self.runtime_dirty_window_ids.contains(&window_id)
+                || self.runtime_managed_only_window_ids.contains(&window_id))
+        {
+            // Still waiting on its queued visibility refresh.
+            self.pending_explicit_focus_window_id = Some(window_id);
+        }
+    }
+
+    /// Stop any active held-key repeat, remove its timer from the event loop,
+    /// and invalidate any in-flight callback.
+    pub(crate) fn cancel_held_key_repeat(&mut self) {
+        if let Some(repeat) = self.held_key_repeat.take() {
+            self.loop_handle.remove(repeat.timer);
+        }
+        self.held_key_repeat_generation = self.held_key_repeat_generation.wrapping_add(1);
+    }
+
+    /// Arm held-key repeat for a pressed binding. Supersedes any previous run
+    /// (a new press wins) and runs the first repeat only after `delay_ms`.
+    pub(crate) fn start_held_key_repeat(
+        &mut self,
+        binding_id: String,
+        key_code: u32,
+        device_key: Option<String>,
+        repeat: CompiledKeyRepeat,
+    ) {
+        self.cancel_held_key_repeat();
+        self.held_key_repeat_generation = self.held_key_repeat_generation.wrapping_add(1);
+        let generation = self.held_key_repeat_generation;
+        let loop_handle = self.loop_handle.clone();
+        match loop_handle.insert_source(
+            Timer::from_duration(Duration::from_millis(repeat.delay_ms)),
+            move |_, _, state| state.run_held_key_repeat_tick(generation),
+        ) {
+            Ok(timer) => {
+                self.held_key_repeat = Some(HeldKeyRepeat {
+                    binding_id,
+                    key_code,
+                    device_key,
+                    interval_ms: repeat.interval_ms,
+                    timer,
+                });
+            }
+            Err(error) => {
+                warn!(?error, "failed to arm held-key repeat timer");
+                self.held_key_repeat = None;
+            }
+        }
+    }
+
+    /// Body of the held-key repeat timer. Refuses to run for a stale generation
+    /// or while the session is locked or paused, re-runs the binding handler,
+    /// and reschedules from the current time so a busy loop cannot build up a
+    /// catch-up burst.
+    fn run_held_key_repeat_tick(&mut self, generation: u64) -> TimeoutAction {
+        if self.held_key_repeat_generation != generation {
+            return TimeoutAction::Drop;
+        }
+        // Refuse both a locked session and a paused VT session; the repeat must
+        // not keep driving handlers while the session is not on screen.
+        let session_inactive = self.session_lock_active
+            || (!self.tty_backends.is_empty() && !self.tty_session_active);
+        if session_inactive {
+            self.cancel_held_key_repeat();
+            return TimeoutAction::Drop;
+        }
+        let Some(repeat) = self.held_key_repeat.take() else {
+            return TimeoutAction::Drop;
+        };
+        let HeldKeyRepeat {
+            binding_id,
+            key_code,
+            device_key,
+            interval_ms,
+            timer,
+        } = repeat;
+        // The held key is user intent just like an ordinary press: run the
+        // handler under the same flag `process_input_event` sets, so
+        // focus-ordering policy sees it as user-requested.
+        let previous_user_input = std::mem::replace(&mut self.user_input_in_flight, true);
+        self.run_runtime_key_binding(&binding_id);
+        self.user_input_in_flight = previous_user_input;
+        if self.held_key_repeat_generation != generation {
+            // The handler cancelled or replaced the run (reload, a new press).
+            // Whoever did it already removed this timer.
+            return TimeoutAction::Drop;
+        }
+        self.held_key_repeat = Some(HeldKeyRepeat {
+            binding_id,
+            key_code,
+            device_key,
+            interval_ms,
+            timer,
+        });
+        TimeoutAction::ToDuration(Duration::from_millis(interval_ms))
     }
 
     fn prune_keyboard_focus_targets(&mut self) {
@@ -1203,10 +1441,11 @@ impl ShojiWM {
                     .find(|window| self.surface_belongs_to_window(window, surface))
                     .and_then(Self::window_root_surface)
             });
-            let owner_still_mapped = owner_root.as_ref().is_some_and(|owner| {
-                self.space
-                    .elements()
-                    .any(|window| Self::window_matches_root_surface(window, owner))
+            let owner_still_available = owner_root.as_ref().is_some_and(|owner| {
+                self.space.elements().any(|window| {
+                    Self::window_matches_root_surface(window, owner)
+                        && self.window_allows_keyboard_focus(window)
+                })
             });
             let focus_still_valid = surface.alive()
                 && self
@@ -1214,18 +1453,15 @@ impl ShojiWM {
                     .elements()
                     .any(|window| self.surface_belongs_to_window(window, surface));
 
-            if owner_still_mapped {
+            if owner_still_available {
                 if !focus_still_valid {
                     self.window_keyboard_focus = owner_root.clone();
                 }
                 self.window_keyboard_focus_owner = owner_root;
             } else {
-                // The focused window is gone. Nothing else in the compositor
-                // elects a replacement — neither `toplevel_destroyed` nor
-                // `unmapped_window` touches keyboard focus — so without this the
-                // keyboard is left on nothing until the user clicks something:
-                // dismissing a dialog does not hand focus back to the window it
-                // was opened over.
+                // The owner disappeared or became unavailable for input
+                // (hidden workspace/minimized). Elect only an available
+                // successor, or clear the target when no candidate remains.
                 //
                 // Only the focus *target* is set. `update_keyboard_focus` still
                 // ranks an exclusive or on-demand layer surface above it, so
@@ -1787,6 +2023,10 @@ impl ShojiWM {
             previous_window_keyboard_focus_owner: None,
             session_lock_focus_owner: None,
             window_keyboard_focus: None,
+            pending_explicit_focus_window_id: None,
+            pending_explicit_focus_user_input: false,
+            held_key_repeat: None,
+            held_key_repeat_generation: 0,
             focus_chain: Vec::new(),
             user_input_in_flight: false,
             mapped_on_demand_layer_surfaces: Default::default(),
@@ -2027,7 +2267,7 @@ impl ShojiWM {
             .cloned()
     }
 
-    fn output_for_window(&self, window: &Window) -> Option<Output> {
+    pub(crate) fn output_for_window(&self, window: &Window) -> Option<Output> {
         // Prefer largest overlap, because it matches how users perceive "the monitor this window
         // is on" during cross-output moves. The center/first-output fallbacks only cover degenerate
         // geometries and early lifecycle states.
@@ -2692,6 +2932,11 @@ impl ShojiWM {
     }
 
     pub fn reload_decoration_runtime(&mut self) {
+        // A held repeat and any deferred focus belong to the old binding/config
+        // set; stop them before the runtime is replaced so neither survives the
+        // reload as a stale grant.
+        self.cancel_held_key_repeat();
+        self.pending_explicit_focus_window_id = None;
         crate::backend::tty::clear_workspace_transitions(self);
         crate::backend::overlay::close_all("Config reloaded");
         self.output_overlays.clear();
@@ -3290,6 +3535,9 @@ impl ShojiWM {
         &mut self,
         update: RuntimeKeyBindingConfigUpdate,
     ) {
+        // A held repeat belongs to the old binding set; stop it before the
+        // compiled bindings are replaced.
+        self.cancel_held_key_repeat();
         self.runtime_key_binding_entries = update
             .entries
             .into_iter()

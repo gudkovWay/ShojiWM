@@ -172,6 +172,7 @@ import type {
   KeyBindingController,
   KeyBindingOptions,
   KeyBindingEventPhase,
+  KeyBindingRepeat,
   PointerController,
   PreloadController,
   RuntimeController,
@@ -181,7 +182,11 @@ import type {
   SSDRebuildSuppressionViolationPolicy,
 } from "./types";
 import { createCompositorEventController } from "./events";
-import { suppressSSDRebuild, withSSDRebuildSuppressed } from "./runtime-hooks";
+import {
+  suppressSSDRebuild,
+  withSSDRebuildSuppressed,
+  requestWindowFocusClear,
+} from "./runtime-hooks";
 import {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -498,6 +503,7 @@ export {
   markLayerDirty,
   markRuntimeDirty,
   markWindowDirty,
+  requestWindowFocusClear,
   suppressSSDRebuild,
   takeDirtyLayerNodeIds,
   takeManagedWindowOnlyDirty,
@@ -656,6 +662,7 @@ export type {
   KeyBindingController,
   KeyBindingOptions,
   KeyBindingEventPhase,
+  KeyBindingRepeat,
   PointerController,
   InputAccelProfile,
   InputClickMethod,
@@ -673,6 +680,7 @@ export type {
   TouchpadInputConfig,
   CursorConfig,
   CursorController,
+  CursorWarpPosition,
   RuntimeCursorConfigUpdate,
   PreloadController,
   RuntimeController,
@@ -853,7 +861,11 @@ const WINDOW_CONTROLLER: CompositorWindowController = {
   composition: null,
   decoration: WINDOW_DECORATION_CONTROLLER,
   focus(window) {
-    window.focus();
+    if (window) {
+      window.focus();
+    } else {
+      requestWindowFocusClear();
+    }
   },
 };
 

@@ -1,4 +1,5 @@
 import { ENV_CONTROLLER } from "./env";
+import { requestPointerWarp } from "./runtime-hooks";
 import type {
   CursorConfig,
   CursorController,
@@ -61,6 +62,14 @@ export const CURSOR_CONTROLLER: CursorController = {
   reload() {
     publishCursorEnvironment(currentConfig);
     pendingConfig = { ...currentConfig, reload: true };
+  },
+  warp(position) {
+    const x = Number(position.x);
+    const y = Number(position.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error("cursor warp position must be finite x/y coordinates");
+    }
+    requestPointerWarp({ x, y });
   },
 };
 

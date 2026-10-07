@@ -175,7 +175,7 @@ pub struct PointerModifierStateSnapshot {
     pub shift: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PointerMovePointSnapshot {
     pub x: f64,
@@ -773,6 +773,12 @@ pub enum WaylandWindowAction {
     Fullscreen,
     Unfullscreen,
     Focus,
+    /// Clear seat window focus without electing a successor. Carries no window
+    /// id; handled before the window-id lookup.
+    ClearFocus,
+    /// Move the seat pointer to a global logical position. Carries the target
+    /// in `RuntimeWindowAction::position`; handled before the window-id lookup.
+    WarpPointer,
     ScheduleAnimation,
     CancelAnimation,
 }

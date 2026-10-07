@@ -1531,8 +1531,25 @@ export interface ProcessController {
 
 export type KeyBindingEventPhase = "press" | "release";
 
+/**
+ * Held-key repeat for a press binding. After `delayMs` the handler re-runs
+ * every `intervalMs` until the physical key is released, the session locks,
+ * the config is replaced, or the input device is removed. Only real (non
+ * modifier-only, non wheel) press bindings may opt in.
+ * 押しっぱなしリピート。`delayMs` の後、物理キーが離される（セッションロック・
+ * 設定置換・デバイス取り外しを含む）まで `intervalMs` ごとにハンドラーを再実行
+ * します。修飾キーのみ・ホイール・release バインドでは指定できません。
+ */
+export interface KeyBindingRepeat {
+  /** Delay before the first repeat. Nonnegative, finite. / 最初のリピートまでの遅延。 */
+  delayMs: number;
+  /** Interval between repeats. Positive, finite. / リピート間隔。 */
+  intervalMs: number;
+}
+
 export interface KeyBindingOptions {
   on?: KeyBindingEventPhase;
+  repeat?: KeyBindingRepeat;
 }
 
 /**
@@ -1793,6 +1810,14 @@ export interface CursorController {
   configure(config: CursorConfig): void;
   /** Reload the current theme and discard decoded cursor caches. / 現在のテーマをキャッシュ破棄して再読込します。 */
   reload(): void;
+  /** Move the seat pointer to a global logical position. / シートポインタをグローバル論理座標へ移動します。 */
+  warp(position: CursorWarpPosition): void;
+}
+
+/** Global logical pointer position, in compositor coordinates. */
+export interface CursorWarpPosition {
+  x: number;
+  y: number;
 }
 
 export interface BorderValue {
@@ -2665,8 +2690,16 @@ export interface CompositorWindowController {
    * `isFocused` signals, composition reevaluation, and
    * `COMPOSITOR.event.onFocus` listeners all fire just as they would for
    * a user-initiated focus change.
+   *
+   * Pass `null` to clear seat window focus without electing another window
+   * (an empty workspace). Layer-shell and lock-screen priority are preserved.
+   * A request for a managed window that is still hidden because a queued
+   * visibility update has not landed yet is deferred until that update is
+   * applied; the last request wins, and `null` cancels any deferred request.
+   * `window` にキーボードフォーカスを要求します。`null` で、別ウィンドウを
+   * 選出せずにシートのウィンドウフォーカスを解除します（空ワークスペース）。
    */
-  focus(window: WaylandWindow): void;
+  focus(window: WaylandWindow | null): void;
 }
 
 export interface ReactiveWaylandWindowHandle {

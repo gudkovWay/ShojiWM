@@ -117,6 +117,11 @@ impl XwmHandler for ShojiWM {
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Some(elem) = self.find_x11_window(&window) {
+            let focus_output = self
+                .window_keyboard_focus_owner
+                .as_ref()
+                .filter(|root| Self::window_matches_root_surface(&elem, root))
+                .and_then(|_| self.output_for_window(&elem));
             let decoration = self.window_decorations.get(&elem).cloned();
             // The runtime id, not the decoration entry's: see toplevel_destroyed.
             let window_id = self.snapshot_window(&elem).id;
@@ -158,10 +163,9 @@ impl XwmHandler for ShojiWM {
             {
                 warn!(window_id, ?error, "failed to report unmapped X11 window to the runtime");
             }
-            // X11 *unmap* is the real close — `destroyed_window` never touches
-            // the space. Re-elect now rather than leaving the stale target to be
-            // reaped whenever some unrelated event next runs
-            // `update_keyboard_focus`.
+            // X11 unmap is the close: preserve the owner's output instead of
+            // electing a visible window on another monitor.
+            self.restore_focus_after_window_close(&elem, focus_output.as_ref());
             self.update_keyboard_focus(smithay::utils::SERIAL_COUNTER.next_serial());
         }
         if !window.is_override_redirect()

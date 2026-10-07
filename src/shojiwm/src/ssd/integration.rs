@@ -1681,6 +1681,7 @@ impl ShojiWM {
                     action: crate::ssd::WaylandWindowAction::FinalizeClose,
                     animation: None,
                     channel: None,
+                    position: None,
                 })
                 .collect(),
         );
@@ -4562,6 +4563,7 @@ impl ShojiWM {
                                 action: crate::ssd::WaylandWindowAction::FinalizeClose,
                                 animation: None,
                                 channel: None,
+                                position: None,
                             });
                         }
                         self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
@@ -4864,6 +4866,7 @@ impl ShojiWM {
                             action: crate::ssd::WaylandWindowAction::FinalizeClose,
                             animation: None,
                             channel: None,
+                            position: None,
                         });
                     }
                     self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
@@ -4969,11 +4972,15 @@ impl ShojiWM {
         if !pending_process_actions.is_empty() {
             self.apply_runtime_process_actions(pending_process_actions);
         }
-        // Minimize/restore land as `managed_window.idle` transitions during the
-        // evaluations above, not as focus changes — re-derive each toplevel's
-        // xdg `Activated` state so those transitions emit configures (see
-        // `sync_window_activated_states` for why clients depend on this).
-        self.sync_window_activated_states();
+        // Runtime evaluations can hide/minimize the keyboard-focus owner, and a
+        // focus request for a managed window may have been deferred until its
+        // visibility update landed. Managed window state has been applied by
+        // this point, so deliver a deferred explicit focus now, then reconcile
+        // focus as well as activation. `update_keyboard_focus` retains
+        // layer-shell priority and initial-paint deferral while dropping
+        // unavailable window targets.
+        self.flush_pending_explicit_focus(&processed_runtime_dirty_window_ids);
+        self.update_keyboard_focus(smithay::utils::SERIAL_COUNTER.next_serial());
         let apply_updates_elapsed_ms = apply_updates_started_at.elapsed().as_secs_f64() * 1000.0;
         let refresh_elapsed_ms = refresh_started_at.elapsed().as_secs_f64() * 1000.0;
 

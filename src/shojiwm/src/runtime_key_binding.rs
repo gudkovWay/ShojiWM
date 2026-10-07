@@ -3,17 +3,36 @@ use std::collections::BTreeMap;
 use smithay::input::keyboard::{KeysymHandle, ModifiersState};
 use xkbcommon::xkb;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RuntimeKeyBindingConfigUpdate {
     pub entries: Vec<RuntimeKeyBindingEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RuntimeKeyBindingEntry {
     pub id: String,
     pub shortcut: String,
     #[serde(default)]
     pub on: RuntimeKeyBindingPhase,
+    #[serde(default)]
+    pub repeat: Option<RuntimeKeyRepeatConfig>,
+}
+
+/// Held-key repeat requested by the config. Values are validated during
+/// compile; invalid ones reject the whole binding (warn + ignore), matching
+/// how other malformed shortcuts are handled.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeKeyRepeatConfig {
+    pub delay_ms: f64,
+    pub interval_ms: f64,
+}
+
+/// Validated repeat timing, in whole milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledKeyRepeat {
+    pub delay_ms: u64,
+    pub interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
@@ -40,10 +59,49 @@ impl RuntimeKeyBindingEntry {
                 self.shortcut.clone(),
             ));
         }
+        let repeat = match self.repeat {
+            None => None,
+            Some(config) => {
+                if self.on != RuntimeKeyBindingPhase::Press {
+                    return Err(RuntimeKeyBindingParseError::RepeatRequiresPress(
+                        self.shortcut.clone(),
+                    ));
+                }
+                if shortcut.is_modifier_only() {
+                    return Err(RuntimeKeyBindingParseError::RepeatModifierOnly(
+                        self.shortcut.clone(),
+                    ));
+                }
+                if shortcut.wheel_direction.is_some() {
+                    return Err(RuntimeKeyBindingParseError::RepeatWheel(
+                        self.shortcut.clone(),
+                    ));
+                }
+                if !config.delay_ms.is_finite() || config.delay_ms < 0.0 {
+                    return Err(RuntimeKeyBindingParseError::RepeatInvalidDelay {
+                        shortcut: self.shortcut.clone(),
+                        delay_ms: config.delay_ms,
+                    });
+                }
+                if !config.interval_ms.is_finite() || config.interval_ms <= 0.0 {
+                    return Err(RuntimeKeyBindingParseError::RepeatInvalidInterval {
+                        shortcut: self.shortcut.clone(),
+                        interval_ms: config.interval_ms,
+                    });
+                }
+                Some(CompiledKeyRepeat {
+                    delay_ms: config.delay_ms.round() as u64,
+                    // A sub-millisecond interval would spin the calloop timer;
+                    // round to at least 1 ms.
+                    interval_ms: (config.interval_ms.round() as u64).max(1),
+                })
+            }
+        };
         Ok(CompiledRuntimeKeyBinding {
             id: self.id.clone(),
             phase: self.on,
             shortcut,
+            repeat,
         })
     }
 }
@@ -70,6 +128,8 @@ pub struct CompiledRuntimeKeyBinding {
     pub id: String,
     pub phase: RuntimeKeyBindingPhase,
     pub shortcut: RuntimeKeyShortcut,
+    /// `Some` when the binding opted into held-key repeat.
+    pub repeat: Option<CompiledKeyRepeat>,
 }
 
 impl CompiledRuntimeKeyBinding {
@@ -172,6 +232,16 @@ pub enum RuntimeKeyBindingParseError {
     MultipleKeys { shortcut: String },
     #[error("shortcut `{shortcut}` contains unknown key `{key}`")]
     UnknownKey { shortcut: String, key: String },
+    #[error("shortcut `{0}` may not use held-key repeat with `on: \"release\"`")]
+    RepeatRequiresPress(String),
+    #[error("modifier-only shortcut `{0}` may not use held-key repeat")]
+    RepeatModifierOnly(String),
+    #[error("mouse-wheel shortcut `{0}` may not use held-key repeat")]
+    RepeatWheel(String),
+    #[error("shortcut `{shortcut}` has invalid repeat delay {delay_ms}")]
+    RepeatInvalidDelay { shortcut: String, delay_ms: f64 },
+    #[error("shortcut `{shortcut}` has invalid repeat interval {interval_ms}")]
+    RepeatInvalidInterval { shortcut: String, interval_ms: f64 },
 }
 
 pub fn compile_runtime_key_bindings(
@@ -347,6 +417,7 @@ mod tests {
             id: "test".to_string(),
             shortcut: shortcut.to_string(),
             on,
+            repeat: None,
         }
     }
 

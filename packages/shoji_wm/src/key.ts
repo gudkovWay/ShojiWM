@@ -2,12 +2,14 @@ import type {
   KeyBindingController,
   KeyBindingEventPhase,
   KeyBindingOptions,
+  KeyBindingRepeat,
 } from "./types";
 
 interface RuntimeKeyBindingConfigEntry {
   id: string;
   shortcut: string;
   on: KeyBindingEventPhase;
+  repeat?: KeyBindingRepeat;
 }
 
 type KeyBindingHandler = () => void;
@@ -43,10 +45,35 @@ function normalizePhase(options: KeyBindingOptions | undefined): KeyBindingEvent
   return options?.on ?? "press";
 }
 
+/**
+ * Validate the numeric shape of a repeat option. Shortcut-kind legality
+ * (modifier-only / wheel / release) is enforced by the native compiler, which
+ * owns shortcut parsing; here we only reject values that would not survive
+ * serialization (NaN/Infinity) or are nonsensical.
+ */
+function normalizeRepeat(
+  options: KeyBindingOptions | undefined,
+): KeyBindingRepeat | undefined {
+  const repeat = options?.repeat;
+  if (!repeat) {
+    return undefined;
+  }
+  if (!Number.isFinite(repeat.delayMs) || repeat.delayMs < 0) {
+    throw new Error("key binding repeat delayMs must be a nonnegative finite number");
+  }
+  if (!Number.isFinite(repeat.intervalMs) || repeat.intervalMs <= 0) {
+    throw new Error("key binding repeat intervalMs must be a positive finite number");
+  }
+  return { delayMs: repeat.delayMs, intervalMs: repeat.intervalMs };
+}
+
 function cloneConfigEntry(
   entry: RuntimeKeyBindingConfigEntry,
 ): RuntimeKeyBindingConfigEntry {
-  return { ...entry };
+  return {
+    ...entry,
+    repeat: entry.repeat ? { ...entry.repeat } : undefined,
+  };
 }
 
 export const KEY_BINDING_CONTROLLER: KeyBindingController = {
@@ -59,6 +86,7 @@ export const KEY_BINDING_CONTROLLER: KeyBindingController = {
       id,
       shortcut: normalizeShortcut(shortcut),
       on: normalizePhase(options),
+      repeat: normalizeRepeat(options),
     };
 
     registrationEntriesTarget().set(id, entry);

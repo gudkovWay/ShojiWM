@@ -801,7 +801,7 @@ interface WindowClosedSuccess {
 }
 
 interface RuntimeWindowAction {
-  windowId: string;
+  windowId?: string;
   action:
     | "close"
     | "finalizeClose"
@@ -811,10 +811,14 @@ interface RuntimeWindowAction {
     | "fullscreen"
     | "unfullscreen"
     | "focus"
+    | "clearFocus"
+    | "warpPointer"
     | "scheduleAnimation"
     | "cancelAnimation";
   animation?: RuntimeManagedWindowAnimation;
   channel?: string;
+  /** Global logical target for `warpPointer`. */
+  position?: RuntimeManagedWindowPoint;
 }
 
 interface RuntimeManagedWindowAnimation {
@@ -1149,6 +1153,7 @@ interface RuntimeKeyBindingConfigEntry {
   id: string;
   shortcut: string;
   on: "press" | "release";
+  repeat?: { delayMs: number; intervalMs: number };
 }
 
 interface RuntimePointerConfig {
@@ -1240,6 +1245,12 @@ const lastNativeEffectStructureByTarget = new Map<string, unknown>();
 const effectUniformSlotIdsByTarget = new Map<string, Map<string, number>>();
 let nextEffectUniformSlotId = 1;
 let runtimeDirty = false;
+// The single ordered stream of window actions queued by config handlers
+// (`window.focus()` / `focus(null)`, close finalize, animations). Insertion
+// order *is* delivery order, so `focus(null); win.focus()` serializes as
+// `clearFocus` then `focus`. Drained by `drainPendingActions` on every response
+// path that surfaces actions.
+let pendingActions: RuntimeWindowAction[] = [];
 let immediateDirtyPoll: PollHandle | null = null;
 let nextPollId = 1;
 let currentSchedulerTimeMs = 0;
@@ -1259,7 +1270,6 @@ interface RuntimeCacheEntry {
   latestSnapshot: WaylandWindowSnapshot;
   cache: CompositionEvaluationCache;
   animationEntries: Map<symbol, unknown>;
-  pendingActions: RuntimeWindowAction[];
   closeAnimationDurationMs: number;
   closeStarted: boolean;
   preconfigured: boolean;
@@ -1384,6 +1394,19 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
       ensureImmediateDirtyPoll();
     },
     wakeRuntime() {
+      ensureImmediateDirtyPoll();
+    },
+    requestWindowFocusClear() {
+      pendingActions.push({ action: "clearFocus" });
+      runtimeDirty = true;
+      ensureImmediateDirtyPoll();
+    },
+    requestPointerWarp(position) {
+      pendingActions.push({
+        action: "warpPointer",
+        position: { x: position.x, y: position.y },
+      });
+      runtimeDirty = true;
       ensureImmediateDirtyPoll();
     },
   });
@@ -1657,14 +1680,10 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               ? cacheByWindowId.get(request.snapshot.id)?.cache
               : undefined;
           // Drain queued actions so they ride along with the evaluation response.
-          // Layout events such as onFirstCommit can schedule animations for
-          // multiple windows while only one window is being evaluated; draining
-          // all render actions here keeps those animations frame-aligned instead
-          // of leaking them to later dirty evaluations in window order.
-          const evaluationActions =
-            request.kind === "evaluate"
-              ? drainPendingActions()
-              : drainPendingActionsForWindow(request.snapshot.id);
+          // A single ordered stream means every action queued since the last
+          // response is delivered in insertion order, regardless of which window
+          // this evaluation concerns.
+          const evaluationActions = drainPendingActions();
           if (evaluationActions.length > 0) {
             debugHotReload("evaluate-actions", {
               kind: request.kind,
@@ -3346,43 +3365,43 @@ function createRuntimeCacheEntry(
   let latestSnapshot = snapshot;
   const actions: WaylandWindowActions = {
     close() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "close",
       });
     },
     maximize() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "maximize",
       });
     },
     unmaximize() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "unmaximize",
       });
     },
     minimize() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "minimize",
       });
     },
     fullscreen() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "fullscreen",
       });
     },
     unfullscreen() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "unfullscreen",
       });
     },
     focus() {
-      entry.pendingActions.push({
+      pendingActions.push({
         windowId: latestSnapshot.id,
         action: "focus",
       });
@@ -3398,7 +3417,7 @@ function createRuntimeCacheEntry(
         title: latestSnapshot.title,
         action: summarizeWindowAction(action),
       });
-      entry.pendingActions.push(action);
+      pendingActions.push(action);
     },
     cancelAnimation(channel) {
       const action = {
@@ -3411,7 +3430,7 @@ function createRuntimeCacheEntry(
         title: latestSnapshot.title,
         action: summarizeWindowAction(action),
       });
-      entry.pendingActions.push(action);
+      pendingActions.push(action);
     },
     setCloseAnimationDuration(durationMs) {
       entry.closeAnimationDurationMs = Math.max(0, Math.floor(durationMs));
@@ -3439,7 +3458,6 @@ function createRuntimeCacheEntry(
     latestSnapshot,
     cache,
     animationEntries,
-    pendingActions: [],
     closeAnimationDurationMs: 0,
     closeStarted: false,
     preconfigured: false,
@@ -4234,7 +4252,7 @@ function startClose(
 
     const durationMs = entry.closeAnimationDurationMs;
     if (durationMs <= 0) {
-      entry.pendingActions.push({ windowId, action: "finalizeClose" });
+      pendingActions.push({ windowId, action: "finalizeClose" });
     } else {
       entry.closePoll?.cancel();
       entry.closePoll = createManagedPoll(
@@ -4245,7 +4263,7 @@ function startClose(
             handle.cancel();
             return;
           }
-          current.pendingActions.push({ windowId, action: "finalizeClose" });
+          pendingActions.push({ windowId, action: "finalizeClose" });
           dirtyWindowIds.add(windowId);
           handle.cancel();
           current.closePoll = undefined;
@@ -4312,7 +4330,7 @@ function invokeHandler(
   if (managedWindowOnly) {
     entry.cache.reevaluateManagedWindow();
   }
-  const actions = entry.pendingActions.splice(0, entry.pendingActions.length);
+  const actions = drainPendingActions();
   if (runtimeEnv("SHOJI_SSD_HANDLER_DEBUG")) {
     console.debug(
       "runtime handler composition result",
@@ -4404,24 +4422,10 @@ function peekNextPollDelay(): number | undefined {
 }
 
 function drainPendingActions(): RuntimeWindowAction[] {
-  const actions: RuntimeWindowAction[] = [];
-  for (const entry of cacheByWindowId.values()) {
-    if (entry.pendingActions.length === 0) {
-      continue;
-    }
-    actions.push(
-      ...entry.pendingActions.splice(0, entry.pendingActions.length),
-    );
-  }
-  return actions;
-}
-
-function drainPendingActionsForWindow(windowId: string): RuntimeWindowAction[] {
-  const entry = cacheByWindowId.get(windowId);
-  if (!entry || entry.pendingActions.length === 0) {
+  if (pendingActions.length === 0) {
     return [];
   }
-  return entry.pendingActions.splice(0, entry.pendingActions.length);
+  return pendingActions.splice(0, pendingActions.length);
 }
 
 function resolveComposition(

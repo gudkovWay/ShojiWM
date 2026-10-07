@@ -16,8 +16,8 @@ use super::embedded_runtime::{
 };
 use super::window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowAnimationSnapshot,
-    ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+    ManagedWindowState, PointerMoveEventSnapshot, PointerMovePointSnapshot, WaylandLayerSnapshot,
+    WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
     WindowActivateRequestEventSnapshot, WindowDecorationDecisionSnapshot,
     WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
@@ -596,13 +596,16 @@ fn slot_narrowed_to_region(slot: &Option<super::WindowEffectSlot>) -> bool {
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RuntimeWindowAction {
-    #[serde(rename = "windowId")]
+    #[serde(rename = "windowId", default)]
     pub window_id: String,
     pub action: WaylandWindowAction,
     #[serde(default)]
     pub animation: Option<ManagedWindowAnimationSnapshot>,
     #[serde(default)]
     pub channel: Option<String>,
+    /// Global logical pointer target for [`WaylandWindowAction::WarpPointer`].
+    #[serde(default)]
+    pub position: Option<PointerMovePointSnapshot>,
 }
 
 /// Temporary Rust-side evaluator that mirrors the intended TS-level behavior:
