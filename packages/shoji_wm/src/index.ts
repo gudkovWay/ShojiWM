@@ -506,6 +506,7 @@ export {
   trackSignalRead,
   trackSignalWrite,
   withSSDRebuildSuppressed,
+  withoutCompositionOwnership,
 } from "./runtime-hooks";
 
 export type {
