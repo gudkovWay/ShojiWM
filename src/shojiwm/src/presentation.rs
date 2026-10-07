@@ -6,9 +6,7 @@ use std::{
 };
 
 use smithay::{
-    backend::renderer::element::{
-        Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
-    },
+    backend::renderer::element::{Id, RenderElementState, RenderElementStates},
     desktop::{
         Space, Window, layer_map_for_output,
         utils::{
@@ -178,21 +176,6 @@ fn window_had_presented_surface(
     presented
 }
 
-fn synthetic_presented_states_for_window(window: &Window) -> RenderElementStates {
-    let mut states = RenderElementStates::default();
-    window.with_surfaces(|surface, _| {
-        states.states.insert(
-            Id::from_wayland_resource(surface),
-            RenderElementState {
-                visible_area: usize::MAX,
-                presentation_state: RenderElementPresentationState::Rendering { reason: None },
-                needs_capture: false,
-            },
-        );
-    });
-    states
-}
-
 fn frame_callback_debug_enabled() -> bool {
     crate::env_flag!("SHOJI_FRAME_CALLBACK_DEBUG")
 }
@@ -248,9 +231,9 @@ pub fn update_primary_scanout_output(
     space.elements().for_each(|window| {
         let visible_outputs = window_decorations
             .get(window)
-            .and_then(|decoration| decoration.managed_window.visible_outputs.clone());
+            .and_then(|decoration| decoration.managed_window.visible_outputs.as_deref());
         let Some(selected_primary_output) =
-            stable_primary_output_for_window(space, window, visible_outputs.as_deref())
+            stable_primary_output_for_window(space, window, visible_outputs)
         else {
             return;
         };
@@ -263,14 +246,16 @@ pub fn update_primary_scanout_output(
             // The current output may repaint before the selected primary output. If the window was
             // actually presented on this frame, update the primary immediately so scale and frame
             // callbacks do not bounce through the stale output until the other monitor repaints.
-            let synthetic_states = synthetic_presented_states_for_window(window);
+            // The real effective states are used here: they already carry offscreen-composited
+            // client surfaces as aliases, so `prefer_next_primary_scanout_compare` only adopts the
+            // selected output for surfaces that were genuinely presented.
             window.with_surfaces(|surface, states| {
                 update_surface_primary_scanout_output(
                     surface,
                     &selected_primary_output,
                     states,
                     None,
-                    &synthetic_states,
+                    render_element_states,
                     prefer_next_primary_scanout_compare,
                 );
             });
@@ -712,8 +697,9 @@ impl ShojiWM {
                             "commit timer barrier signaled for window surface"
                         );
                     }
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         });
@@ -727,8 +713,9 @@ impl ShojiWM {
                     .map(|commit_timer| commit_timer.lock().unwrap())
                     && commit_timer_state.signal_until(frame_target)
                 {
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
@@ -890,8 +877,9 @@ impl ShojiWM {
                             );
                         }
                         fifo_barrier.signal();
-                        let client = surface.client().unwrap();
-                        clients.insert(client.id(), client);
+                        if let Some(client) = surface.client() {
+                            clients.insert(client.id(), client);
+                        }
                     } else if debug_fifo {
                         info!(
                             surface = ?surface.id(),
@@ -935,8 +923,9 @@ impl ShojiWM {
                     .take();
                 if let Some(fifo_barrier) = fifo_barrier {
                     fifo_barrier.signal();
-                    let client = surface.client().unwrap();
-                    clients.insert(client.id(), client);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
                 }
             });
         }
