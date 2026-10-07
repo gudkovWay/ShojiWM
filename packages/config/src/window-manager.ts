@@ -226,7 +226,7 @@ interface AddWindowOptions {
   restoreScrollIfInitiallyFloating?: boolean;
 }
 
-interface HybridWindowManagerSnapshot {
+export interface HybridWindowManagerSnapshot {
   currentMonitor: string;
   activeWorkspaceByMonitor: [string, number][];
   workspaces: WorkspaceSnapshot[];
@@ -413,11 +413,33 @@ export const MAXIMIZED_WINDOW_PADDING = {
   left: 8,
 };
 
+/**
+ * Config-local readonly decoration footprint outside a window's root rect.
+ * The config supplies a per-window callback (e.g. the selected frame pack's
+ * authored ornament outsets); the manager never imports the visual runtime.
+ */
+export interface WindowDecorationOutsets {
+  readonly left: number;
+  readonly right: number;
+  readonly top: number;
+  readonly bottom: number;
+}
+
+const ZERO_DECORATION_OUTSETS: WindowDecorationOutsets = {
+  left: 0,
+  right: 0,
+  top: 0,
+  bottom: 0,
+};
+
 export class HybridWindowManager {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly activeWorkspaceByMonitor = new Map<string, number>();
   private readonly windowStack = createWindowStack();
   private readonly naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect;
+  private readonly decorationOutsetsFor: (
+    window: WaylandWindow,
+  ) => WindowDecorationOutsets;
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
@@ -474,10 +496,40 @@ export class HybridWindowManager {
 
   public constructor(
     naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect,
+    decorationOutsetsFor: (
+      window: WaylandWindow,
+    ) => WindowDecorationOutsets = () => ZERO_DECORATION_OUTSETS,
   ) {
     this.currentMonitor = "";
     this.naturalRootRect = naturalRootRect;
+    this.decorationOutsetsFor = decorationOutsetsFor;
     this.syncWorkspaces();
+  }
+
+  /** Per-window external decoration footprint (never null; zeros default). */
+  private outsetsFor(window: WaylandWindow): WindowDecorationOutsets {
+    return this.decorationOutsetsFor(window) ?? ZERO_DECORATION_OUTSETS;
+  }
+
+  /**
+   * Output-logical usable rectangle for footprint clamps (no maximized
+   * padding), falling back to the full monitor rect.
+   */
+  private workspaceViewportRect(monitor: string): ManagedWindowRect {
+    const usable = COMPOSITOR.layer.usableArea(monitor);
+    if (usable) {
+      return usable;
+    }
+    const output = COMPOSITOR.output.current[monitor];
+    if (output?.resolution) {
+      return {
+        x: output.position.x,
+        y: output.position.y,
+        width: output.resolution.width / output.scale,
+        height: output.resolution.height / output.scale,
+      };
+    }
+    return { x: 0, y: 0, width: 1280, height: 720 };
   }
 
   public configureWorkspaceGestureSpeed(
@@ -1695,7 +1747,7 @@ export class HybridWindowManager {
     }
   }
 
-  public refreshUsableAreaLayouts() {
+  public refreshUsableAreaLayouts(force = false) {
     this.syncWorkspaces();
     // While a window is being interactively dragged, do not re-apply the
     // usable-area layout. It would clobber the in-flight drag — most visibly,
@@ -1707,9 +1759,51 @@ export class HybridWindowManager {
       return;
     }
     for (const workspace of this.workspaces.values()) {
-      workspace.refreshUsableAreaLayout();
+      workspace.refreshUsableAreaLayout(force);
+    }
+    if (force) {
+      // A forced pass (frame selection change / reload restore) must also
+      // re-fit already-snapped floating windows, not only tiled/maximized
+      // ones. The layout is recomputed from the same windows, so nothing
+      // moves unboundedly — only the footprint inset changes.
+      this.refreshSnappedFloatingLayouts();
     }
     this.syncWorkspaceVisibility();
+  }
+
+  /**
+   * Recompute and re-apply every floating snap layout, grouped per monitor.
+   */
+  private refreshSnappedFloatingLayouts(): void {
+    for (const workspace of this.workspaces.values()) {
+      // Snap layouts only exist on floating workspaces; tiled leaves own
+      // their geometry and a stale zone must never win over a leaf rect.
+      if (workspace.isTiled) {
+        continue;
+      }
+      const byMonitor = new Map<string, WaylandWindow[]>();
+      for (const window of workspace.listWindows()) {
+        const monitor = window.state[WINDOW_STATE_SNAP_MONITOR]();
+        if (!monitor || !this.isWindowInFloatingSnapLayout(window, monitor)) {
+          continue;
+        }
+        const group = byMonitor.get(monitor);
+        if (group) {
+          group.push(window);
+        } else {
+          byMonitor.set(monitor, [window]);
+        }
+      }
+      for (const [monitor, windows] of byMonitor) {
+        const base = this.monitorSnapBaseRect(monitor);
+        if (!base) {
+          continue;
+        }
+        const layout = this.floatingSnapLayoutFromWindows(base, windows);
+        this.clampFloatingSnapLayout(base, layout, windows);
+        this.applyFloatingSnapLayout(base, layout, windows);
+      }
+    }
   }
 
   public switchWorkspace(direction: -1 | 1) {
@@ -2067,6 +2161,7 @@ export class HybridWindowManager {
         monitor,
         this.naturalRootRect,
         (window) => this.maximizedRectForWindow(window, monitor),
+        (window) => this.outsetsFor(window),
         (monitor) => this.getActiveWorkspaceIndex(monitor),
       );
       this.workspaces.set(key, workspace);
@@ -2581,18 +2676,86 @@ export class HybridWindowManager {
     const extra = this.clientToRootSizeExtra(event.window);
     const minWidth = Math.max(1, constraints.min?.width ?? 1) + extra.width;
     const minHeight = Math.max(1, constraints.min?.height ?? 1) + extra.height;
+    // Client maxima stay client-sized: the root ceiling is client max + frame
+    // extra (insets included), exactly as before decoration outsets existed.
     const maxWidth = constrainedMax(constraints, "width", extra.width);
     const maxHeight = constrainedMax(constraints, "height", extra.height);
+
+    // Decorated windows: additionally cap the dragged axis so root + external
+    // ornament footprint stays inside the monitor bounds, measured from the
+    // fixed opposite resize edge. Anchors already off-monitor are left alone
+    // (no teleporting); snap-layout resizes are handled by the layout clamps.
+    let cappedMaxWidth = maxWidth;
+    let cappedMaxHeight = maxHeight;
+    const outsets = this.outsetsFor(event.window);
+    const decorated =
+      outsets.left !== 0 ||
+      outsets.right !== 0 ||
+      outsets.top !== 0 ||
+      outsets.bottom !== 0;
+    if (decorated) {
+      const workspace = this.findWorkspaceForWindow(event.window);
+      if (workspace) {
+        const viewport = this.workspaceViewportRect(workspace.monitor);
+        const vpLeft = read(viewport.x);
+        const vpTop = read(viewport.y);
+        const vpRight = vpLeft + read(viewport.width);
+        const vpBottom = vpTop + read(viewport.height);
+        // Cap only while the FIXED opposite edge (including its footprint
+        // outset) is inside the viewport footprint bounds; an anchor already
+        // off-monitor must not be teleported by a cap.
+        if (event.edges.right !== event.edges.left) {
+          const fixedInside = event.edges.right
+            ? vpLeft <= event.startRect.x - outsets.left &&
+              event.startRect.x - outsets.left <= vpRight
+            : vpLeft <=
+                event.startRect.x + event.startRect.width + outsets.right &&
+              event.startRect.x + event.startRect.width + outsets.right <=
+                vpRight;
+          if (fixedInside) {
+            const bound = event.edges.right
+              ? vpRight - outsets.right - event.startRect.x
+              : event.startRect.x +
+                event.startRect.width -
+                vpLeft -
+                outsets.left;
+            if (bound >= minWidth) {
+              cappedMaxWidth = Math.min(cappedMaxWidth, bound);
+            }
+          }
+        }
+        if (event.edges.bottom !== event.edges.top) {
+          const fixedInside = event.edges.bottom
+            ? vpTop <= event.startRect.y - outsets.top &&
+              event.startRect.y - outsets.top <= vpBottom
+            : vpTop <=
+                event.startRect.y + event.startRect.height + outsets.bottom &&
+              event.startRect.y + event.startRect.height + outsets.bottom <=
+                vpBottom;
+          if (fixedInside) {
+            const bound = event.edges.bottom
+              ? vpBottom - outsets.bottom - event.startRect.y
+              : event.startRect.y +
+                event.startRect.height -
+                vpTop -
+                outsets.top;
+            if (bound >= minHeight) {
+              cappedMaxHeight = Math.min(cappedMaxHeight, bound);
+            }
+          }
+        }
+      }
+    }
 
     const width = clamp(
       event.currentRect.width,
       minWidth,
-      Math.max(minWidth, maxWidth),
+      Math.max(minWidth, cappedMaxWidth),
     );
     const height = clamp(
       event.currentRect.height,
       minHeight,
-      Math.max(minHeight, maxHeight),
+      Math.max(minHeight, cappedMaxHeight),
     );
 
     return {
@@ -2626,6 +2789,26 @@ export class HybridWindowManager {
     };
   }
 
+  /**
+   * Maximized available rectangle: the existing MAXIMIZED_WINDOW_PADDING plus
+   * this window's own decoration footprint, so the painted root stays inside
+   * the padded area while ornaments extend into the reserve.
+   */
+  private maximizedPaddingFor(window: WaylandWindow): {
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
+  } {
+    const outsets = this.outsetsFor(window);
+    return {
+      top: MAXIMIZED_WINDOW_PADDING.top + outsets.top,
+      right: MAXIMIZED_WINDOW_PADDING.right + outsets.right,
+      bottom: MAXIMIZED_WINDOW_PADDING.bottom + outsets.bottom,
+      left: MAXIMIZED_WINDOW_PADDING.left + outsets.left,
+    };
+  }
+
   private maximizedRectForWindow(
     window: WaylandWindow,
     preferredOutput?: string,
@@ -2652,7 +2835,7 @@ export class HybridWindowManager {
           width: usable.width,
           height: usable.height,
         },
-        MAXIMIZED_WINDOW_PADDING,
+        this.maximizedPaddingFor(window),
       );
     }
     if (output?.resolution) {
@@ -2663,7 +2846,7 @@ export class HybridWindowManager {
           width: output.resolution.width / output.scale,
           height: output.resolution.height / output.scale,
         },
-        MAXIMIZED_WINDOW_PADDING,
+        this.maximizedPaddingFor(window),
       );
     }
     return rect;
@@ -2952,28 +3135,33 @@ export class HybridWindowManager {
     }
 
     const layout = this.floatingSnapLayoutFromWindows(base, snappedWindows);
+    // The resized rect is the window root; express its dragged edge as the
+    // external footprint boundary the split coordinate lives in.
+    const outsets = this.outsetsFor(event.window);
     let changed = false;
 
     if (event.edges.right && isLeftSnapZone(zone)) {
-      layout.splitX = read(nextRect.x) + read(nextRect.width);
+      layout.splitX = read(nextRect.x) + read(nextRect.width) + outsets.right;
       changed = true;
     } else if (event.edges.left && isRightSnapZone(zone)) {
-      layout.splitX = read(nextRect.x) - SNAP_GAP_PX;
+      layout.splitX = read(nextRect.x) - outsets.left - SNAP_GAP_PX;
       changed = true;
     }
 
     if (event.edges.bottom && isTopSnapZone(zone)) {
       if (snapColumn(zone) === "left") {
-        layout.leftSplitY = read(nextRect.y) + read(nextRect.height);
+        layout.leftSplitY =
+          read(nextRect.y) + read(nextRect.height) + outsets.bottom;
       } else {
-        layout.rightSplitY = read(nextRect.y) + read(nextRect.height);
+        layout.rightSplitY =
+          read(nextRect.y) + read(nextRect.height) + outsets.bottom;
       }
       changed = true;
     } else if (event.edges.top && isBottomSnapZone(zone)) {
       if (snapColumn(zone) === "left") {
-        layout.leftSplitY = read(nextRect.y) - SNAP_GAP_PX;
+        layout.leftSplitY = read(nextRect.y) - outsets.top - SNAP_GAP_PX;
       } else {
-        layout.rightSplitY = read(nextRect.y) - SNAP_GAP_PX;
+        layout.rightSplitY = read(nextRect.y) - outsets.top - SNAP_GAP_PX;
       }
       changed = true;
     }
@@ -3019,20 +3207,23 @@ export class HybridWindowManager {
         continue;
       }
       const rect = window.state[WINDOW_STATE_RECT]();
+      // Split boundaries are footprint-allocation coordinates: convert the
+      // sampled root edge to its external footprint edge first.
+      const outsets = this.outsetsFor(window);
       if (isLeftSnapZone(zone)) {
-        splitXSamples.push(read(rect.x) + read(rect.width));
+        splitXSamples.push(read(rect.x) + read(rect.width) + outsets.right);
       } else {
-        splitXSamples.push(read(rect.x) - SNAP_GAP_PX);
+        splitXSamples.push(read(rect.x) - outsets.left - SNAP_GAP_PX);
       }
 
       if (isTopSnapZone(zone)) {
         const samples =
           snapColumn(zone) === "left" ? leftSplitYSamples : rightSplitYSamples;
-        samples.push(read(rect.y) + read(rect.height));
+        samples.push(read(rect.y) + read(rect.height) + outsets.bottom);
       } else if (isBottomSnapZone(zone)) {
         const samples =
           snapColumn(zone) === "left" ? leftSplitYSamples : rightSplitYSamples;
-        samples.push(read(rect.y) - SNAP_GAP_PX);
+        samples.push(read(rect.y) - outsets.top - SNAP_GAP_PX);
       }
     }
 
@@ -3134,9 +3325,20 @@ export class HybridWindowManager {
   } {
     const constraints = window.sizeConstraints();
     const extra = this.clientToRootSizeExtra(window);
+    // A snapped window's allocation holds root frame extra (insets) AND the
+    // external decoration footprint; both must survive the apply-time inset.
+    const outsets = this.outsetsFor(window);
     return {
-      width: Math.max(1, constraints.min?.width ?? 1) + extra.width,
-      height: Math.max(1, constraints.min?.height ?? 1) + extra.height,
+      width:
+        Math.max(1, constraints.min?.width ?? 1) +
+        extra.width +
+        outsets.left +
+        outsets.right,
+      height:
+        Math.max(1, constraints.min?.height ?? 1) +
+        extra.height +
+        outsets.top +
+        outsets.bottom,
     };
   }
 
@@ -3151,9 +3353,15 @@ export class HybridWindowManager {
         continue;
       }
 
-      const rect = this.floatingSnapRectForZone(base, layout, zone);
+      const rect = insetRect(
+        this.floatingSnapRectForZone(base, layout, zone),
+        this.outsetsFor(window),
+      );
       stopRectAnimation(window, WINDOW_STATE_RECT);
       window.state[WINDOW_STATE_RECT].set(rect);
+      // Keep the floating restore point at the applied root so a reload
+      // restores the footprint-fitted geometry, not a stale allocation.
+      this.findWorkspaceForWindow(window)?.syncFloatingWindowRect(window, rect);
     }
   }
 
@@ -3380,15 +3588,16 @@ export class HybridWindowManager {
         window.state[WINDOW_STATE_MAXIMIZED].set(false);
         window.unmaximize();
       }
+      const rect = insetRect(snap.rect, this.outsetsFor(window));
       playRectAnimation(
         window,
         WINDOW_STATE_RECT,
-        snap.rect,
+        rect,
         WINDOW_MANAGEMENT_EASING,
         WINDOW_MANAGEMENT_ANIMATION_DURATION,
       );
       this.setWindowSnapState(workspace, window, snap.monitor, snap.zone);
-      workspace?.syncFloatingWindowRect(window, snap.rect);
+      workspace?.syncFloatingWindowRect(window, rect);
     }
     this.applyWorkspaceStackPolicy(workspace);
     return true;
@@ -3404,6 +3613,9 @@ export class Workspace {
   private readonly maximizedRootRect: (
     window: WaylandWindow,
   ) => ManagedWindowRect;
+  private readonly decorationOutsetsFor: (
+    window: WaylandWindow,
+  ) => WindowDecorationOutsets;
   private readonly activeWorkspaceIndex: (monitor: string) => number;
   private readonly tileWidthByWindowId = new Map<string, number>();
   private readonly restoredWindowStateById = new Map<
@@ -3439,13 +3651,22 @@ export class Workspace {
     monitor: string,
     naturalRootRect: (window: WaylandWindow) => ManagedWindowRect,
     maximizedRootRect: (window: WaylandWindow) => ManagedWindowRect,
+    decorationOutsetsFor: (
+      window: WaylandWindow,
+    ) => WindowDecorationOutsets,
     activeWorkspaceIndex: (monitor: string) => number,
   ) {
     this.index = index;
     this.monitor = monitor;
     this.naturalRootRect = naturalRootRect;
     this.maximizedRootRect = maximizedRootRect;
+    this.decorationOutsetsFor = decorationOutsetsFor;
     this.activeWorkspaceIndex = activeWorkspaceIndex;
+  }
+
+  /** Per-window external decoration footprint (never null; zeros default). */
+  private outsetsFor(window: WaylandWindow): WindowDecorationOutsets {
+    return this.decorationOutsetsFor(window) ?? ZERO_DECORATION_OUTSETS;
   }
 
   public moveToMonitor(monitor: string, index: number) {
@@ -3465,6 +3686,7 @@ export class Workspace {
       if (!this.isTiled || !this.shouldTile(window)) {
         const rect = this.clampRectToViewport(
           window.state[WINDOW_STATE_RECT](),
+          window,
         );
         window.state[WINDOW_STATE_RECT].set(rect);
         window.state[WINDOW_STATE_FLOATING_RECT].set(
@@ -3777,14 +3999,18 @@ export class Workspace {
     return this.activeWorkspaceIndex(this.monitor) === this.index;
   }
 
-  public refreshUsableAreaLayout() {
+  public refreshUsableAreaLayout(force = false) {
     if (!COMPOSITOR.output.list.includes(this.monitor)) {
       return;
     }
 
     if (this.isTiled) {
       const nextViewportRect = this.tileViewportRect();
+      // A `force` pass (e.g. after a frame selection change) re-applies the
+      // per-window layout even when the tile viewport itself did not move,
+      // so decorated roots re-fit inside their slots without a resize event.
       if (
+        !force &&
         this.lastAppliedTileViewportRect &&
         managedRectEquals(this.lastAppliedTileViewportRect, nextViewportRect)
       ) {
@@ -4064,16 +4290,38 @@ export class Workspace {
 
     tileable.forEach((window, index) => {
       const tileWidth = this.tileWidthForWindow(window, viewportRect);
+      // The tile slot is the full footprint allocation; a decorated window's
+      // painted root is inset inside it so external ornaments stay on the
+      // output. The strip geometry (slot x/width, gaps, scroll) is untouched.
+      const outsets = this.outsetsFor(window);
+      const decorated =
+        outsets.left !== 0 ||
+        outsets.right !== 0 ||
+        outsets.top !== 0 ||
+        outsets.bottom !== 0;
       const rect = window.state[WINDOW_STATE_FULLSCREEN]()
         ? this.fullscreenRootRect(window)
         : window.state[WINDOW_STATE_MAXIMIZED]()
           ? this.maximizedTileRect(window, nextX)
-          : {
-              x: nextX,
-              y: read(viewportRect.y),
-              width: tileWidth,
-              height: tileHeight,
-            };
+          : decorated
+            ? {
+                x: nextX + outsets.left,
+                y: read(viewportRect.y) + outsets.top,
+                width: Math.max(
+                  1,
+                  tileWidth - outsets.left - outsets.right,
+                ),
+                height: Math.max(
+                  1,
+                  tileHeight - outsets.top - outsets.bottom,
+                ),
+              }
+            : {
+                x: nextX,
+                y: read(viewportRect.y),
+                width: tileWidth,
+                height: tileHeight,
+              };
       appliedRects[window.id] = rect;
       if (window.id === this.draggingWindowId) {
         this.lastDraggingSlotRect = rect;
@@ -4143,7 +4391,14 @@ export class Workspace {
       minWidth,
       Math.max(minWidth, maxWidth),
     );
-    this.tileWidthByWindowId.set(event.window.id, width);
+    // tileWidthByWindowId stores the footprint allocation; the resized rect
+    // is the painted root, so a decorated window re-adds its horizontal
+    // outsets to keep the next layout from stealing its ornament border.
+    const resizeOutsets = this.outsetsFor(event.window);
+    this.tileWidthByWindowId.set(
+      event.window.id,
+      width + resizeOutsets.left + resizeOutsets.right,
+    );
     this.scrollToWindow(event.window);
     this.applyLayout();
   }
@@ -5067,6 +5322,15 @@ export class Workspace {
 
     let width = read(sizeRect.width);
     let height = read(sizeRect.height);
+    const constraints = window.sizeConstraints();
+    // Extra = authored frame (insets included) minus the client surface;
+    // computed before any fallback so the client minimum is preserved.
+    const minWidth =
+      Math.max(1, constraints.min?.width ?? 1) +
+      Math.max(0, read(sizeRect.width) - window.position.width);
+    const minHeight =
+      Math.max(1, constraints.min?.height ?? 1) +
+      Math.max(0, read(sizeRect.height) - window.position.height);
     // Reading the natural size while the client geometry is still unsettled
     // (≈0, e.g. right after the first commit) yields a degenerate rect that
     // is nothing but the SSD frame. Freezing that as the floating restore
@@ -5081,9 +5345,40 @@ export class Workspace {
       height = Math.round(logicalHeight * 0.7);
     }
 
+    // Reserve this window's decoration footprint around the centered root:
+    // center the (root + outsets) box inside the usable area so ornaments
+    // stay on the output without shrinking the client-visible root. A root
+    // larger than the usable area cannot host its footprint; shrink to the
+    // biggest size that fits, never below the client's own minimum. Guarded
+    // on a nonzero footprint so undecorated windows keep the exact legacy
+    // geometry.
+    const outsets = this.outsetsFor(window);
+    if (
+      outsets.left !== 0 ||
+      outsets.right !== 0 ||
+      outsets.top !== 0 ||
+      outsets.bottom !== 0
+    ) {
+      width = clamp(
+        width,
+        minWidth,
+        Math.max(minWidth, logicalWidth - outsets.left - outsets.right),
+      );
+      height = clamp(
+        height,
+        minHeight,
+        Math.max(minHeight, logicalHeight - outsets.top - outsets.bottom),
+      );
+    }
     return {
-      x: logicalX + (logicalWidth - width) / 2,
-      y: logicalY + (logicalHeight - height) / 2,
+      x:
+        logicalX +
+        outsets.left +
+        (logicalWidth - outsets.left - outsets.right - width) / 2,
+      y:
+        logicalY +
+        outsets.top +
+        (logicalHeight - outsets.top - outsets.bottom - height) / 2,
       width,
       height,
     };
@@ -5129,14 +5424,56 @@ export class Workspace {
     return Math.round(this.scrollOffset * scale) / scale;
   }
 
-  private clampRectToViewport(rect: ManagedWindowRect): ManagedWindowRect {
+  private clampRectToViewport(
+    rect: ManagedWindowRect,
+    window: WaylandWindow,
+  ): ManagedWindowRect {
     const viewport = this.tileViewportRect();
-    const width = read(rect.width);
-    const height = read(rect.height);
-    const minX = read(viewport.x);
-    const minY = read(viewport.y);
-    const maxX = minX + Math.max(0, read(viewport.width) - width);
-    const maxY = minY + Math.max(0, read(viewport.height) - height);
+    const outsets = this.outsetsFor(window);
+    let width = read(rect.width);
+    let height = read(rect.height);
+    const minX = read(viewport.x) + outsets.left;
+    const minY = read(viewport.y) + outsets.top;
+    if (
+      outsets.left !== 0 ||
+      outsets.right !== 0 ||
+      outsets.top !== 0 ||
+      outsets.bottom !== 0
+    ) {
+      // A decorated root larger than the viewport cannot host its footprint;
+      // shrink to the biggest size that fits while never going below the
+      // client's own minimum (an impossible fit preserves the minimum).
+      const constraints = window.sizeConstraints();
+      const natural = this.naturalRootRect(window);
+      const minWidth =
+        Math.max(1, constraints.min?.width ?? 1) +
+        Math.max(0, read(natural.width) - window.position.width);
+      const minHeight =
+        Math.max(1, constraints.min?.height ?? 1) +
+        Math.max(0, read(natural.height) - window.position.height);
+      width = clamp(
+        width,
+        minWidth,
+        Math.max(minWidth, read(viewport.width) - outsets.left - outsets.right),
+      );
+      height = clamp(
+        height,
+        minHeight,
+        Math.max(
+          minHeight,
+          read(viewport.height) - outsets.top - outsets.bottom,
+        ),
+      );
+    }
+    const maxX =
+      minX +
+      Math.max(0, read(viewport.width) - outsets.left - outsets.right - width);
+    const maxY =
+      minY +
+      Math.max(
+        0,
+        read(viewport.height) - outsets.top - outsets.bottom - height,
+      );
     return {
       x: clamp(read(rect.x), minX, maxX),
       y: clamp(read(rect.y), minY, maxY),
@@ -5194,20 +5531,21 @@ export class Workspace {
     window: WaylandWindow,
     viewportRect: ManagedWindowRect,
   ): number {
+    const outsets = this.outsetsFor(window);
+    const externalWidth = outsets.left + outsets.right;
     if (window.state[WINDOW_STATE_MAXIMIZED]()) {
-      return read(this.maximizedRootRect(window).width);
+      return read(this.maximizedRootRect(window).width) + externalWidth;
     }
 
     const width =
       this.tileWidthByWindowId.get(window.id) ??
       this.defaultTileWidth(viewportRect);
+    // The stored slot includes ornaments; client constraints remain root-sized.
+    const minWidth = this.minTileWidth(window, viewportRect) + externalWidth;
     return clamp(
       width,
-      this.minTileWidth(window, viewportRect),
-      Math.max(
-        this.minTileWidth(window, viewportRect),
-        this.maxTileWidth(window),
-      ),
+      minWidth,
+      Math.max(minWidth, this.maxTileWidth(window) + externalWidth),
     );
   }
 
@@ -5217,7 +5555,7 @@ export class Workspace {
   ): ManagedWindowRect {
     const maximizedRect = this.maximizedRootRect(window);
     return {
-      x,
+      x: x + this.outsetsFor(window).left,
       y: read(maximizedRect.y),
       width: read(maximizedRect.width),
       height: read(maximizedRect.height),
@@ -5233,15 +5571,17 @@ export class Workspace {
       return;
     }
     const viewportRect = this.tileViewportRect();
+    // tileWidthByWindowId stores the footprint allocation; the incoming rect
+    // is a painted root, so decorated windows add their horizontal outsets.
+    const outsets = this.outsetsFor(window);
+    const externalWidth = outsets.left + outsets.right;
+    const minWidth = this.minTileWidth(window, viewportRect) + externalWidth;
     this.tileWidthByWindowId.set(
       window.id,
       clamp(
-        read(rect.width),
-        this.minTileWidth(window, viewportRect),
-        Math.max(
-          this.minTileWidth(window, viewportRect),
-          this.maxTileWidth(window),
-        ),
+        read(rect.width) + externalWidth,
+        minWidth,
+        Math.max(minWidth, this.maxTileWidth(window) + externalWidth),
       ),
     );
   }
