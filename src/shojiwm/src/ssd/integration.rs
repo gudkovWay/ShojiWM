@@ -2187,10 +2187,9 @@ impl ShojiWM {
                     animation,
                 },
             );
-        let _ = self.advance_managed_window_animations(started_at_ms);
-        let mut just_scheduled = std::collections::HashSet::new();
-        just_scheduled.insert(inserted_window_id.clone());
-        self.apply_managed_window_rects(&just_scheduled, true);
+        let mut dirty_rect_window_ids = self.advance_managed_window_animations(started_at_ms);
+        dirty_rect_window_ids.insert(inserted_window_id.clone());
+        self.apply_managed_window_rects(&dirty_rect_window_ids, true);
         if (managed_animation_debug_enabled()
             || hot_reload_debug_enabled()
             || minimize_debug_enabled())
@@ -2315,16 +2314,42 @@ impl ShojiWM {
                 "managed animation: cancel"
             );
         }
+        // Whether a channel (or the whole map entry) actually existed and was
+        // removed. A cancel naming a channel this window never had is a true
+        // no-op: nothing was reset, so no redraw/reset/queue is warranted.
+        let mut removed = false;
+        // A removed last-channel map entry hands back its owned `String` key,
+        // which is moved into the pending queue instead of allocating a new
+        // one. `None` means the entry survived with other channels or the
+        // removal left the map in place.
+        let mut removed_owned_key: Option<String> = None;
         if let Some(channel) = channel {
+            let mut last_channel_removed = false;
             if let Some(channels) = self.managed_window_animations.get_mut(window_id) {
-                channels.remove(channel);
-                if channels.is_empty() {
-                    self.managed_window_animations.remove(window_id);
-                }
+                removed = channels.remove(channel).is_some();
+                last_channel_removed = channels.is_empty();
             }
-        } else {
-            self.managed_window_animations.remove(window_id);
+            if last_channel_removed
+                && let Some((key, _)) = self.managed_window_animations.remove_entry(window_id)
+            {
+                removed_owned_key = Some(key);
+            }
+        } else if let Some((key, _)) = self.managed_window_animations.remove_entry(window_id) {
+            removed = true;
+            removed_owned_key = Some(key);
         }
+
+        if !removed {
+            if should_log_cancel {
+                info!(
+                    window_id,
+                    channel = ?channel,
+                    "managed animation: cancel skipped (no matching channel)"
+                );
+            }
+            return;
+        }
+
         let active = self
             .managed_window_animations
             .get(window_id)
@@ -2332,6 +2357,27 @@ impl ShojiWM {
         self.set_managed_window_animation_active(window_id, active);
         if !active {
             self.reset_managed_window_animation_state_to_static(window_id);
+        }
+        // Queue the window's managed-rect geometry for the next refresh apply.
+        // The reset above only reverted `managed_window`; with the animation map
+        // now empty `advance_managed_window_animations` returns no dirty id, so
+        // without this the apply pass would skip a window whose declarative
+        // state is unchanged. Reuse the removed map entry's owned key when
+        // available; otherwise allocate once per genuine cancellation, never
+        // per frame.
+        match removed_owned_key {
+            Some(key) => {
+                self.pending_managed_rect_apply_window_ids.insert(key);
+            }
+            None => {
+                if !self
+                    .pending_managed_rect_apply_window_ids
+                    .contains(window_id)
+                {
+                    self.pending_managed_rect_apply_window_ids
+                        .insert(window_id.to_owned());
+                }
+            }
         }
         if should_log_cancel {
             info!(
@@ -2489,9 +2535,11 @@ impl ShojiWM {
                 let previous_transform = decoration.visual_transform;
                 decoration.managed_window = next_managed_window.clone();
                 decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    decoration.visual_transform = next_managed_window.transform;
-                }
+                // Publish the sampled transform unconditionally: after an
+                // opacity/offset cancellation this is the static-seeded
+                // transform, and a stale transform would desync the rendered
+                // geometry from the sampled composition.
+                decoration.visual_transform = next_managed_window.transform;
                 if rect_changed {
                     dirty_rect_window_ids.insert(window_id.clone());
                 }
@@ -2540,10 +2588,11 @@ impl ShojiWM {
                 let previous_transform = closing.decoration.visual_transform;
                 closing.decoration.managed_window = next_managed_window.clone();
                 closing.decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    closing.decoration.visual_transform = next_managed_window.transform;
-                    closing.transform = next_managed_window.transform;
-                }
+                // Same publishing invariant as the live branch above: the
+                // closing snapshot's final sampled transform must stay
+                // coherent with the sampled composition.
+                closing.decoration.visual_transform = next_managed_window.transform;
+                closing.transform = next_managed_window.transform;
                 let next_root = transformed_root_rect(
                     closing.decoration.layout.root.rect,
                     closing.decoration.visual_transform,
@@ -4319,6 +4368,12 @@ impl ShojiWM {
             timescope::scope!("ssd advance window animations");
             self.advance_managed_window_animations(now_ms)
         });
+        // Move geometry queued by genuine animation cancellations into the
+        // apply batch. Drained AFTER `advance` (so a same-frame cancel/reset is
+        // still seen) and BEFORE `apply_managed_window_rects`; `drain` moves the
+        // `String`s out and retains the pending set's capacity. Ids for windows
+        // that vanished in the meantime simply drain without a fake configure.
+        managed_rect_apply_window_ids.extend(self.pending_managed_rect_apply_window_ids.drain());
         if managed_rect_debug_enabled() {
             let mut apply_ids = managed_rect_apply_window_ids
                 .iter()

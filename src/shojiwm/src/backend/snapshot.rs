@@ -284,6 +284,9 @@ pub fn render_element_scene_signature<E: Element>(elements: &[E], scale: Scale<f
         let geometry = element.geometry(scale);
         (geometry.loc.x, geometry.loc.y, geometry.size.w, geometry.size.h).hash(&mut hasher);
         crate::backend::signature::hash_debug(&mut hasher, &element.src());
+        // Effective opacity and transform change captured pixels without a new buffer commit.
+        element.alpha().to_bits().hash(&mut hasher);
+        crate::backend::signature::hash_debug(&mut hasher, &element.transform());
     }
     hasher.finish()
 }

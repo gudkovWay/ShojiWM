@@ -382,6 +382,14 @@ pub struct ShojiWM {
     pub runtime_output_globals: HashMap<String, GlobalId>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
+    /// Native window ids whose managed-rect geometry must be re-applied by the
+    /// next refresh even when no animation channel remains and the declarative
+    /// JS state is unchanged. Populated when a genuine animation cancellation
+    /// resets a window's managed geometry (see `cancel_managed_window_animation`)
+    /// and drained into the refresh apply batch after `advance_managed_window_animations`
+    /// and before `apply_managed_window_rects`. Ids for windows that vanished in
+    /// the meantime drain harmlessly.
+    pub pending_managed_rect_apply_window_ids: std::collections::HashSet<String>,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
     pub runtime_process_config_generation: u64,
     pub runtime_process_supervision_enabled: bool,
@@ -1724,6 +1732,7 @@ impl ShojiWM {
             runtime_output_globals: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
+            pending_managed_rect_apply_window_ids: Default::default(),
             runtime_output_configs: Default::default(),
             runtime_process_config_generation: 0,
             runtime_process_supervision_enabled: false,
@@ -2765,6 +2774,11 @@ impl ShojiWM {
         self.popup_effect_evaluation_cache.clear();
         self.layer_backdrop_cache.clear();
         self.layer_effect_cache.clear();
+        // Native managed-geometry work queued by the outgoing isolate's
+        // cancellations targets the old config; the fresh isolate re-evaluates
+        // the whole scene and every live window was just marked dirty, so drop
+        // the stale queue instead of re-applying old geometry.
+        self.pending_managed_rect_apply_window_ids.clear();
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
         info!("hot reloaded TypeScript config");
