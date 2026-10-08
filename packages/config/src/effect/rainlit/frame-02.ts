@@ -23,19 +23,18 @@ import { SCENE_02_PERIOD_SECONDS, createBambooSceneMotion } from "./scene-02";
  * module; nothing here re-derives artwork cells by hand.
  *
  * The frame owns one authored wind (`gust`) that also feeds the linked Kitty
- * interior, plus the 120s bamboo-girl daughter scene: the whole bamboo
- * assembly (roll + mat + attached loops) creeps down, drops to the real floor
- * under the girl's approach, and rises again only after her visible button
+ * interior, plus the 120s bamboo-girl daughter scene: the bamboo roll and
+ * slat creep down, drop and settle on the real floor before the girl's
+ * approach, and rise again only after her visible button
  * press. The frame stays on ONE native clock (`MotionInput.seconds`, 120s
  * period); the original 20s ambient harmonics are preserved in a separate
  * constant, and 120 = 6 x 20 keeps their seam continuous at their real speed.
  * No second clock, no per-tick allocation, no asset loading or compilation at
  * module load.
  *
- * The two loosened red loops are suspended from FIXED upper anchors (shared as
- * `FRAME_02_BAMBOO_ANCHORS`): the runtime draws a thin cord from the anchor to
- * each loop's moving pivot, so the assembly pays the cords out as it descends
- * and retracts them when it lifts. ONE irregular lamp pulse (`lampEnergy`)
+ * The two red bindings stay on the upper beam. Matching load-bearing braid
+ * emerges behind their knots and follows the moving roll/slat bearings,
+ * with bounded slack after contact. ONE irregular lamp pulse (`lampEnergy`)
  * drives the exterior paper emission, the interior reflection and the scene
  * stage's warm spill — a single source with a single consequence.
  */
@@ -98,7 +97,7 @@ const ENERGY_REST = 1;
 /** Shared warm energy for the exterior paper and the interior reflection. */
 const LIGHT_REST = 0.5;
 
-/** Shared name of the bamboo group's translateY channel (roll/mat/loops). */
+/** Shared name of the moving roll/slat translateY channel. */
 const BAMBOO_TRANSLATE_Y = "bambooTranslateY";
 
 export const FRAME_02: FramePack = {
@@ -160,7 +159,7 @@ export const FRAME_02: FramePack = {
     const scene = createBambooSceneMotion(input);
     const reveal = scene.bambooReveal;
 
-    // one authored gust shared by the crane, the loops, the interior and the
+    // one authored gust shared by the crane, the interior and the
     // scene stage's foreground weather, published as the signed [-1, 1] wind
     // scalar; reduced motion rests at 0
     const wind = computed(() => (reduced() ? 0 : gustAt(seconds(), 0)));
@@ -172,12 +171,6 @@ export const FRAME_02: FramePack = {
     const craneAngle = computed(() =>
       reduced() ? 0 : 0.032 * gustAt(seconds() - 0.9, 0.35),
     );
-    // loops loosen coherently as the mat leaves the bundle
-    const tiesAngle = computed(() => {
-      if (reduced()) return 0;
-      const t = seconds();
-      return -0.05 * read(reveal) + 0.006 * gustAt(t, 0.2);
-    });
     // ONE irregular lamp pulse drives every consequence of the same physical
     // source: the exterior paper emission (lampEnergy), the interior reflection
     // (light) and the foreground spill the scene stage reads. It is allocated
@@ -191,7 +184,7 @@ export const FRAME_02: FramePack = {
     const shade = computed(() => 0.12 * (reduced() ? 0 : read(reveal)));
 
     return {
-      angles: { tiesAngle, craneAngle, lampAngle },
+      angles: { bambooAngle: scene.bambooAngle, craneAngle, lampAngle },
       reveals: { bambooReveal: reveal },
       translations: { [BAMBOO_TRANSLATE_Y]: scene.bambooOffsetY },
       scene,

@@ -189,9 +189,9 @@ export interface FrameMotion {
  * the root left inset exactly once. `girlFacing` is `1` for the original
  * authored sheet (facing LEFT) and `-1` for a uniform whole-sprite horizontal
  * mirror (facing RIGHT). `bambooOffsetY` is a signed logical root downward
- * (+y) displacement of the whole bamboo assembly and `bambooReveal` its 0..1
- * exposure; both rest at 0 with the bamboo home at the quiet seam. Under
- * reduced motion every channel is at its rest value (bamboo home, girl
+ * (+y) displacement of the roll/slat only; upper bindings stay fixed.
+ * `bambooReveal` and `bambooAngle` independently describe exposure and tilt.
+ * Under reduced motion every channel is at its rest value (bamboo home, girl
  * hidden, all impact and button channels zero).
  */
 export interface BambooSceneMotion {
@@ -207,6 +207,8 @@ export interface BambooSceneMotion {
   readonly bambooOffsetY: MaybeSignal<number>;
   /** Bamboo exposure 0..1 (0 = rolled home, 1 = fully exposed). */
   readonly bambooReveal: MaybeSignal<number>;
+  /** Rigid roll/slat tilt in radians around their common world pivot. */
+  readonly bambooAngle: MaybeSignal<number>;
   /** Button contact 0..1 with distinct press and release edges. */
   readonly buttonPress: MaybeSignal<number>;
   /** Local floor-impact intensity 0..1; zero at the quiet boundaries. */

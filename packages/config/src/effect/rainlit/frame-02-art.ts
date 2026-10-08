@@ -54,7 +54,8 @@ export const FRAME_02_ART: Frame02Art = {
       anchor: "tl",
       offset: [40.5, 18.5],
       size: [165.5, 26],
-      pivot: [82.75, 13],
+      pivot: [82.75, -17],
+      angle: "bambooAngle",
       reveal: "bambooReveal",
       revealMode: "slide",
       translateY: "bambooTranslateY",
@@ -66,6 +67,7 @@ export const FRAME_02_ART: Frame02Art = {
       offset: [40.5, -15.5],
       size: [165.5, 34],
       pivot: [82.75, 17],
+      angle: "bambooAngle",
       translateY: "bambooTranslateY",
     },
     {
@@ -75,8 +77,6 @@ export const FRAME_02_ART: Frame02Art = {
       offset: [61, -17],
       size: [19, 57],
       pivot: [9.5, 2],
-      translateY: "bambooTranslateY",
-      angle: "tiesAngle",
     },
     {
       id: "tie-far",
@@ -85,8 +85,6 @@ export const FRAME_02_ART: Frame02Art = {
       offset: [165, -17],
       size: [19, 57],
       pivot: [9.5, 2],
-      translateY: "bambooTranslateY",
-      angle: "tiesAngle",
     },
     {
       id: "crane-hook",

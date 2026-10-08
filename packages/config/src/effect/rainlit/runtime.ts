@@ -80,7 +80,8 @@ import {
   WINDOW_STATE_WORKSPACE_VISIBLE,
 } from "../../window-manager";
 import { FRAME_02 } from "./frame-02";
-import { FRAME_02_BAMBOO_ANCHORS, FRAME_02_BUTTON_SPAN } from "./frame-02-geometry";
+import { FRAME_02_BAMBOO_ANCHORS, FRAME_02_BUTTON_SPAN, FRAME_02_CORD_DIAMETER } from "./frame-02-geometry";
+import { bambooCordX, bambooCordY } from "./bamboo-02-motion";
 import { FRAME_06 } from "./frame-06";
 import { FRAME_07 } from "./frame-07";
 import { FRAME_09 } from "./frame-09";
@@ -759,15 +760,9 @@ function buildRuntime(
       Math.min(15, Math.max(0, Math.round(read(sceneMotion.girlFrame)))),
     );
 
-    // Fixed upper suspension anchors (LOGICAL ROOT, shared as
-    // `FRAME_02_BAMBOO_ANCHORS`, tie-near then tie-far) and the CURRENT
-    // tie-pivot attachments for the two loosened loops, all converted to
-    // client-local (root minus L/T insets) exactly like every other scene
-    // position. The pivot world point is `pos + pivot`, invariant under the
-    // loop's own rotation, so the moving attachment never drifts while the tie
-    // swings; at rest each anchor coincides with its tie pivot (offset +
-    // pivot), so the cord length is zero at the quiet seam, and both anchors
-    // carries the shared ornament scale.
+    // Fixed knot centres and moving load-bearing points are deliberately
+    // separate. Bearings follow the roll/slat rotation and exposure, never
+    // the stationary upper binding pivots. Convert root -> client once.
     sceneUniforms = {
       logical_size: [clientW, clientH],
       // Root logical size and the ring insets: the shader recovers the ROOT
@@ -777,6 +772,7 @@ function buildRuntime(
       scene_frame_size: [width, height],
       scene_insets: insetsVec,
       scene_scale: sceneScale,
+      focused: focusSignal,
       frame_atlas_size: pack.atlasSize,
       scene_atlas_size: sceneArt.atlasSize,
       sc_cell: uniformArray.vec4(
@@ -835,8 +831,7 @@ function buildRuntime(
       ceiling_impact: computed(() =>
         Math.min(1, Math.max(0, read(sceneMotion.ceilingImpact))),
       ),
-      // Fixed suspension cords: the two shared root anchors, the two current
-      // tie pivots (pos + pivot, client-local) and the floor-impact slack.
+      // Continuous braid from fixed upper knots to the lower bundle bearings.
       cord_a0: [
         computed(
           () => FRAME_02_BAMBOO_ANCHORS[0][0] * read(ornamentScale) - insets.left,
@@ -854,33 +849,22 @@ function buildRuntime(
         ),
       ],
       cord_e0: [
-        computed(
-          () =>
-            read(posX[bambooIndex[2]]) -
-            insets.left +
-            read(rlPivot[bambooIndex[2]][0]),
-        ),
-        computed(
-          () =>
-            read(posY[bambooIndex[2]]) -
-            insets.top +
-            read(rlPivot[bambooIndex[2]][1]),
-        ),
+        computed(() => bambooCordX(0, read(sceneMotion.bambooReveal),
+          read(sceneMotion.bambooAngle), ornamentScale()) - insets.left),
+        computed(() => bambooCordY(0, read(sceneMotion.bambooOffsetY),
+          read(sceneMotion.bambooReveal), read(sceneMotion.bambooAngle),
+          ornamentScale()) - insets.top),
       ],
       cord_e1: [
-        computed(
-          () =>
-            read(posX[bambooIndex[3]]) -
-            insets.left +
-            read(rlPivot[bambooIndex[3]][0]),
-        ),
-        computed(
-          () =>
-            read(posY[bambooIndex[3]]) -
-            insets.top +
-            read(rlPivot[bambooIndex[3]][1]),
-        ),
+        computed(() => bambooCordX(1, read(sceneMotion.bambooReveal),
+          read(sceneMotion.bambooAngle), ornamentScale()) - insets.left),
+        computed(() => bambooCordY(1, read(sceneMotion.bambooOffsetY),
+          read(sceneMotion.bambooReveal), read(sceneMotion.bambooAngle),
+          ornamentScale()) - insets.top),
       ],
+      cord_diameter: computed(() => FRAME_02_CORD_DIAMETER * ornamentScale()),
+      cord_payout: computed(() =>
+        Math.min(1, Math.max(0, read(sceneMotion.bambooOffsetY) / Math.max(0.001, 12 * ornamentScale())))),
       cord_slack: computed(() =>
         Math.min(1, Math.max(0, read(sceneMotion.floorImpact))),
       ),

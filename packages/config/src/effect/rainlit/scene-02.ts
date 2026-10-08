@@ -10,6 +10,12 @@ import {
   SCENE_02_CELL_SIZE,
   SCENE_02_PRESS_CONTACT,
 } from "./scene-02-assets";
+import {
+  bambooAngleAt,
+  bambooDropEnd,
+  bambooOffsetAt,
+  bambooRevealAt,
+} from "./bamboo-02-motion";
 
 /**
  * Rainlit 02 daughter scene — the native 120s bamboo-girl story.
@@ -22,10 +28,10 @@ import {
  *
  * Story (exact causal intervals, seconds):
  *   0..100    quiet        bamboo rolled home, girl hidden, all impacts 0
- *   100..105  creep        assembly descends slowly, mat begins to expose
- *   105..105.6 drop        accelerating fall to the real floor
- *   105.6..106.2 impact    floor impact spike + settle
- *   106.2..110 walk        girl enters right and walks LEFT to the button
+ *   100..105  creep        bounded slips beneath stationary upper bindings
+ *   105..landing drop      height-aware accelerated fall (0.4..0.9s)
+ *   landing..+0.6 impact    rigid recoil and rocking, no floor penetration
+ *   settled..110 walk      girl enters right after the bundle settles
  *   110..110.6 stop/reach  girl stops, then begins reaching
  *   110.6..111.2 press     full index-finger press, then a distinct release
  *   111.2..114.5 lift      bamboo rises ONLY after the visible contact
@@ -76,10 +82,7 @@ const BUTTON_SPAN = FRAME_02_BUTTON_SPAN;
 const WALK_STRIDE = 8;
 
 /** Interval boundaries in scene seconds (see the header story). */
-const QUIET_END = 100;
-const CREEP_END = 105;
-const DROP_END = 105.6;
-const SETTLE_END = 106.2;
+const FLOOR_SETTLE_SECONDS = 0.6;
 const WALK_END = 110;
 const STOP_SETTLE_END = 110.35;
 const STOP_END = 110.6;
@@ -98,35 +101,12 @@ const DEPART_END = 119.4;
 /** Girl fade-in / fade-out durations. */
 const FADE_IN = 0.5;
 const FADE_OUT_START = 118.9;
-/** Fraction of the fall distance reached during the slow creep. */
-const CREEP_LEVEL = 0.18;
 
 function smoothstep(value: number): number {
   const x = value < 0 ? 0 : value > 1 ? 1 : value;
   return x * x * (3 - 2 * x);
 }
 
-/** Assembly descent 0..1: 0 = rolled home, 1 = resting on the floor. */
-function descentAt(t: number): number {
-  if (t < QUIET_END) return 0;
-  if (t < CREEP_END) {
-    return CREEP_LEVEL * smoothstep((t - QUIET_END) / (CREEP_END - QUIET_END));
-  }
-  if (t < DROP_END) {
-    // Accelerating drop: quadratic ease-in, so the velocity grows into the
-    // landing instead of easing out of the creep.
-    const u = (t - CREEP_END) / (DROP_END - CREEP_END);
-    return CREEP_LEVEL + (1 - CREEP_LEVEL) * u * u;
-  }
-  if (t < PRESS_END) return 1;
-  if (t < LIFT_END) {
-    // Rise begins only after the visible contact (PRESS_END). Quadratic
-    // ease-in gives a soft start and a real arrival speed at the ceiling.
-    const u = (t - PRESS_END) / (LIFT_END - PRESS_END);
-    return 1 - u * u;
-  }
-  return 0;
-}
 
 /** Button contact 0..1: fast press edge, hold, then a distinct release edge. */
 function buttonPressAt(t: number): number {
@@ -144,10 +124,10 @@ function impactAt(t: number, from: number, to: number): number {
 }
 
 /** Girl horizontal position (LOGICAL ROOT cell left) over the story. */
-function girlXAt(t: number, parkX: number, pressX: number): number {
-  if (t <= SETTLE_END) return parkX;
+function girlXAt(t: number, parkX: number, pressX: number, settled: number): number {
+  if (t <= settled) return parkX;
   if (t < WALK_END) {
-    const u = (t - SETTLE_END) / (WALK_END - SETTLE_END);
+    const u = (t - settled) / (WALK_END - settled);
     return parkX + (pressX - parkX) * u;
   }
   if (t < DEPART_WALK_START) return pressX;
@@ -170,10 +150,11 @@ function girlFrameAt(
   stride: number,
   parkX: number,
   pressX: number,
+  settled: number,
 ): number {
-  if (t <= SETTLE_END) return 0;
+  if (t <= settled) return 0;
   if (t < WALK_END) {
-    return walkFrame(parkX - girlXAt(t, parkX, pressX), stride);
+    return walkFrame(parkX - girlXAt(t, parkX, pressX, settled), stride);
   }
   if (t < STOP_SETTLE_END) return 9; // stopped after walking, feet planted
   if (t < STOP_END) return 10; // begin reaching
@@ -184,16 +165,16 @@ function girlFrameAt(
   if (t < LOOK_END) return 14; // head returns level, relaxed
   if (t < DEPART_WALK_START) return 15; // departure step, still facing LEFT
   if (t < DEPART_END) {
-    return walkFrame(girlXAt(t, parkX, pressX) - pressX, stride);
+    return walkFrame(girlXAt(t, parkX, pressX, settled) - pressX, stride);
   }
   return 0;
 }
 
 /** Girl opacity: fade in on approach, fade out on departure, 0 at rest. */
-function girlOpacityAt(t: number): number {
-  if (t <= SETTLE_END) return 0;
-  if (t < SETTLE_END + FADE_IN) {
-    return smoothstep((t - SETTLE_END) / FADE_IN);
+function girlOpacityAt(t: number, settled: number): number {
+  if (t <= settled) return 0;
+  if (t < settled + FADE_IN) {
+    return smoothstep((t - settled) / FADE_IN);
   }
   if (t < FADE_OUT_START) return 1;
   if (t < DEPART_END) {
@@ -229,6 +210,8 @@ export function createBambooSceneMotion(input: MotionInput): BambooSceneMotion {
   const fall = computed(() =>
     Math.max(0, floorRoot() - BAMBOO_MAX_BOTTOM * ornamentScale()),
   );
+  const landing = computed(() => bambooDropEnd(fall(), ornamentScale()));
+  const settled = computed(() => landing() + FLOOR_SETTLE_SECONDS);
 
   // Uniform girl scale: capped, then shrunk to always fit the client opening
   // with a 1px margin per side so hands and hair are never silently cropped.
@@ -252,29 +235,29 @@ export function createBambooSceneMotion(input: MotionInput): BambooSceneMotion {
   // real travel at every root size.
   const stride = computed(() => Math.max(1, WALK_STRIDE * sceneScale()));
 
-  // Assembly descent is the single causal driver of offset + exposure; under
-  // reduced motion it rests at exactly 0 (bamboo home).
-  const descent = computed(() => (reduced() ? 0 : descentAt(seconds())));
-  const bambooOffsetY = computed(() => descent() * fall());
+  // Independent scalar tracks on the existing clock; bindings do not move.
+  const bambooOffsetY = computed(() => reduced() ? 0 :
+    bambooOffsetAt(seconds(), fall(), ornamentScale(), landing()));
 
   return {
     girlX: computed(() =>
-      reduced() ? parkX() : girlXAt(seconds(), parkX(), pressX()),
+      reduced() ? parkX() : girlXAt(seconds(), parkX(), pressX(), settled()),
     ),
     girlFrame: computed(() =>
-      reduced() ? 0 : girlFrameAt(seconds(), stride(), parkX(), pressX()),
+      reduced() ? 0 : girlFrameAt(seconds(), stride(), parkX(), pressX(), settled()),
     ),
     // 1 = authored sheet facing LEFT (approach, unmirrored press, depart step);
     // -1 = uniform whole-sprite mirror for the rightward departure walk.
     girlFacing: computed(() =>
       reduced() || seconds() < DEPART_WALK_START ? 1 : -1,
     ),
-    girlOpacity: computed(() => (reduced() ? 0 : girlOpacityAt(seconds()))),
+    girlOpacity: computed(() => (reduced() ? 0 : girlOpacityAt(seconds(), settled()))),
     bambooOffsetY,
-    bambooReveal: descent,
+    bambooReveal: computed(() => reduced() ? 0 : bambooRevealAt(seconds(), landing())),
+    bambooAngle: computed(() => reduced() ? 0 : bambooAngleAt(seconds(), landing())),
     buttonPress: computed(() => (reduced() ? 0 : buttonPressAt(seconds()))),
     floorImpact: computed(() =>
-      reduced() ? 0 : impactAt(seconds(), DROP_END, SETTLE_END),
+      reduced() ? 0 : impactAt(seconds(), landing(), settled()),
     ),
     ceilingImpact: computed(() =>
       reduced() ? 0 : impactAt(seconds(), LIFT_END, CEILING_END),

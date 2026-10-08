@@ -27,16 +27,12 @@
 //   reveal/translation the frame stage uses (runtime reuses the identical FK
 //   signals), so the group reads as one continuous object across the frame
 //   ring and the client.
-// - Fixed red suspension: two ~1px braided cords span from the FIXED upper
-//   anchors (shared `FRAME_02_BAMBOO_ANCHORS`, root [70.5, -15] and
-//   [174.5, -15], scaled by the same ornament scale) down to the CURRENT
-//   moving tie pivots (pos + pivot, the pivot is rotation-invariant, so the
-//   attachment is stable). At rest both ends coincide; as the assembly
-//   descends the cord lengthens — a controlled payout with real tension — and
-//   a bounded lateral sag appears only on the floor impact. Nothing here
-//   introduces a second clock; the descent length is the existing shared
-//   `bambooOffsetY`. The cord is drawn BEFORE the bamboo layers, so it stays
-//   behind the bundle and the ties.
+// - Upper bindings stay on the beam. Two solid shaded burgundy braids emerge
+//   behind their knots and bear against the moving bamboo's lower edge.
+//   Diameter and texture come from the same authored binding material, not a
+//   translucent sinusoidal hairline. The strand crosses in front of the roll
+//   and terminates inside its lower silhouette; no moving tassel is duplicated.
+//   Local impact slack is bounded, and all coordinates share the frame scale.
 // - The girl is one indexed 16-cell atlas draw with a uniform whole-sprite
 //   horizontal mirror (facing < -0.5 flips the local u axis); alpha comes
 //   from the atlas's real transparency, never a luminance key. The authored
@@ -62,6 +58,7 @@ uniform vec2 logical_size;     // client opening logical size
 uniform vec2 scene_frame_size; // ROOT logical size (frame.frag's logical_size)
 uniform vec4 scene_insets;     // left, top, right, bottom logical px (ring)
 uniform float scene_scale;     // sceneScale = girlScale / 0.20
+uniform float focused;
 uniform vec4 sc_cell[4];
 uniform vec2 sc_size[4];
 uniform vec2 sc_pivot[4];
@@ -80,13 +77,14 @@ uniform vec2 b_size;
 uniform float b_press;
 uniform float floor_impact;
 uniform float ceiling_impact;
-// Fixed suspension: upper anchors (client-local logical px), moving tie-pivot
-// attachments, and the 0..1 floor-impact slack that bends the cord a little.
+// Fixed knot centres, moving lower bearings, and scaled material width.
 uniform vec2 cord_a0;
 uniform vec2 cord_e0;
 uniform vec2 cord_a1;
 uniform vec2 cord_e1;
 uniform float cord_slack;
+uniform float cord_diameter;
+uniform float cord_payout;
 
 // Half-source-texel inset sample of one atlas cell (identical to the frame
 // stage's helper): keeps linear filtering inside the cell's transparent
@@ -102,49 +100,50 @@ vec4 rl_scene_over(vec4 dst, vec4 src) {
     return src + dst * (1.0 - src.a);
 }
 
-// One fixed suspension cord: a thin braided red line from the fixed upper
-// anchor `a` to the current tie pivot `e`. Distance is measured to a quadratic
-// Bezier whose control point adds a bounded lateral sag only under the floor
-// impact (`slack`), so the payout stays taut while it lengthens. Returns
-// premultiplied coverage. The cord is near-vertical, so the braid phase is
-// keyed to y (a cheap, stable parameter along its length).
-vec4 rl_scene_cord(vec2 p, vec2 a, vec2 e, float slack, float seed) {
-    // Conservative bounds reject BEFORE any geometry work: the cord endpoints,
-    // the <=3 px lateral sag and the sub-pixel braided weave all stay inside
-    // this box, so a fragment far from the cord skips the segment evaluation.
-    vec2 lo = min(a, e) - vec2(4.0, 1.0);
-    vec2 hi = max(a, e) + vec2(4.0, 1.0);
-    if (p.x < lo.x || p.x > hi.x || p.y < lo.y || p.y > hi.y) {
+// Near-vertical load-bearing braid. Solve its lateral bow directly in y:
+// no eight-segment distance loop on every covered fragment.
+vec4 rl_scene_cord(vec2 p, vec2 a, vec2 e, float slack, float seed, float aa) {
+    if (cord_payout <= 0.0 || e.y <= a.y) { return vec4(0.0); }
+    float radius = 0.5 * cord_diameter;
+    float bow = cord_diameter * 1.5 * clamp(slack, 0.0, 1.0) * (seed < 0.5 ? -1.0 : 1.0);
+    float margin = radius + abs(bow) + aa;
+    if (p.x < min(a.x, e.x) - margin || p.x > max(a.x, e.x) + margin ||
+        p.y < a.y - radius - aa || p.y > e.y + radius + aa) {
         return vec4(0.0);
     }
-    vec2 chord = e - a;
-    float len = length(chord);
-    vec2 perp = len > 1e-3 ? vec2(-chord.y, chord.x) / len : vec2(1.0, 0.0);
-    vec2 ctrl = 0.5 * (a + e) + perp * (clamp(slack, 0.0, 1.0) * 3.0);
-    // Small braided weave: the centreline drifts a fraction of a pixel.
-    vec2 pw = vec2(p.x - 0.15 * sin(p.y * 0.7 + seed * 2.1), p.y);
-    vec2 prev = a;
-    float dmin = 1e9;
-    for (int k = 1; k <= 8; k++) {
-        float t = float(k) / 8.0;
-        float mt = 1.0 - t;
-        vec2 pt = mt * mt * a + 2.0 * mt * t * ctrl + t * t * e;
-        vec2 pa = pw - prev;
-        vec2 ba = pt - prev;
-        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-4), 0.0, 1.0);
-        dmin = min(dmin, length(pa - ba * h));
-        prev = pt;
+    float dy = e.y - a.y;
+    float u = clamp((p.y - a.y) / dy, 0.0, 1.0);
+    float centre = mix(a.x, e.x, u) + 4.0 * bow * u * (1.0 - u);
+    float slope = (e.x - a.x + 4.0 * bow * (1.0 - 2.0 * u)) / dy;
+    float cross = (p.x - centre) / sqrt(1.0 + slope * slope);
+    float cap = p.y - mix(a.y, e.y, u);
+    float distance = length(vec2(cross, cap));
+    float coverage = (1.0 - smoothstep(max(0.0, radius - aa), radius + aa, distance)) * cord_payout;
+    if (coverage <= 1e-4) { return vec4(0.0); }
+    // Reuse the burgundy strand in the original binding, excluding its
+    // bamboo surround and lower tassel. Only colour varies; the core is solid.
+    float across = clamp(cross / max(cord_diameter, 0.001) + 0.5, 0.0, 1.0);
+    float along = fract((p.y - a.y) / max(5.0 * cord_diameter, 0.001) + seed * 0.37);
+    vec4 cell = seed < 0.5 ? sc_cell[2] : sc_cell[3];
+    vec3 material = rl_scene_cell_sample(frame_atlas, frame_atlas_size, cell,
+        vec2(mix(0.38, 0.62, across), mix(0.12, 0.46, along))).rgb;
+    float radial = 2.0 * across - 1.0;
+    float roundLight = 0.78 + 0.22 * sqrt(max(0.0, 1.0 - radial * radial));
+    return vec4(material * roundLight * coverage, coverage);
+}
+
+// Existing upper binding art occludes the emerging braid on either side of
+// the frame/client boundary. The cells remain stationary and retain alpha.
+float rl_scene_binding_alpha(vec2 p) {
+    float coverage = 0.0;
+    for (int i = 2; i < 4; i++) {
+        vec2 uv = (p - sc_pos[i]) / max(sc_size[i], vec2(0.001));
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+            coverage = max(coverage,
+                rl_scene_cell_sample(frame_atlas, frame_atlas_size, sc_cell[i], uv).a);
+        }
     }
-    // ~1 px cord: half-width 0.5 with a sub-pixel antialiased shoulder.
-    float body = 1.0 - smoothstep(0.44, 0.60, dmin);
-    // Braided highlight ripple; only ever DARKENS coverage, never widens it.
-    float braid = 0.82 + 0.18 * sin(p.y * 1.8 + seed * 1.3);
-    float cov = body * braid;
-    if (cov <= 1e-4) {
-        return vec4(0.0);
-    }
-    vec3 col = vec3(0.60, 0.135, 0.115);
-    return vec4(col * cov, cov);
+    return coverage;
 }
 
 vec4 shader_main(EffectContext effect) {
@@ -156,13 +155,19 @@ vec4 shader_main(EffectContext effect) {
     vec2 root = max(scene_frame_size, vec2(1.0));
     vec2 framePx = max(effect.frame_rect_px.zw, vec2(1.0));
     vec2 p = effect_frame_px(effect) / (framePx / root) - scene_insets.xy;
+    float aa = max(0.25, 0.5 * root.x / framePx.x);
+    float materialLight = mix(0.85, 1.0, clamp(focused, 0.0, 1.0));
 
     // Fixed suspension, drawn in BOTH spaces so the cable crosses the native
     // frame/client clip with no gap.
     vec4 cord = rl_scene_over(
-        rl_scene_cord(p, cord_a0, cord_e0, cord_slack, 0.0),
-        rl_scene_cord(p, cord_a1, cord_e1, cord_slack, 1.0)
+        rl_scene_cord(p, cord_a0, cord_e0, cord_slack, 0.0, aa),
+        rl_scene_cord(p, cord_a1, cord_e1, cord_slack, 1.0, aa)
     );
+    if (cord.a > 0.0) {
+        cord *= 1.0 - rl_scene_binding_alpha(p);
+        cord.rgb *= materialLight;
+    }
 
     // Outside the client opening (frame ring, header band) the incoming frame
     // art — rails, corners, real native controls — is returned untouched,
@@ -182,7 +187,6 @@ vec4 shader_main(EffectContext effect) {
     // Premultiply the incoming straight frame art once. Inside the client this
     // is exactly zero, so only the sprites below contribute coverage.
     vec4 acc = vec4(src.rgb * src.a, src.a);
-    acc = rl_scene_over(acc, cord);
 
     // Bamboo continuation: the exact frame-stage layer math, in client-local
     // space. Sampled from the ORIGINAL pack atlas so the material matches
@@ -205,8 +209,10 @@ vec4 shader_main(EffectContext effect) {
         vec2 t = q / size;
         if (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0) { continue; }
         vec4 cs = rl_scene_cell_sample(frame_atlas, frame_atlas_size, sc_cell[i], t);
-        acc = rl_scene_over(acc, vec4(cs.rgb * cs.a, cs.a));
+        acc = rl_scene_over(acc, vec4(cs.rgb * materialLight * cs.a, cs.a));
     }
+    // Bearing strands remain visibly connected across the front of the bundle.
+    acc = rl_scene_over(acc, cord);
 
     // The girl: one indexed atlas draw with a uniform mirror. facing < -0.5
     // means the sheet was authored facing left and this draw is reflected to

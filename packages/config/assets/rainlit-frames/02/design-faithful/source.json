@@ -1209,8 +1209,9 @@
         ],
         "pivot": [
           82.75,
-          13.0
+          -17.0
         ],
+        "angle": "bambooAngle",
         "reveal": "bambooReveal",
         "revealMode": "slide",
         "translateY": "bambooTranslateY"
@@ -1240,6 +1241,7 @@
           82.75,
           17.0
         ],
+        "angle": "bambooAngle",
         "translateY": "bambooTranslateY"
       },
       {
@@ -1266,9 +1268,7 @@
         "pivot": [
           9.5,
           2.0
-        ],
-        "translateY": "bambooTranslateY",
-        "angle": "tiesAngle"
+        ]
       },
       {
         "id": "tie-far",
@@ -1294,9 +1294,7 @@
         "pivot": [
           9.5,
           2.0
-        ],
-        "translateY": "bambooTranslateY",
-        "angle": "tiesAngle"
+        ]
       },
       {
         "id": "crane-hook",

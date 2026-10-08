@@ -12,10 +12,8 @@
  * floor and the client-local positions from that single inset. Nothing here
  * constructs signals, loads assets or compiles effects.
  *
- * `FRAME_02_BAMBOO_ANCHORS` are the two FIXED upper suspension anchors of the
- * loosened red loops in LOGICAL ROOT coordinates; at rest they coincide with
- * the tie layers' world pivots (`offset + pivot`), and they are the anchors the
- * runtime's fixed cords are drawn from.
+ * `FRAME_02_BAMBOO_ANCHORS` are the FIXED upper knot centres, where
+ * load-bearing braid emerges from behind the original stationary bindings.
  */
 
 /** Painted timber ring inset per side, logical px (one authored beam). */
@@ -28,14 +26,16 @@ export const FRAME_02_MINIMUM_ROOT = [480, 320] as const;
 export const FRAME_02_BAMBOO_MAX_BOTTOM = 44.5;
 
 /**
- * Fixed upper suspension anchors of the two loosened loops, LOGICAL ROOT
- * px, in tie-near / tie-far order. Each equals that tie layer's rest world
- * pivot, so the cord length is zero at the quiet seam.
+ * Knot centres in LOGICAL ROOT px, in tie-near / tie-far order.
+ * These stay on the beam; moving cord bearings follow the bamboo instead.
  */
 export const FRAME_02_BAMBOO_ANCHORS = [
-  [70.5, -15],
-  [174.5, -15],
+  [70.5, 22],
+  [174.5, 22],
 ] as const;
+
+/** One braided strand, not the combined width of the doubled upper binding. */
+export const FRAME_02_CORD_DIAMETER = 4.5;
 
 /**
  * Logical root x span the scene scale opens for the decorative button: the
