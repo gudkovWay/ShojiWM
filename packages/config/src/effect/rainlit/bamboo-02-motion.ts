@@ -67,7 +67,14 @@ export function bambooOffsetAt(t: number, distance: number, scale: number, landi
     const u = (t - 105) / (landing - 105);
     y = creep + (distance - creep) * u * u;
   } else if (t < 111.2) {
-    y = distance - 8 * scale * recoil(t, landing, 0.6);
+    // Two ballistic hops: 24px / 0.4s, then 6px / 0.2s at full scale.
+    // Halving flight time and quartering height keeps the same acceleration;
+    // both contacts still settle within the existing 0.6s story interval.
+    const elapsed = t - landing;
+    const secondHop = elapsed >= 0.4;
+    const u = Math.min(1, (elapsed - (secondHop ? 0.4 : 0)) / (secondHop ? 0.2 : 0.4));
+    const height = Math.min(24 * scale, distance * 0.12) * (secondHop ? 0.25 : 1);
+    y = distance - 4 * height * u * (1 - u);
   } else if (t < 114.5) {
     const u = (t - 111.2) / 3.3;
     y = distance * (1 - u * u);

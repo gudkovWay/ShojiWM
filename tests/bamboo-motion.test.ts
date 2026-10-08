@@ -33,10 +33,32 @@ test("fall duration grows with distance; floor contact precedes the girl", () =>
   }
 });
 
-test("rigid tilt and recoil never drive exposed bamboo through the floor", () => {
-  for (const [distance, scale] of [[111.75, 0.5], [222.5, 1], [1242.5, 1]]) {
+test("landing has two visible diminishing hops with floor contact between them", () => {
+  for (const scale of [0.5, 1]) {
+    const distance = 902.5 * scale;
     const land = bambooDropEnd(distance, scale);
-    for (const t of [104.7, 105.1, land - 0.001, land, land + 0.09, land + 0.22, land + 0.5, 111.2, 112, 114.5, 114.65]) {
+    const clearanceAt = (elapsed: number) => {
+      const t = land + elapsed;
+      return distance + 44.5 * scale -
+        bambooOffsetAt(t, distance, scale, land) -
+        bambooBottomAt(bambooAngleAt(t, land), bambooRevealAt(t, land), scale);
+    };
+    const firstHop = clearanceAt(0.2);
+    const secondHop = clearanceAt(0.5);
+    assert.ok(firstHop > 18 * scale && firstHop <= 24 * scale);
+    assert.ok(secondHop > 3 * scale && secondHop <= 6 * scale);
+    assert.ok(secondHop < firstHop / 3);
+    for (const contact of [0, 0.4, 0.6, 0.8]) near(clearanceAt(contact), 0);
+    for (const contact of [0.4, 0.6]) {
+      near(clearanceAt(contact - 1e-7), clearanceAt(contact + 1e-7), 0.001);
+    }
+  }
+});
+
+test("rigid tilt and recoil never drive exposed bamboo through the floor", () => {
+  for (const [distance, scale] of [[10, 0.5], [111.75, 0.5], [222.5, 1], [1242.5, 1]]) {
+    const land = bambooDropEnd(distance, scale);
+    for (const t of [104.7, 105.1, land - 0.001, land, land + 0.09, land + 0.2, land + 0.4, land + 0.5, land + 0.6, 111.2, 112, 114.5, 114.65]) {
       const reveal = bambooRevealAt(t, land);
       const angle = bambooAngleAt(t, land);
       const offset = bambooOffsetAt(t, distance, scale, land);
