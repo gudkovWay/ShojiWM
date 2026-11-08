@@ -31,7 +31,10 @@ use smithay::{
     utils::{Logical, Physical, Point, Rectangle, Scale},
     wayland::{
         background_effect::BackgroundEffectSurfaceCachedState,
-        compositor::{RectangleKind, RegionAttributes, SurfaceAttributes, with_states},
+        compositor::{
+            RectangleKind, RegionAttributes, SurfaceAttributes, TraversalAction, with_states,
+            with_surface_tree_downward,
+        },
         session_lock::LockSurface,
         shell::wlr_layer::Layer as WlrLayer,
         shell::xdg::XdgToplevelSurfaceData,
@@ -42,8 +45,109 @@ use tracing::{info, warn};
 use crate::{backend::clipped_surface::ClippedSurfaceElement, ssd::ContentClip};
 
 pub enum WindowClipElement {
+    /// The root surface, clipped (or color converted, see `color_converted`).
     Clipped(ClippedSurfaceElement),
     Raw(WaylandSurfaceRenderElement<GlesRenderer>),
+    /// A subsurface whose color-management tag needs converting; it is drawn
+    /// unclipped, like `Raw`. Never the root: callers take `Clipped` for that.
+    ColorConverted(ClippedSurfaceElement),
+}
+
+/// Color-management tags of a window's surface tree, keyed by the element id
+/// `WaylandSurfaceRenderElement` derives from each surface.
+fn surface_descriptions(
+    window: &Window,
+) -> std::collections::HashMap<Id, crate::color::ImageDescription> {
+    match window.underlying_surface() {
+        // Skipped entirely until something in the session has ever been
+        // tagged, which is one relaxed atomic load in the common case.
+        WindowSurface::Wayland(toplevel)
+            if crate::protocols::color_management::any_surface_tagged() =>
+        {
+            let mut found = std::collections::HashMap::new();
+            with_surface_tree_downward(
+                toplevel.wl_surface(),
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                // Read the description out of the `SurfaceData` smithay
+                // hands us. Calling `surface_image_description` here instead
+                // would re-take the surface's user-data lock that the
+                // traversal is still holding, and that lock is not
+                // reentrant — it deadlocks the compositor on the first
+                // window that maps.
+                |surface, states, _| {
+                    if let Some(description) =
+                        crate::protocols::color_management::image_description_from_states(states)
+                    {
+                        found.insert(Id::from_wayland_resource(surface), description);
+                    }
+                },
+                |_, _, _| true,
+            );
+            found
+        }
+        // X11 has no color-management protocol, so XWayland clients are
+        // always untagged and take the passthrough path.
+        _ => std::collections::HashMap::new(),
+    }
+}
+
+/// `elements` (a window's surface elements, as `surface_elements` and friends
+/// build them) with every tagged non-sRGB surface color converted; see
+/// `raw_or_color_converted`. Untagged sessions take one atomic load.
+pub fn color_converted_surface_elements(
+    window: &Window,
+    renderer: &mut GlesRenderer,
+    elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    output_scale: Scale<f64>,
+) -> Result<Vec<WindowClipElement>, smithay::backend::renderer::gles::GlesError> {
+    let surface_descriptions = surface_descriptions(window);
+    if surface_descriptions.is_empty() {
+        return Ok(elements.into_iter().map(WindowClipElement::Raw).collect());
+    }
+    let root_id = match window.underlying_surface() {
+        WindowSurface::Wayland(toplevel) => Some(Id::from_wayland_resource(toplevel.wl_surface())),
+        WindowSurface::X11(_) => None,
+    };
+    elements
+        .into_iter()
+        .map(|element| {
+            raw_or_color_converted(
+                renderer,
+                element,
+                output_scale,
+                root_id.as_ref(),
+                &surface_descriptions,
+            )
+        })
+        .collect()
+}
+
+/// `element` as a `Raw` element, or converted when its surface carries an
+/// image description other than sRGB. Without this, the tag would only be
+/// honoured on a clipped root surface: a PQ video on a subsurface, or in a
+/// window without an SSD clip, reached the HDR encode as if it were sRGB.
+fn raw_or_color_converted(
+    renderer: &mut GlesRenderer,
+    element: WaylandSurfaceRenderElement<GlesRenderer>,
+    output_scale: Scale<f64>,
+    root_id: Option<&Id>,
+    surface_descriptions: &std::collections::HashMap<Id, crate::color::ImageDescription>,
+) -> Result<WindowClipElement, smithay::backend::renderer::gles::GlesError> {
+    let description = surface_descriptions.get(Element::id(&element)).copied();
+    let Some(description) = description.filter(|description| {
+        crate::backend::clipped_surface::needs_color_conversion(Some(*description))
+    }) else {
+        return Ok(WindowClipElement::Raw(element));
+    };
+    let is_root = root_id.is_some_and(|root_id| Element::id(&element) == root_id);
+    let converted =
+        ClippedSurfaceElement::color_only(renderer, element, output_scale, description)?;
+    Ok(if is_root {
+        WindowClipElement::Clipped(converted)
+    } else {
+        WindowClipElement::ColorConverted(converted)
+    })
 }
 
 fn popup_debug_enabled() -> bool {
@@ -243,14 +347,16 @@ pub fn layer_effect_region_bounds(
             };
             input_region
         }
-        crate::ssd::EffectRegion::BlurRegion => with_states(layer_surface.wl_surface(), |states| {
-            states
-                .cached_state
-                .get::<BackgroundEffectSurfaceCachedState>()
-                .current()
-                .blur_region
-                .clone()
-        })?,
+        crate::ssd::EffectRegion::BlurRegion => {
+            with_states(layer_surface.wl_surface(), |states| {
+                states
+                    .cached_state
+                    .get::<BackgroundEffectSurfaceCachedState>()
+                    .current()
+                    .blur_region
+                    .clone()
+            })?
+        }
     };
     region_bounds_within_layer(&region, layer_rect)
 }
@@ -293,6 +399,19 @@ pub fn layer_surfaces_for_output(
     let upper = ordered(&[WlrLayer::Overlay, WlrLayer::Top]);
     let lower = ordered(&[WlrLayer::Bottom, WlrLayer::Background]);
     (upper, lower)
+}
+
+/// Mapped layer surfaces of `kinds` (front to back), each layer front to back.
+pub fn layer_surfaces_on(
+    output: &smithay::output::Output,
+    kinds: &[WlrLayer],
+) -> Vec<LayerSurface> {
+    let map = layer_map_for_output(output);
+    kinds
+        .iter()
+        .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .filter(layer_surface_is_mapped)
+        .collect()
 }
 
 /// Layer surfaces ordered for the dedicated popup pass.
@@ -932,9 +1051,24 @@ pub fn clipped_surface_elements(
     // SSD clip is allowed to crop the client surface tree.
     let clip = clip.filter(|clip| clip.clips_surface);
 
+    // Color-management tag for the window's root surface, applied to every
+    // element in its tree. Approximation: subsurfaces are distinct protocol
+    // surfaces and may carry their own descriptions, so a player that puts
+    // video on a subsurface while leaving the toplevel untagged is not handled
+    // yet. The common case — a client tagging its main surface — is.
+    // Color-management tags, keyed by the element id `WaylandSurfaceRenderElement`
+    // derives from each surface. Collected per-surface rather than taken from the
+    // toplevel, because a subsurface carries its own description — players that
+    // put video on a subsurface leave the toplevel untagged.
+    //
+    // Pairing by id rather than rebuilding the element list ourselves keeps
+    // smithay's surface-tree walk (and its view-offset handling) as the single
+    // source of truth for positioning.
+    let surface_descriptions = surface_descriptions(window);
+
     let elements = surface_elements(window, renderer, location, output_scale, alpha);
     if clip.is_none() || crate::env_flag!("SHOJI_GAP_BYPASS_CLIP") {
-        return Ok(elements.into_iter().map(WindowClipElement::Raw).collect());
+        return color_converted_surface_elements(window, renderer, elements, output_scale);
     }
 
     let mut debug_app_id: Option<String> = None;
@@ -964,10 +1098,7 @@ pub fn clipped_surface_elements(
         .iter()
         .map(|element| Element::geometry(element, output_scale))
         .collect::<Vec<_>>();
-    let element_srcs = elements
-        .iter()
-        .map(Element::src)
-        .collect::<Vec<_>>();
+    let element_srcs = elements.iter().map(Element::src).collect::<Vec<_>>();
     let selected_indices = geometry
         .map(|forced_geometry| {
             let best_score = element_geometries
@@ -1041,6 +1172,9 @@ pub fn clipped_surface_elements(
             let mut output = Vec::with_capacity(elements.len());
             for element in elements {
                 if Element::id(&element) == &root_id {
+                    // Resolve before the move: `element` is consumed below.
+                    let element_description =
+                        surface_descriptions.get(Element::id(&element)).copied();
                     output.push(WindowClipElement::Clipped(ClippedSurfaceElement::new(
                         renderer,
                         element,
@@ -1050,9 +1184,16 @@ pub fn clipped_surface_elements(
                         clip,
                         geometry,
                         debug_label.clone(),
+                        element_description,
                     )?));
                 } else {
-                    output.push(WindowClipElement::Raw(element));
+                    output.push(raw_or_color_converted(
+                        renderer,
+                        element,
+                        output_scale,
+                        None,
+                        &surface_descriptions,
+                    )?);
                 }
             }
             Ok(output)
@@ -1073,6 +1214,8 @@ pub fn clipped_surface_elements(
                         "gap debug clipped surface candidate",
                     );
                 }
+                // Resolve before the move: `element` is consumed below.
+                let element_description = surface_descriptions.get(Element::id(&element)).copied();
                 if geometry_override.is_some() {
                     ClippedSurfaceElement::new(
                         renderer,
@@ -1083,6 +1226,7 @@ pub fn clipped_surface_elements(
                         clip,
                         geometry_override,
                         debug_label.clone(),
+                        element_description,
                     )
                     .map(WindowClipElement::Clipped)
                 } else {
@@ -1116,6 +1260,11 @@ pub fn clipped_popup_elements(
                 clip,
                 None,
                 Some("popup clipped by ManagedWindow.forceRectSize".to_owned()),
+                // Popups are separate protocol surfaces with their own
+                // descriptions; inheriting the toplevel's would be wrong. They
+                // are effectively never color-tagged, so leave them untagged
+                // rather than guess.
+                None,
             )
         })
         .collect()
@@ -1129,7 +1278,9 @@ mod region_bounds_tests {
         RegionAttributes {
             rects: rects
                 .iter()
-                .map(|(kind, (x, y, w, h))| (*kind, Rectangle::new((*x, *y).into(), (*w, *h).into())))
+                .map(|(kind, (x, y, w, h))| {
+                    (*kind, Rectangle::new((*x, *y).into(), (*w, *h).into()))
+                })
                 .collect(),
         }
     }

@@ -1,3 +1,4 @@
+import { hasDndStartListeners, takeDndListenersChanged } from "./dnd";
 import type {
   InputDeviceInfo,
   OutputInfo,
@@ -249,6 +250,28 @@ export interface PointerMoveEvent {
 
 export type PointerMoveListener = (event: PointerMoveEvent) => void;
 
+/**
+ * `enter` / `leave`: the pointer moved into or out of the region.
+ * `pressure`: inside the region, the pointer was pushed `pressure` px against
+ * the edge of the output layout (once per visit).
+ * `enter` / `leave`: ポインターが領域に入った・出た。
+ * `pressure`: 領域内で画面配置の端へ `pressure` px 押し込んだ（滞在中1回）。
+ */
+export type PointerRegionPhase = "enter" | "leave" | "pressure";
+
+export interface PointerRegionEvent {
+  /** The id given to `COMPOSITOR.pointer.defineRegion`. */
+  id: string;
+  phase: PointerRegionPhase;
+  /** The output whose copy of the region the pointer is in (or left). */
+  outputName: string;
+  position: PointerMovePoint;
+  modifiers: PointerModifierState;
+  timestamp: number;
+}
+
+export type PointerRegionListener = (event: PointerRegionEvent) => void;
+
 export type PointerMoveAsyncListener = (
   event: PointerMoveEvent,
 ) => void | Promise<void>;
@@ -281,6 +304,7 @@ export interface RuntimeEventConfig {
   pointerMoveAsync: boolean;
   gestureSwipe: boolean;
   gestureSwipeAsync: boolean;
+  dnd: boolean;
 }
 
 /**
@@ -464,17 +488,23 @@ export interface CompositorEventController {
    */
   onKeyboardLayoutChange(listener: KeyboardLayoutChangeListener): () => void;
   /**
-   * Fires synchronously on every pointer move event.
+   * Fires synchronously when the pointer moves, at most about once per display
+   * refresh: faster motion is coalesced into one event with the latest position
+   * and the combined `delta`. A listener always sees the latest position before
+   * any other input event, such as a button press.
    * Keep the listener short: input processing waits for it to return.
-   * ポインター移動イベントのたびに同期的に発火します。
+   * ポインターが移動すると同期的に発火します。発火はディスプレイのリフレッシュごとに
+   * 最大1回程度で、それより速い移動は最新の位置と合算した `delta` を持つ1つのイベントに
+   * まとめられます。ボタン押下などの他の入力イベントより前に、必ず最新の位置が届きます。
    * 入力処理はリスナーの完了を待つため、短い処理に留めてください。
    */
   onPointerMove(listener: PointerMoveListener): () => void;
   /**
-   * Fires asynchronously on every pointer move event.
+   * Fires asynchronously when the pointer moves, coalesced like `onPointerMove`.
    * The listener may return a `Promise`; the compositor awaits it before
    * completing the runtime dispatch.
-   * ポインター移動イベントのたびに非同期で発火します。リスナーは `Promise` を返せます。
+   * ポインターが移動すると非同期で発火します。`onPointerMove` と同様にまとめられます。
+   * リスナーは `Promise` を返せます。
    *
    * @example
    * ```ts
@@ -503,6 +533,26 @@ export interface CompositorEventController {
    * ```
    */
   onGestureSwipeAsync(listener: GestureSwipeAsyncListener): () => void;
+  /**
+   * Fires when the pointer enters, leaves or pushes against a region defined
+   * with `COMPOSITOR.pointer.defineRegion`. The compositor hit-tests regions
+   * itself, so pointer motion elsewhere costs no runtime call.
+   * `COMPOSITOR.pointer.defineRegion` で定義した領域にポインターが入った・出た・
+   * 押し込んだときに発火します。判定はコンポジター側で行うため、領域外での
+   * ポインター移動ではランタイムは呼ばれません。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.pointer.defineRegion("top-strip", {
+   *   anchor: "top",
+   *   size: { width: 400, height: 2 },
+   * });
+   * COMPOSITOR.event.onPointerRegion((event) => {
+   *   if (event.id === "top-strip" && event.phase === "enter") showBar(event.outputName);
+   * });
+   * ```
+   */
+  onPointerRegion(listener: PointerRegionListener): () => void;
   /**
    * Fires when a new layer-shell surface is created.
    * 新しいレイヤーシェルサーフェスが作成されたときに発火します。
@@ -574,6 +624,8 @@ export interface CompositorEventController {
   /** @internal */
   emitGestureSwipeAsync(event: GestureSwipeEvent): Promise<boolean>;
   /** @internal */
+  emitPointerRegion(event: PointerRegionEvent): boolean;
+  /** @internal */
   emitCreateLayer(layer: WaylandLayer): void;
   /** @internal */
   emitUpdateLayer(layer: WaylandLayer): void;
@@ -613,6 +665,7 @@ export function createCompositorEventController(): CompositorEventController {
   const pointerMoveAsyncListeners = new Set<PointerMoveAsyncListener>();
   const gestureSwipeListeners = new Set<GestureSwipeListener>();
   const gestureSwipeAsyncListeners = new Set<GestureSwipeAsyncListener>();
+  const pointerRegionListeners = new Set<PointerRegionListener>();
   const createLayerListeners = new Set<LayerCreateListener>();
   const updateLayerListeners = new Set<LayerUpdateListener>();
   const destroyLayerListeners = new Set<LayerDestroyListener>();
@@ -721,6 +774,12 @@ export function createCompositorEventController(): CompositorEventController {
       return () => {
         gestureSwipeAsyncListeners.delete(listener);
         markEventConfigDirty();
+      };
+    },
+    onPointerRegion(listener) {
+      pointerRegionListeners.add(listener);
+      return () => {
+        pointerRegionListeners.delete(listener);
       };
     },
     onCreateLayer(listener) {
@@ -870,6 +929,15 @@ export function createCompositorEventController(): CompositorEventController {
       }
       return true;
     },
+    emitPointerRegion(event) {
+      if (pointerRegionListeners.size === 0) {
+        return false;
+      }
+      for (const listener of pointerRegionListeners) {
+        listener(event);
+      }
+      return true;
+    },
     emitCreateLayer(layer) {
       for (const listener of createLayerListeners) {
         listener(layer);
@@ -919,7 +987,8 @@ export function createCompositorEventController(): CompositorEventController {
       return next;
     },
     takePendingEventConfig() {
-      if (!pendingEventConfig) {
+      const dndChanged = takeDndListenersChanged();
+      if (!pendingEventConfig && !dndChanged) {
         return undefined;
       }
       pendingEventConfig = false;
@@ -928,6 +997,7 @@ export function createCompositorEventController(): CompositorEventController {
         pointerMoveAsync: pointerMoveAsyncListeners.size > 0,
         gestureSwipe: gestureSwipeListeners.size > 0,
         gestureSwipeAsync: gestureSwipeAsyncListeners.size > 0,
+        dnd: hasDndStartListeners(),
       };
     },
   };

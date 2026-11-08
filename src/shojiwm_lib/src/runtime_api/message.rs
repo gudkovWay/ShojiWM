@@ -13,21 +13,21 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    keyboard_layout::KeyboardLayoutSnapshot,
+    keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     runtime_input::RuntimeInputDeviceSnapshot,
     runtime_workspace::RuntimeWorkspaceActivateRequestSnapshot,
     ssd::{
-        BackgroundEffectConfig, DecorationNode, ShaderUniformValue, DecorationCachedEvaluationResult, DecorationEvaluationResult,
-        DecorationHandlerInvocation, DecorationKeyBindingInvocation,
+        BackgroundEffectConfig, DecorationCachedEvaluationResult, DecorationEvaluationResult,
+        DecorationHandlerInvocation, DecorationKeyBindingInvocation, DecorationNode,
         DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick,
         DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
         DecorationWindowStateRequestInvocation, GestureSwipeEventSnapshot,
         LayerEffectEvaluationResult, PointerMoveEventSnapshot, PopupEffectEvaluationResult,
-        WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowSnapshot,
-        WindowActivateRequestEventSnapshot, WindowDecorationDecisionSnapshot,
-        WindowDecorationPolicyContextSnapshot, WindowFullscreenRequestEventSnapshot,
-        WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
-        WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+        ShaderUniformValue, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot,
+        WaylandWindowSnapshot, WindowActivateRequestEventSnapshot, WindowDecorationClientSnapshot,
+        WindowDecorationDecisionSnapshot, WindowDecorationPolicyContextSnapshot,
+        WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
+        WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
     },
 };
 
@@ -81,6 +81,11 @@ pub enum DecorationRequest<'a> {
         window: &'a WaylandWindowSnapshot,
         context: &'a WindowDecorationPolicyContextSnapshot,
     },
+    /// The legacy KDE decoration manager's default mode for a client that
+    /// just bound it. GTK 3 decides on its own title bar from this alone.
+    KdeDefaultMode {
+        client: &'a WindowDecorationClientSnapshot,
+    },
     /// A decoration node handler (button click, state change) fired.
     InvokeHandler {
         window_id: &'a str,
@@ -122,9 +127,23 @@ pub enum WindowRequest<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum InputRequest<'a> {
-    KeyBinding { binding_id: &'a str },
+    KeyBinding {
+        binding_id: &'a str,
+    },
     PointerMove(&'a PointerMoveEventSnapshot),
     GestureSwipe(&'a GestureSwipeEventSnapshot),
+    /// The pointer entered, left or pressed against a `defineRegion` region.
+    /// Answered like a pointer hook.
+    PointerRegion(&'a crate::runtime_pointer_region::PointerRegionEventSnapshot),
+    /// Input taken by the config's input grab `grab_id`. Answered like a
+    /// pointer hook; a runtime that does not grab answers `Unhandled`.
+    InputGrab {
+        grab_id: u64,
+        event: &'a crate::runtime_input_grab::InputGrabEventSnapshot,
+    },
+    /// A drag started, changed or ended. Sent only while the runtime asks
+    /// for it (`RuntimeEventConfigUpdate::dnd`). Answered like a pointer hook.
+    Dnd(&'a crate::dnd::DndEventSnapshot),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,11 +197,15 @@ pub enum RuntimeEvent {
     /// Input devices changed.
     InputState(BTreeMap<String, RuntimeInputDeviceSnapshot>),
     KeyboardLayout(KeyboardLayoutSnapshot),
+    /// Caps Lock or Num Lock changed.
+    KeyboardLocks(KeyboardLocksSnapshot),
     /// Pointer hook the config asked to receive asynchronously. A result, if
     /// any, comes back as `HostMessage::PointerHookResult`.
     PointerMove(PointerMoveEventSnapshot),
     /// Asynchronous gesture hook, same delivery as [`Self::PointerMove`].
     GestureSwipe(GestureSwipeEventSnapshot),
+    /// Touchpad pinches, delivered without waiting for a result.
+    GesturePinch(crate::ssd::GesturePinchEventSnapshot),
 }
 
 /// One change to a decoration tree the compositor already holds, returned by
@@ -194,6 +217,13 @@ pub enum CompositionPatch {
     /// A structural or otherwise generic node change. This remains the
     /// compatibility fallback and performs one serde_v8 conversion.
     ReplaceNode {
+        node_id: String,
+        node: DecorationNode,
+    },
+    /// A node whose own props changed: `node` comes without children, and the
+    /// node keeps the ones it has. A root prop (a window's shadow) then does
+    /// not send the whole tree across the bridge again.
+    ReplaceProps {
         node_id: String,
         node: DecorationNode,
     },
@@ -216,15 +246,17 @@ pub const OVERLAY_STAGE_INDEX: usize = u32::MAX as usize - 2;
 impl CompositionPatch {
     pub fn node_id(&self) -> &str {
         match self {
-            Self::ReplaceNode { node_id, .. } | Self::ShaderUniform { node_id, .. } => node_id,
+            Self::ReplaceNode { node_id, .. }
+            | Self::ReplaceProps { node_id, .. }
+            | Self::ShaderUniform { node_id, .. } => node_id,
         }
     }
 
+    /// The node a patch puts in place; without children for `ReplaceProps`.
     pub fn replacement_node(&self) -> Option<&DecorationNode> {
         match self {
-            Self::ReplaceNode { node, .. } => Some(node),
+            Self::ReplaceNode { node, .. } | Self::ReplaceProps { node, .. } => Some(node),
             Self::ShaderUniform { .. } => None,
         }
     }
 }
-

@@ -68,8 +68,13 @@ pub mod adapter;
 pub mod animation;
 pub mod assets;
 pub mod compositor;
+pub mod dnd;
 pub mod effect;
+pub mod input_grab;
 pub mod ipc;
+pub mod output_composition;
+pub mod overlay;
+mod published;
 pub mod reactive;
 mod runtime;
 pub mod style;
@@ -83,38 +88,60 @@ pub use compositor::COMPOSITOR;
 /// Everything a reactive config usually needs.
 pub mod prelude {
     pub use crate::{
-        COMPOSITOR, ConfigBuilder, run_config,
+        COMPOSITOR, ConfigBuilder,
         animation::{
-            Animation, AnimationOptions, Easing, Repeat, TimerHandle, cubic_bezier, now_ms,
-            set_interval, set_timeout,
+            Animation, AnimationOptions, Easing, PollHandle, PollOutput, Repeat, TimerHandle,
+            create_poll, create_poll_for_each_output, cubic_bezier, now_ms, set_interval,
+            set_timeout,
         },
         compositor::{
-            Command, DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, OutputConfig,
-            OutputContext, OutputPower, OutputPowerOptions, Sender, SurfaceRef,
+            Command, CursorPosition, CursorPositionSnapshot, DisableEvent, EnableEvent,
+            FramePacing, HotCorner, HotCornerOptions, InputChangeEvent, LockBackground,
+            OutputChangeEvent, OutputConfig, OutputContext, OutputPower, OutputPowerOptions,
+            PointerRegion, PointerRegionAnchor, PointerRegionEventSnapshot, PointerRegionOffset,
+            PointerRegionPhase, PointerRegionSize, Sender, SurfaceRef,
+        },
+        dnd::{
+            DragAction, DragActions, DragDevice, DragEnd, DragEndKind, DragIconInfo, DragPoint,
+            DragSession, DragView, DragViewAnchor, DragViewOptions,
         },
         effect::{
-            Effect, Include, Invalidate, PaintShader, Source, Stage, StateTexture, SurfaceEffect,
-            SurfaceEffects, Uniform, backdrop_source, blend, dual_kawase_blur, image_source,
-            layer_source, noise, paint_shader, popup_source, render_to, render_to_if_dirty, save,
-            saved, shader_input, shader_stage, state_source, state_texture, unit, window_source,
-            xray_backdrop_source,
+            Effect, Include, Invalidate, PaintShader, ShaderStage, Source, Stage, StateTexture,
+            SurfaceEffect, SurfaceEffects, Uniform, backdrop_source, blend, dual_kawase_blur,
+            image_source, layer_source, noise, paint_shader, popup_source, render_to,
+            render_to_if_dirty, save, saved, shader_input, shader_stage, state_source,
+            state_texture, unit, window_source, xray_backdrop_source,
         },
+        input_grab::{
+            InputGrab, InputGrabCancelReason, InputGrabKeyEvent, InputGrabOptions,
+            InputGrabPointerButtonEvent, InputGrabPointerMotionEvent, InputGrabScrollEvent,
+            InputGrabState,
+        },
+        output_composition::{
+            Camera, CompositionColor, CompositionRect, LayerName, LayerPopups, Layers, Mat4,
+            OutputNode, OutputStack, PickablePlane, Plane, ProjectedPoint, RenderTexture, Scene3D,
+            ScreenCamera, Solid, TextureView, Transform3D, Windows, look_at, output_logical_size,
+            perspective, pick_plane, project_point, screen_camera, transform3d,
+        },
+        overlay::{Overlay, OverlayHandle, OverlayPlacement, snapshot_source},
         reactive::{
             Get, Memo, Prop, ReadSignal, Scope, Signal, batch, derive, effect, memo, on_cleanup,
             signal, untrack,
         },
+        run_config,
         style::{Border, FontWeight, Style, Transform2D, hex, inset_shadow, rgba, shadow},
         view::{
             AppIcon, Button, Child, ClientWindow, Composition, Direction, Element, Flex, Image,
-            Label, ManagedTransform, ManagedWindow, Popup, PopupTrigger, Rect, ShaderEffect, WindowBorder,
+            Label, ManagedTransform, ManagedWindow, Popup, PopupTrigger, Rect, ShaderEffect,
+            WindowBorder,
         },
         window::{AnimationMode, ManagedAnimation, Window, WindowStateKey},
         window_stack::{Placement, WindowStack},
     };
     pub use shojiwm_lib::ssd::{
         AlignItems, BlendMode, BoxShadow, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
-        PointerEvents, PopupAlign, PopupCollision, PopupDismissReason, PopupLayer, PopupPlacement, PopupMode,
-        StylePosition, WindowAction,
+        PointerEvents, PopupAlign, PopupCollision, PopupDismissReason, PopupLayer, PopupMode,
+        PopupPlacement, StylePosition, WindowAction,
     };
 }
 
@@ -125,8 +152,9 @@ pub use shojiwm_lib::runtime_api::{self, *};
 pub use shojiwm_lib::ssd;
 /// Config types the compositor consumes (outputs, input, processes, ...).
 pub use shojiwm_lib::{
-    config, cursor, keyboard_layout, runtime_debug, runtime_input, runtime_key_binding,
-    runtime_process, runtime_workspace,
+    config, cursor, frame_pacing, keyboard_layout, runtime_debug, runtime_input,
+    runtime_input_grab, runtime_key_binding, runtime_pointer_region, runtime_process,
+    runtime_workspace,
 };
 
 /// [`RuntimeLauncher`] for a config compiled into the binary.
@@ -212,7 +240,13 @@ mod tests {
         runtime.enable().unwrap();
         assert!(matches!(host.pop(), Some(HostMessage::ProcessActions(_))));
         assert!(runtime.invoke_key_binding("any", 0).unwrap().invoked);
-        assert!(runtime.scheduler_tick(0.0).unwrap().next_poll_in_ms.is_none());
+        assert!(
+            runtime
+                .scheduler_tick(0.0)
+                .unwrap()
+                .next_poll_in_ms
+                .is_none()
+        );
     }
 
     /// A runtime whose new config takes a while to build: `prepare_reload`
@@ -277,7 +311,10 @@ mod tests {
         };
         let mut runtime = RuntimeHandle::new("slow", Box::new(runtime), host.clone());
 
-        assert_eq!(runtime.prepare_reload().unwrap(), ReloadPreparation::Pending);
+        assert_eq!(
+            runtime.prepare_reload().unwrap(),
+            ReloadPreparation::Pending
+        );
         // The old config keeps answering while the build runs.
         assert!(!runtime.invoke_key_binding("any", 0).unwrap().invoked);
 

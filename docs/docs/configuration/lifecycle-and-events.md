@@ -96,6 +96,7 @@ window manager decides how to honor them.
 | --- | --- |
 | `onPointerMove(event)` / `onPointerMoveAsync(event)` | The pointer moves |
 | `onGestureSwipe(event)` / `onGestureSwipeAsync(event)` | A multi-finger touchpad swipe progresses |
+| `onPointerRegion(event)` | The pointer enters, leaves or pushes against a [pointer region](./keybindings-and-pointer.md#pointer-regions) |
 | `onOutputChange(event)` | An output is added/removed/reconfigured |
 | `onInputDeviceChange(...)` | The set of input devices changes (hotplug) |
 | `onCreateLayer(...)` / `onUpdateLayer(...)` / `onDestroyLayer(...)` | A layer-shell surface (bar/dock/wallpaper) is mapped/updated/unmapped |
@@ -106,6 +107,13 @@ window manager decides how to honor them.
 path through the native runtime bridge. Prefer these for short handlers that
 must update window management state with minimum latency. They must not perform
 blocking I/O or other expensive work.
+
+Pointer motion reaches the config at most about once per display refresh, however
+fast the mouse reports: `onPointerMove`, `onPointerMoveAsync` and the `update`
+phase of `onWindowMove` / `onWindowResize` get the latest position, and the
+`delta` of `onPointerMove` covers all the motion since its previous event. The
+latest position always arrives before any other input event, such as a button
+press. Clients still receive every report.
 
 The `onPointerMoveAsync` and `onGestureSwipeAsync` variants run on the runtime
 worker, may return a `Promise`, and coalesce high-frequency input while the

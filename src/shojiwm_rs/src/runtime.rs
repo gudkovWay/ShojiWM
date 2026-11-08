@@ -16,18 +16,23 @@ use shojiwm_lib::{
     activation_environment::{RuntimeEnvOperation, RuntimeEnvUpdates},
     config::RuntimeOutputConfig,
     cursor::RuntimeCursorConfigUpdate,
-    keyboard_layout::KeyboardLayoutSnapshot,
+    frame_pacing::FramePacing,
+    keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     runtime_api::{HostMessage, RuntimeHost},
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::{RuntimeInputConfig, RuntimeInputDeviceSnapshot},
     runtime_key_binding::RuntimeKeyBindingEntry,
     runtime_process::{RuntimeProcessAction, RuntimeProcessEntry},
-    runtime_workspace::{RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate},
+    runtime_workspace::{
+        RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate,
+        RuntimeWorkspaceCreateEvent, RuntimeWorkspaceMoveWindowEvent,
+    },
     ssd::{
         GestureSwipeEventSnapshot, ManagedWindowState, PointerMoveEventSnapshot,
         RuntimeWindowAction, SurfacePolicy, WaylandLayerSnapshot, WaylandOutputSnapshot,
         WaylandPopupSnapshot, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-        WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot, WindowEffectConfig,
+        WindowDecorationClientSnapshot, WindowDecorationModeSnapshot,
+        WindowDecorationPolicyContextSnapshot, WindowEffectConfig,
         WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
         WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
         WindowTransform,
@@ -36,10 +41,9 @@ use shojiwm_lib::{
 
 use crate::{
     animation::TimerHandle,
-    compositor::{
-        DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef,
-    },
+    compositor::{DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef},
     effect::{Effect, SurfaceEffects},
+    output_composition::OutputStack,
     reactive::{Observer, Scope, Signal},
     view::{Composition, ManagedWindow, ViewContext, ViewTree},
     window::{Window, WindowSignals},
@@ -70,23 +74,38 @@ pub(crate) struct Listeners {
     pub output_change: Vec<RefListener<OutputChangeEvent>>,
     pub input_change: Vec<RefListener<InputChangeEvent>>,
     pub keyboard_layout: Vec<RefListener<KeyboardLayoutSnapshot>>,
+    pub keyboard_locks: Vec<RefListener<KeyboardLocksSnapshot>>,
     pub pointer_move: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub pointer_move_async: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub gesture_swipe: Vec<RefListener<GestureSwipeEventSnapshot>>,
     pub gesture_swipe_async: Vec<RefListener<GestureSwipeEventSnapshot>>,
+    pub gesture_pinch_async: Vec<RefListener<shojiwm_lib::ssd::GesturePinchEventSnapshot>>,
+    pub pointer_region:
+        Vec<RefListener<shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot>>,
     pub create_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub update_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub destroy_layer: Vec<RefListener<WaylandLayerSnapshot>>,
     pub workspace_activate: Vec<RefListener<RuntimeWorkspaceActivateRequestSnapshot>>,
+    pub workspace_move_window: Vec<RefListener<RuntimeWorkspaceMoveWindowEvent>>,
+    pub workspace_create: Vec<RefListener<RuntimeWorkspaceCreateEvent>>,
+    pub dnd_start: Vec<Listener<crate::dnd::DragSession>>,
 }
 
 pub(crate) type EffectFn<S> = Rc<dyn Fn(&S) -> SurfaceEffects>;
+/// A value the config computes for each output.
+pub(crate) type PerOutputFn<T> = Rc<dyn Fn(&WaylandOutputSnapshot) -> T>;
 pub(crate) type SurfacePolicyFn = Rc<dyn Fn(SurfaceRef<'_>) -> Option<SurfacePolicy>>;
 /// Per-window state signals, keyed by state key name and value type.
 pub(crate) type WindowStateSlots = HashMap<(&'static str, TypeId), Rc<dyn Any>>;
 pub(crate) type CompositionFn = Rc<dyn Fn(Window) -> Composition>;
-pub(crate) type DecorationPolicyFn =
-    Rc<dyn Fn(&WaylandWindowSnapshot, &WindowDecorationPolicyContextSnapshot) -> WindowDecorationModeSnapshot>;
+pub(crate) type DecorationPolicyFn = Rc<
+    dyn Fn(
+        &WaylandWindowSnapshot,
+        &WindowDecorationPolicyContextSnapshot,
+    ) -> WindowDecorationModeSnapshot,
+>;
+pub(crate) type KdeDefaultDecorationFn =
+    Rc<dyn Fn(&WindowDecorationClientSnapshot) -> WindowDecorationModeSnapshot>;
 pub(crate) type OutputConfigureFn =
     Rc<dyn Fn(&crate::compositor::OutputContext) -> BTreeMap<String, Option<RuntimeOutputConfig>>>;
 pub(crate) type InputConfigureFn =
@@ -115,10 +134,19 @@ pub(crate) struct Registry {
     pub listeners: Listeners,
     pub composition: Option<CompositionFn>,
     pub decoration_policy: Option<DecorationPolicyFn>,
+    pub kde_default_decoration: Option<KdeDefaultDecorationFn>,
     pub key_bindings: Vec<RuntimeKeyBindingEntry>,
     pub key_handlers: HashMap<String, Rc<dyn Fn()>>,
     pub window_move_modifier: Option<String>,
     pub window_resize_modifier: Option<String>,
+    pub pointer_regions: Vec<shojiwm_lib::runtime_pointer_region::PointerRegionSpec>,
+    pub app_lock_ignored: bool,
+    pub app_lock_ignore_modifier: Option<String>,
+    /// Handlers of `bind_hot_corner`, by region id.
+    pub region_handlers: HashMap<
+        String,
+        Rc<dyn Fn(&shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot)>,
+    >,
     pub processes: Vec<RuntimeProcessEntry>,
     pub debug: RuntimeDebugConfigUpdate,
     pub env: BTreeMap<String, String>,
@@ -128,7 +156,9 @@ pub(crate) struct Registry {
     pub desired_input: Option<RuntimeInputConfig>,
     pub workspace_configure: Option<WorkspaceConfigureFn>,
     pub desired_workspaces: Option<RuntimeWorkspaceConfigUpdate>,
-    pub background_effect: Option<Effect>,
+    pub background_effect: Option<Rc<dyn Fn() -> Option<Effect>>>,
+    pub frame_pacing: Option<PerOutputFn<FramePacing>>,
+    pub output_composition: Option<PerOutputFn<OutputStack>>,
     pub layer_effect: Option<EffectFn<WaylandLayerSnapshot>>,
     pub popup_effect: Option<EffectFn<WaylandPopupSnapshot>>,
     pub window_effect: Option<Rc<dyn Fn(Window) -> SurfaceEffects>>,
@@ -140,6 +170,7 @@ pub(crate) struct Registry {
 thread_local! {
     pub(crate) static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
     static HOST: RefCell<Option<RuntimeHost>> = const { RefCell::new(None) };
+    static WAYLAND_DISPLAY: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIONS: RefCell<Vec<RuntimeWindowAction>> = const { RefCell::new(Vec::new()) };
     static DIRTY_WINDOWS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     static LAYER_EFFECTS_DIRTY: Cell<bool> = const { Cell::new(false) };
@@ -155,6 +186,7 @@ pub(crate) struct GlobalSignals {
     pub inputs: Signal<BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     pub layers: Signal<BTreeMap<String, WaylandLayerSnapshot>>,
     pub keyboard_layout: Signal<Option<KeyboardLayoutSnapshot>>,
+    pub keyboard_locks: Signal<Option<KeyboardLocksSnapshot>>,
 }
 
 pub(crate) fn global() -> GlobalSignals {
@@ -167,6 +199,7 @@ pub(crate) fn global() -> GlobalSignals {
                 inputs: scope.signal(BTreeMap::new()),
                 layers: scope.signal(BTreeMap::new()),
                 keyboard_layout: scope.signal(None),
+                keyboard_locks: scope.signal(None),
             }
         })
     })
@@ -178,6 +211,17 @@ pub(crate) fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
 
 pub(crate) fn set_host(host: RuntimeHost) {
     HOST.with(|slot| *slot.borrow_mut() = Some(host));
+}
+
+pub(crate) fn set_wayland_display(display: Option<String>) {
+    WAYLAND_DISPLAY.with(|slot| *slot.borrow_mut() = display);
+}
+
+/// The compositor's own Wayland socket name, from [`LaunchContext::wayland_display`].
+///
+/// [`LaunchContext::wayland_display`]: shojiwm_lib::runtime_api::LaunchContext::wayland_display
+pub(crate) fn wayland_display() -> Option<String> {
+    WAYLAND_DISPLAY.with(|slot| slot.borrow().clone())
 }
 
 pub(crate) fn host() -> Option<RuntimeHost> {
@@ -316,10 +360,7 @@ impl Windows {
     }
 
     pub fn all(&self) -> Vec<Rc<WindowEntry>> {
-        self.order
-            .iter()
-            .filter_map(|id| self.by_id(id))
-            .collect()
+        self.order.iter().filter_map(|id| self.by_id(id)).collect()
     }
 }
 
@@ -332,7 +373,10 @@ pub(crate) fn all_windows() -> Vec<Rc<WindowEntry>> {
 }
 
 /// Run a list of listeners, cloned out of the registry first.
-pub(crate) fn emit<L: ?Sized>(select: impl FnOnce(&Listeners) -> Vec<Rc<L>>, call: impl Fn(&L)) -> bool {
+pub(crate) fn emit<L: ?Sized>(
+    select: impl FnOnce(&Listeners) -> Vec<Rc<L>>,
+    call: impl Fn(&L),
+) -> bool {
     let listeners = with_registry(|registry| select(&registry.listeners));
     for listener in &listeners {
         call(listener);
@@ -344,6 +388,12 @@ pub(crate) fn emit<L: ?Sized>(select: impl FnOnce(&Listeners) -> Vec<Rc<L>>, cal
 pub(crate) fn send(message: HostMessage) {
     if let Some(host) = host() {
         host.send(message);
+    }
+}
+
+pub(crate) fn send_all(messages: Vec<HostMessage>) {
+    if let Some(host) = host() {
+        host.send_all(messages);
     }
 }
 
@@ -382,6 +432,9 @@ pub(crate) fn publish_pending() {
                 shojiwm_lib::runtime_pointer::RuntimePointerConfigUpdate {
                     window_move_modifier: registry.window_move_modifier.clone(),
                     window_resize_modifier: registry.window_resize_modifier.clone(),
+                    regions: registry.pointer_regions.clone(),
+                    app_lock_ignored: registry.app_lock_ignored,
+                    app_lock_ignore_modifier: registry.app_lock_ignore_modifier.clone(),
                 },
             ));
         }
@@ -392,12 +445,16 @@ pub(crate) fn publish_pending() {
         }
         if pending.event_filter {
             let listeners = &registry.listeners;
-            messages.push(HostMessage::EventFilter(shojiwm_lib::ssd::RuntimeEventConfigUpdate {
-                pointer_move: !listeners.pointer_move.is_empty(),
-                pointer_move_async: !listeners.pointer_move_async.is_empty(),
-                gesture_swipe: !listeners.gesture_swipe.is_empty(),
-                gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
-            }));
+            messages.push(HostMessage::EventFilter(
+                shojiwm_lib::ssd::RuntimeEventConfigUpdate {
+                    pointer_move: !listeners.pointer_move.is_empty(),
+                    pointer_move_async: !listeners.pointer_move_async.is_empty(),
+                    gesture_swipe: !listeners.gesture_swipe.is_empty(),
+                    gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
+                    gesture_pinch_async: !listeners.gesture_pinch_async.is_empty(),
+                    dnd: !listeners.dnd_start.is_empty(),
+                },
+            ));
         }
         if pending.processes {
             messages.push(HostMessage::Process(
@@ -425,6 +482,7 @@ pub(crate) fn publish_pending() {
 pub(crate) fn reset() {
     REGISTRY.with(|registry| *registry.borrow_mut() = Registry::default());
     HOST.with(|host| *host.borrow_mut() = None);
+    WAYLAND_DISPLAY.with(|display| *display.borrow_mut() = None);
     ACTIONS.with(|actions| actions.borrow_mut().clear());
     DIRTY_WINDOWS.with(|dirty| dirty.borrow_mut().clear());
     // Cleared rather than replaced, so generations keep counting and stale

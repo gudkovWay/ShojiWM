@@ -164,6 +164,109 @@ Notes:
 - Clients are told at once: every bound `wl_output` receives a fresh `geometry`
   event, so a config reload takes effect without a reconnect.
 
+### HDR (`hdr`)
+
+Drives the output as HDR10: a PQ / BT.2020 signal with HDR metadata. It only
+takes effect when the display's EDID advertises SMPTE ST 2084 (PQ); otherwise
+the output stays SDR and the log says why. Experimental, tty only.
+
+`hdr: true` turns it on with the defaults. To change a setting, give an object
+instead, which turns HDR on as well:
+
+| Option | Meaning |
+| --- | --- |
+| `hdr.enabled` | `false` keeps the settings but drives the output as SDR. Default `true` |
+| `hdr.sdrLuminance` | Brightness of SDR white (ordinary windows): cd/m² (10–1000), or `"backlight"` to follow the brightness setting. Default: follow the backlight on laptops, 203 elsewhere |
+| `hdr.sdrGamut` | Colors: `"native"` (default) as in SDR mode, or `"srgb"` for exact colors |
+| `hdr.maxLuminance` | The display's real peak in cd/m², when its EDID omits it (otherwise 1000 is assumed). Range 50–10000 |
+| `hdr.minLuminance` | The display's real black level in cd/m². Range 0–10 |
+
+```ts
+display['eDP-1'] = {
+  resolution: 'best',
+  position: 'auto',
+  hdr: true,
+};
+
+display['DP-1'] = {
+  hdr: {
+    // An external monitor has no backlight to follow: fix SDR white instead.
+    sdrLuminance: 250,
+  },
+};
+```
+
+How it looks:
+
+- **SDR content** (almost every window) keeps its look, with white shown at
+  `hdr.sdrLuminance`.
+- **Brightness keys keep working on laptops.** An HDR signal states absolute
+  luminance, so the panel ignores its backlight while in HDR. ShojiWM applies
+  the brightness setting itself instead: it moves SDR white, reaching the
+  panel's suggested SDR maximum (from its EDID) at full brightness. The
+  backlight value is left untouched and takes over again in SDR mode. The
+  level used is the driver's `actual_brightness`, which can differ from the
+  requested `brightness` (amdgpu's OLED panels apply a curve).
+- **SDR colors match SDR mode.** In SDR mode a wide-gamut panel shows sRGB
+  values on its own, wider primaries, which makes them more saturated than
+  sRGB. HDR follows suit by default (`sdrGamut: "native"`, using the
+  primaries in the panel's EDID); `"srgb"` shows exact colors instead, which on
+  such a panel look duller. The choice applies to all content alike:
+  color-managed clients such as Chrome hand over even their SDR interface in
+  the HDR format, and an exception for them would leave them duller than every
+  other window. With `"native"`, HDR video gets the same vivid look the panel
+  gives video in SDR mode.
+- Without a backlight, SDR white defaults to 203 cd/m², the broadcast
+  reference, which can look dim on a bright monitor; raise it to taste.
+- **HDR content** from color-managed clients (Chrome and Chromium, mpv, games
+  through Vulkan) is shown above SDR white, up to the display's peak, and
+  tone-mapped where it goes beyond. Clients learn the available headroom
+  (peak ÷ SDR white) from the color-management protocol, so the higher
+  `hdr.sdrLuminance` is, the less room is left for highlights.
+- Screenshots and screen recordings stay SDR.
+
+Notes:
+
+- Whether the display supports HDR is in `OutputInfo.hdrSupported`.
+- On HDMI, the link has to carry 10 bits per color at the chosen mode;
+  `OutputInfo.hdmi` and `availableModes[].clockKhz` let a config check that.
+- `SHOJI_HDR_OUTPUTS=eDP-1` (or `all`) turns HDR on without a config, and
+  `SHOJI_SDR_NITS` sets the default for `hdr.sdrLuminance` on outputs without a
+  backlight.
+
+### Color profile (`icc`)
+
+Applies the monitor's ICC profile, for example one made with DisplayCAL or
+ArgyllCMS. Colors are converted from sRGB to what the profile says the monitor
+does, so a calibrated monitor shows them accurately. Tty only.
+
+```ts
+display['DP-1'] = {
+  icc: '~/.local/share/icc/DP-1.icc',
+};
+```
+
+How it works:
+
+- Windows are taken as sRGB with a 2.2 gamma (what an uncalibrated monitor
+  shows) and converted with the relative colorimetric intent and black point
+  compensation. On a wide-gamut monitor this makes sRGB content look like sRGB
+  instead of oversaturated.
+- The profile's calibration curves (`vcgt`) are applied too. Do not load them
+  again with another tool such as `dispwin`.
+- Content from color-managed clients is converted to sRGB first and then
+  through the profile like everything else.
+
+Notes:
+
+- The profile applies while the output runs SDR; an output in HDR ignores it.
+- It is read when the config is evaluated. After replacing the file, reload the
+  config. A profile that cannot be read is logged and ignored.
+- The output goes through one extra conversion pass, as in HDR, so a fullscreen
+  window is not scanned out directly on it. The cursor stays a hardware cursor.
+- Screenshots and screen recordings are taken before the conversion, so they
+  stay plain sRGB.
+
 ## Switching panels off (DPMS)
 
 `mode: 'disabled'` takes an output out of the desktop, so its windows move

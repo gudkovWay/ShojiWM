@@ -7,6 +7,7 @@ uniform float rim_width_px;
 uniform float refraction_px;
 uniform float chromatic_shift_px;
 uniform float highlight_strength;
+uniform float highlight_width_px;
 uniform float debug_view;
 uniform float blur_mix;
 uniform float edge_softness_px;
@@ -55,47 +56,63 @@ vec4 shader_main(EffectContext effect) {
     vec2 dy = vec2(0.0, 3.0 / size.y);
     // Sobel estimate: merge three parallel differences instead of trusting
     // a single pair of samples on a changing rasterized corner.
-    float tl = texture2D(distance_field, uv - dx - dy).r;
-    float tr = texture2D(distance_field, uv + dx - dy).r;
-    float bl = texture2D(distance_field, uv - dx + dy).r;
-    float br = texture2D(distance_field, uv + dx + dy).r;
-    vec2 gradient = vec2(tr + 2.0 * texture2D(distance_field, uv + dx).r + br
-                         - tl - 2.0 * texture2D(distance_field, uv - dx).r - bl,
-                         bl + 2.0 * texture2D(distance_field, uv + dy).r + br
-                         - tl - 2.0 * texture2D(distance_field, uv - dy).r - tr) / 24.0;
+    // B holds a smoothed copy of the distance, so the bend turns smoothly
+    // around corners sharper than the rim rather than creasing.
+    float tl = texture2D(distance_field, uv - dx - dy).b;
+    float tr = texture2D(distance_field, uv + dx - dy).b;
+    float bl = texture2D(distance_field, uv - dx + dy).b;
+    float br = texture2D(distance_field, uv + dx + dy).b;
+    vec2 gradient = vec2(tr + 2.0 * texture2D(distance_field, uv + dx).b + br
+                         - tl - 2.0 * texture2D(distance_field, uv - dx).b - bl,
+                         bl + 2.0 * texture2D(distance_field, uv + dy).b + br
+                         - tl - 2.0 * texture2D(distance_field, uv - dy).b - tr) / 24.0;
     float magnitude = length(gradient);
     vec2 inward = gradient / max(magnitude, 0.0001);
-    float distance = max(texture2D(distance_field, uv).r, 0.0);
+    // R: distance from the boundary; G: distance of the ridge (the middle of
+    // the shape) seen from here. See island-ridge.frag.
+    vec2 field = texture2D(distance_field, uv).rg;
+    float distance = max(field.r, 0.0);
     float rimWidth = max(rim_width_px, 1.0);
+    // A shape thinner than the rim gets a narrower lens of the same form,
+    // flat at its middle: a full-width lens would still be sloped where the
+    // two sides meet, and their opposite normals would crease there.
+    float lensWidth = clamp(field.g, 1.0, rimWidth);
+    float lensScale = lensWidth / rimWidth;
     // Gentle in the interior, steeply curved close to the boundary.
-    float profile = filteredCircularLens(distance, rimWidth);
+    float profile = filteredCircularLens(distance, lensWidth);
     // Opposing normals cancel at a neck: attenuate rather than flip direction.
     float coherence = smoothstep(0.15, 0.85, magnitude);
     vec2 bend = inward * profile * coherence;
-    // The previous 0.6*rim cap was specific to the smoothstep slope and is
-    // not a no-foldover guarantee for a circular lens. Bound excursion to
-    // the rim width while allowing the tutorial's pronounced edge lensing.
-    float strength = min(max(refraction_px, 0.0), rimWidth);
+    // Bound excursion to the rim width, and scale it with a narrowed lens so
+    // a thin shape bends like a thin lens rather than sampling past itself.
+    float strength = min(max(refraction_px, 0.0), rimWidth) * lensScale;
     vec2 offset = bend * strength / size;
     // Separate RGB around the refracted coordinate along the same normal.
     // Keep chromatic separation in the outer half of the rim, with a circular
     // falloff of its own instead of spreading constant fringes across the UI.
-    float chromaticProfile = filteredCircularLens(distance, max(rimWidth * 0.5, 1.0));
-    vec2 dispersion = inward * coherence * chromaticProfile * chromatic_shift_px / size;
+    float chromaticProfile = filteredCircularLens(distance, max(lensWidth * 0.5, 1.0));
+    vec2 dispersion = inward * coherence * chromaticProfile * chromatic_shift_px * lensScale / size;
     float edgeBlur = 0.8 * profile;
     vec3 color = vec3(backgroundAt(uv + offset + dispersion, size, edgeBlur).r,
                       backgroundAt(uv + offset, size, edgeBlur).g,
                       backgroundAt(uv + offset - dispersion, size, edgeBlur).b);
 
+    // Light from the upper left catches the rim facing it, and, weaker, the
+    // opposite one where it leaves the glass; the sides facing away stay
+    // nearly dark.
     float light = dot(-inward, normalize(vec2(-0.45, -0.89)));
-    float bevel = max(bevel_width_px, 1.0);
-    float rim = exp(-distance / 1.6) * coherence;
+    float glint = 0.12 + 0.88 * pow(max(light, 0.0), 1.5) + 0.5 * pow(max(-light, 0.0), 1.5);
+    // A soft band rather than a hairline: several pixels wide with no hard
+    // inner edge, so it stays smooth on low-density screens. A broader sheen
+    // follows the curvature of the lens.
+    float band = exp(-distance / max(highlight_width_px, 0.5));
+    float shine = clamp(highlight_strength * glint * coherence * (1.2 * band + 0.3 * profile), 0.0, 1.0);
+    float bevel = min(max(bevel_width_px, 1.0), lensWidth);
     float innerBand = exp(-pow((distance - bevel * 0.5) / (bevel * 0.45), 2.0)) * coherence;
-    // Thin reflection plus a broader inset shadow communicate a rounded lip.
-    // Use mostly neutral light, avoiding a colored outline on bright backdrops.
     color *= 1.0 - clamp(bevel_shadow, 0.0, 0.6) * innerBand * (0.5 + 0.5 * max(-light, 0.0));
-    color += vec3(0.94, 0.97, 1.0) * highlight_strength
-        * (rim * (0.3 + 0.7 * max(light, 0.0)) + innerBand * 0.22 * max(light, 0.0));
+    // Screen, not add: brightens dark glass the most and never clips to a
+    // flat white line over bright content.
+    color = 1.0 - (1.0 - color) * (1.0 - shine * vec3(0.94, 0.97, 1.0));
 
     if (debug_view > 2.5) color = vec3(0.5 + bend * 0.5, 0.5);
     else if (debug_view > 1.5) color = vec3(clamp(distance / rimWidth, 0.0, 1.0));

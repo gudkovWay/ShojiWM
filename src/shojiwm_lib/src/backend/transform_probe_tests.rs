@@ -7,8 +7,8 @@
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Offscreen};
 use smithay::utils::{Point, Rectangle, Size, Transform};
@@ -36,11 +36,16 @@ fn try_renderer() -> Option<GlesRenderer> {
 /// Renders a red rect at (10,10,40,20) logical through the given output
 /// transform and returns the bounding box of red pixels in the physical
 /// readback (buffer rows top-to-bottom as returned by copy_framebuffer).
-fn red_bounds_for_transform(transform: Transform) -> Option<Rectangle<i32, smithay::utils::Buffer>> {
+fn red_bounds_for_transform(
+    transform: Transform,
+) -> Option<Rectangle<i32, smithay::utils::Buffer>> {
     let mut renderer = try_renderer()?;
     let physical_size = Size::<i32, smithay::utils::Physical>::from((OUT_W, OUT_H));
     let mut buffer: GlesRenderbuffer = renderer
-        .create_buffer(Fourcc::Abgr8888, physical_size.to_logical(1).to_buffer(1, Transform::Normal))
+        .create_buffer(
+            Fourcc::Abgr8888,
+            physical_size.to_logical(1).to_buffer(1, Transform::Normal),
+        )
         .ok()?;
     let mut fb = renderer.bind(&mut buffer).ok()?;
 
@@ -66,8 +71,11 @@ fn red_bounds_for_transform(transform: Transform) -> Option<Rectangle<i32, smith
         )
         .ok()?;
 
-    let copy_rect = Rectangle::from_size(physical_size.to_logical(1).to_buffer(1, Transform::Normal));
-    let mapping = renderer.copy_framebuffer(&fb, copy_rect, Fourcc::Abgr8888).ok()?;
+    let copy_rect =
+        Rectangle::from_size(physical_size.to_logical(1).to_buffer(1, Transform::Normal));
+    let mapping = renderer
+        .copy_framebuffer(&fb, copy_rect, Fourcc::Abgr8888)
+        .ok()?;
     let bytes = renderer.map_texture(&mapping).ok()?;
 
     let mut min_x = i32::MAX;
@@ -204,7 +212,10 @@ fn output_transform_rotates_texture_content_on_offscreen_targets() {
         eprintln!("skipping: no GPU render node available");
         return;
     };
-    assert_eq!(normal_blue, Rectangle::new((10, 10).into(), (40, 20).into()));
+    assert_eq!(
+        normal_blue,
+        Rectangle::new((10, 10).into(), (40, 20).into())
+    );
     assert_eq!(normal_red, Rectangle::new((10, 10).into(), (10, 10).into()));
 
     // 180°: the rect lands at the antipode and its red top-left corner ends up
@@ -407,7 +418,624 @@ fn winit_framebuffer_flip_matches_tty_presentation_for_every_transform() {
         let (nested_red, nested_blue) =
             texture_bounds_for_transform(winit_render_transform(transform))
                 .expect("render node vanished mid-test");
-        assert_eq!(flip_rows(nested_red), tty_red, "{transform:?}: red quadrant");
+        assert_eq!(
+            flip_rows(nested_red),
+            tty_red,
+            "{transform:?}: red quadrant"
+        );
         assert_eq!(flip_rows(nested_blue), tty_blue, "{transform:?}: blue body");
     }
+}
+
+/// The HDR10 path composites into an fp16 intermediate and the DRM pass draws
+/// that through the PQ encode element. The red rect must still land where the
+/// direct render puts it, for every transform: the intermediate used to be
+/// rendered with the output transform and then rotated again by the DRM pass.
+#[test]
+fn hdr_pipeline_keeps_the_direct_render_orientation() {
+    use super::winit::ALL_TRANSFORMS;
+    use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
+
+    // Red through the PQ encode is no longer pure red, so look for "reddish".
+    let reddish_bounds = |bytes: &[u8]| {
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for y in 0..OUT_H {
+            for x in 0..OUT_W {
+                let offset = ((y * OUT_W + x) * 4) as usize;
+                let (r, g) = (i32::from(bytes[offset]), i32::from(bytes[offset + 1]));
+                if r > 60 && r > g + 20 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        Rectangle::<i32, smithay::utils::Buffer>::new(
+            (x0, y0).into(),
+            (x1 - x0 + 1, y1 - y0 + 1).into(),
+        )
+    };
+
+    for transform in ALL_TRANSFORMS {
+        let Some(direct) = red_bounds_for_transform(transform) else {
+            eprintln!("skipping: no GPU render node available");
+            return;
+        };
+        let mut renderer = try_renderer().expect("render node vanished mid-test");
+        let output = Output::new(
+            "HDR-PROBE".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "probe".into(),
+                model: "probe".into(),
+                serial_number: "probe".into(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: (OUT_W, OUT_H).into(),
+                refresh: 60_000,
+            }),
+            Some(transform),
+            Some(OutputScale::Integer(1)),
+            None,
+        );
+        let solid = SolidColorBuffer::new(
+            Size::<i32, smithay::utils::Logical>::from((RECT_W, RECT_H)),
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        let element = SolidColorRenderElement::from_buffer(
+            &solid,
+            Point::<i32, smithay::utils::Physical>::from((RECT_X, RECT_Y)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        );
+        let mut pipeline = None;
+        let (encode, _) = crate::backend::hdr_pipeline::render_hdr_pipeline(
+            &mut renderer,
+            &mut pipeline,
+            &output,
+            &[element],
+            [0.0, 0.0, 0.0, 1.0],
+            crate::backend::hdr_pipeline::OutputEncoding::Pq(
+                crate::backend::hdr_pipeline::EncodeParams::new(
+                    203.0,
+                    1000.0,
+                    crate::color::primaries::SRGB,
+                ),
+            ),
+            Fourcc::Abgr16161616f,
+        )
+        .expect("HDR pipeline should render")
+        .expect("output has a mode");
+
+        // Stand-in for the DRM pass: a damage tracker carrying the output transform.
+        let physical_size = Size::<i32, smithay::utils::Physical>::from((OUT_W, OUT_H));
+        let buffer_size = physical_size.to_logical(1).to_buffer(1, Transform::Normal);
+        let mut buffer: GlesRenderbuffer = renderer
+            .create_buffer(Fourcc::Abgr8888, buffer_size)
+            .expect("scanout stand-in should allocate");
+        let mut fb = renderer
+            .bind(&mut buffer)
+            .expect("scanout stand-in should bind");
+        OutputDamageTracker::new(physical_size, 1.0, transform)
+            .render_output(
+                &mut renderer,
+                &mut fb,
+                0,
+                &[encode],
+                Color32F::new(0.0, 0.0, 0.0, 1.0),
+            )
+            .expect("encode pass should render");
+        let mapping = renderer
+            .copy_framebuffer(&fb, Rectangle::from_size(buffer_size), Fourcc::Abgr8888)
+            .expect("readback should succeed");
+        let bytes = renderer.map_texture(&mapping).expect("readback should map");
+        assert_eq!(reddish_bounds(bytes), direct, "{transform:?}");
+    }
+}
+
+/// The HDR encode carries compositing-space values past SDR white up to the
+/// display's peak: 1.0 is SDR white, 2.0 a highlight (2^2.2 x SDR white), and
+/// anything brighter than the peak clamps to it rather than to SDR white.
+#[test]
+fn hdr_encode_extends_past_sdr_white_to_the_display_peak() {
+    use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
+
+    let Some(mut renderer) = try_renderer() else {
+        eprintln!("skipping: no GPU render node available");
+        return;
+    };
+    const SDR_WHITE: f32 = 203.0;
+    const PEAK: f32 = 1000.0;
+    let output = Output::new(
+        "HDR-ENCODE".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "probe".into(),
+            model: "probe".into(),
+            serial_number: "probe".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: (30, 10).into(),
+            refresh: 60_000,
+        }),
+        Some(Transform::Normal),
+        Some(OutputScale::Integer(1)),
+        None,
+    );
+    // Three 10x10 patches: SDR white, a highlight, and something past the peak.
+    let patches = [1.0f32, 2.0, 4.0];
+    let buffers = patches.map(|value| {
+        SolidColorBuffer::new(
+            Size::<i32, smithay::utils::Logical>::from((10, 10)),
+            [value, value, value, 1.0],
+        )
+    });
+    let elements: Vec<_> = buffers
+        .iter()
+        .enumerate()
+        .map(|(index, buffer)| {
+            SolidColorRenderElement::from_buffer(
+                buffer,
+                Point::<i32, smithay::utils::Physical>::from((index as i32 * 10, 0)),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            )
+        })
+        .collect();
+    let mut pipeline = None;
+    let (encode, _) = crate::backend::hdr_pipeline::render_hdr_pipeline(
+        &mut renderer,
+        &mut pipeline,
+        &output,
+        &elements,
+        [0.0, 0.0, 0.0, 1.0],
+        crate::backend::hdr_pipeline::OutputEncoding::Pq(
+            crate::backend::hdr_pipeline::EncodeParams::new(
+                SDR_WHITE,
+                PEAK,
+                crate::color::primaries::SRGB,
+            ),
+        ),
+        Fourcc::Abgr16161616f,
+    )
+    .expect("HDR pipeline should render")
+    .expect("output has a mode");
+
+    let size = Size::<i32, smithay::utils::Physical>::from((30, 10));
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let mut target: GlesRenderbuffer = renderer
+        .create_buffer(Fourcc::Abgr8888, buffer_size)
+        .expect("scanout stand-in should allocate");
+    let mut fb = renderer
+        .bind(&mut target)
+        .expect("scanout stand-in should bind");
+    OutputDamageTracker::new(size, 1.0, Transform::Normal)
+        .render_output(
+            &mut renderer,
+            &mut fb,
+            0,
+            &[encode],
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )
+        .expect("encode pass should render");
+    let mapping = renderer
+        .copy_framebuffer(&fb, Rectangle::from_size(buffer_size), Fourcc::Abgr8888)
+        .expect("readback should succeed");
+    let bytes = renderer.map_texture(&mapping).expect("readback should map");
+
+    // An 8-bit stand-in for the 10-bit scanout is precise enough to tell these
+    // PQ levels apart (~0.58, ~0.75, ~0.75).
+    let red_at = |x: i32| f32::from(bytes[(5 * 30 + x) as usize * 4]) / 255.0;
+    let pq = |nits: f32| crate::color::colorimetry::pq_inverse_eotf(nits as f64) as f32;
+    let gamma = crate::backend::hdr_pipeline::sdr_reference_gamma();
+    let expected = [
+        pq(SDR_WHITE),
+        pq((2f32.powf(gamma) * SDR_WHITE).min(PEAK)),
+        pq(PEAK),
+    ];
+    for (index, expected) in expected.into_iter().enumerate() {
+        let got = red_at(index as i32 * 10 + 5);
+        assert!(
+            (got - expected).abs() < 1.5 / 255.0,
+            "patch {} ({}): PQ {got}, expected {expected}",
+            index,
+            patches[index]
+        );
+    }
+}
+
+/// Encodes one solid compositing-space color through the HDR pipeline at
+/// SDR white 203 / peak 1000 and returns the PQ signal read back (8-bit).
+fn encode_solid(
+    renderer: &mut GlesRenderer,
+    color: [f32; 3],
+    primaries: crate::color::primaries::PrimariesChromaticities,
+) -> [f32; 3] {
+    encode_solid_with(
+        renderer,
+        color,
+        crate::backend::hdr_pipeline::OutputEncoding::Pq(
+            crate::backend::hdr_pipeline::EncodeParams::new(203.0, 1000.0, primaries),
+        ),
+    )
+}
+
+/// One solid compositing-space color through the encode pass, read back
+/// (8-bit).
+fn encode_solid_with(
+    renderer: &mut GlesRenderer,
+    color: [f32; 3],
+    encoding: crate::backend::hdr_pipeline::OutputEncoding,
+) -> [f32; 3] {
+    use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
+
+    let output = Output::new(
+        "HDR-GAMUT".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "probe".into(),
+            model: "probe".into(),
+            serial_number: "probe".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: (10, 10).into(),
+            refresh: 60_000,
+        }),
+        Some(Transform::Normal),
+        Some(OutputScale::Integer(1)),
+        None,
+    );
+    let buffer = SolidColorBuffer::new(
+        Size::<i32, smithay::utils::Logical>::from((10, 10)),
+        [color[0], color[1], color[2], 1.0],
+    );
+    let element = SolidColorRenderElement::from_buffer(
+        &buffer,
+        Point::<i32, smithay::utils::Physical>::from((0, 0)),
+        1.0,
+        1.0,
+        Kind::Unspecified,
+    );
+    let mut pipeline = None;
+    let (encode, _) = crate::backend::hdr_pipeline::render_hdr_pipeline(
+        renderer,
+        &mut pipeline,
+        &output,
+        &[element],
+        [0.0, 0.0, 0.0, 1.0],
+        encoding,
+        Fourcc::Abgr16161616f,
+    )
+    .expect("HDR pipeline should render")
+    .expect("output has a mode");
+    let size = Size::<i32, smithay::utils::Physical>::from((10, 10));
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let mut target: GlesRenderbuffer = renderer
+        .create_buffer(Fourcc::Abgr8888, buffer_size)
+        .expect("scanout stand-in should allocate");
+    let mut fb = renderer
+        .bind(&mut target)
+        .expect("scanout stand-in should bind");
+    OutputDamageTracker::new(size, 1.0, Transform::Normal)
+        .render_output(
+            renderer,
+            &mut fb,
+            0,
+            &[encode],
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )
+        .expect("encode pass should render");
+    let mapping = renderer
+        .copy_framebuffer(&fb, Rectangle::from_size(buffer_size), Fourcc::Abgr8888)
+        .expect("readback should succeed");
+    let bytes = renderer.map_texture(&mapping).expect("readback should map");
+    let at = (5 * 10 + 5) * 4;
+    [0, 1, 2].map(|channel| f32::from(bytes[at + channel]) / 255.0)
+}
+
+/// SDR content shown in the panel's native gamut: pure compositing-space red
+/// reaches the PQ signal as the panel's own red, not sRGB red.
+#[test]
+fn hdr_encode_takes_compositing_primaries_into_bt2020() {
+    use crate::color::colorimetry::{chromaticity_conversion_matrix, pq_inverse_eotf};
+    use crate::color::primaries::{BT2020, Chromaticity, PrimariesChromaticities, SRGB};
+
+    let Some(mut renderer) = try_renderer() else {
+        eprintln!("skipping: no GPU render node available");
+        return;
+    };
+    let native = PrimariesChromaticities {
+        red: Chromaticity {
+            x: 0.6826,
+            y: 0.3164,
+        },
+        green: Chromaticity {
+            x: 0.2451,
+            y: 0.7139,
+        },
+        blue: Chromaticity {
+            x: 0.1396,
+            y: 0.0439,
+        },
+        white: Chromaticity {
+            x: 0.3125,
+            y: 0.3291,
+        },
+    };
+    for primaries in [SRGB, native] {
+        let matrix = chromaticity_conversion_matrix(primaries, BT2020);
+        let expected = [0, 1, 2].map(|row| pq_inverse_eotf(matrix[row][0].max(0.0) * 203.0) as f32);
+        let got = encode_solid(&mut renderer, [1.0, 0.0, 0.0], primaries);
+        for channel in 0..3 {
+            assert!(
+                (got[channel] - expected[channel]).abs() < 1.5 / 255.0,
+                "{primaries:?} channel {channel}: PQ {} expected {}",
+                got[channel],
+                expected[channel]
+            );
+        }
+    }
+    // The two must differ, or the test proves nothing.
+    let srgb = encode_solid(&mut renderer, [1.0, 0.0, 0.0], SRGB);
+    let wide = encode_solid(&mut renderer, [1.0, 0.0, 0.0], native);
+    assert!(
+        (srgb[1] - wide[1]).abs() > 5.0 / 255.0,
+        "{srgb:?} vs {wide:?}"
+    );
+}
+
+/// The encode element reports only what stage 1 redrew, so the DRM pass
+/// re-encodes a moved window's old and new rectangles instead of the whole
+/// output, and a change of encode parameters re-encodes everything.
+#[test]
+fn hdr_encode_damage_follows_stage1_damage() {
+    use crate::backend::hdr_pipeline::{EncodeParams, render_hdr_pipeline};
+    use smithay::backend::renderer::element::Element;
+    use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
+    use smithay::utils::Scale;
+
+    let Some(mut renderer) = try_renderer() else {
+        eprintln!("skipping: no GPU render node available");
+        return;
+    };
+    let output = Output::new(
+        "HDR-DAMAGE".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "probe".into(),
+            model: "probe".into(),
+            serial_number: "probe".into(),
+        },
+    );
+    output.change_current_state(
+        Some(Mode {
+            size: (100, 100).into(),
+            refresh: 60_000,
+        }),
+        Some(Transform::Normal),
+        Some(OutputScale::Integer(1)),
+        None,
+    );
+    let buffer = SolidColorBuffer::new(
+        Size::<i32, smithay::utils::Logical>::from((10, 10)),
+        [1.0, 0.5, 0.25, 1.0],
+    );
+    let at = |x: i32, y: i32| {
+        SolidColorRenderElement::from_buffer(
+            &buffer,
+            Point::<i32, smithay::utils::Physical>::from((x, y)),
+            1.0,
+            1.0,
+            Kind::Unspecified,
+        )
+    };
+    let params = EncodeParams::new(203.0, 1000.0, crate::color::primaries::SRGB);
+    let mut pipeline = None;
+    let mut render = |element, params| {
+        render_hdr_pipeline(
+            &mut renderer,
+            &mut pipeline,
+            &output,
+            &[element],
+            [0.0, 0.0, 0.0, 1.0],
+            crate::backend::hdr_pipeline::OutputEncoding::Pq(params),
+            Fourcc::Abgr16161616f,
+        )
+        .expect("HDR pipeline should render")
+        .expect("output has a mode")
+        .0
+    };
+    let scale = Scale::from(1.0);
+    let damage_of = |encode: &crate::backend::hdr_pipeline::HdrEncodeElement, since| {
+        encode
+            .damage_since(scale, Some(since))
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let full = Rectangle::<i32, smithay::utils::Physical>::from_size((100, 100).into());
+
+    let first = render(at(10, 10), params);
+    let first_commit = first.current_commit();
+
+    let unchanged = render(at(10, 10), params);
+    assert_eq!(unchanged.current_commit(), first_commit);
+    assert!(damage_of(&unchanged, first_commit).is_empty());
+
+    let moved = render(at(50, 60), params);
+    let damage = damage_of(&moved, first_commit);
+    assert!(!damage.is_empty());
+    assert!(!damage.contains(&full), "{damage:?}");
+    for rect in [
+        Rectangle::new((10, 10).into(), (10, 10).into()),
+        Rectangle::new((50, 60).into(), (10, 10).into()),
+    ] {
+        assert!(
+            damage.iter().any(|damaged| damaged.contains_rect(rect)),
+            "{rect:?} missing from {damage:?}"
+        );
+    }
+    let covered: i32 = damage.iter().map(|rect| rect.size.w * rect.size.h).sum();
+    assert!(covered < 100 * 100 / 4, "{damage:?}");
+
+    let brighter = render(
+        at(50, 60),
+        EncodeParams::new(300.0, 1000.0, crate::color::primaries::SRGB),
+    );
+    assert_eq!(damage_of(&brighter, moved.current_commit()), vec![full]);
+
+    // A commit the history no longer holds is a full re-encode too.
+    assert_eq!(
+        brighter
+            .damage_since(scale, None)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![full]
+    );
+}
+
+/// The hardware cursor on HDR outputs is encoded on the CPU; it has to come
+/// out as the encode pass would have drawn the same pixel.
+#[test]
+fn hdr_cursor_cpu_encode_matches_the_encode_pass() {
+    use crate::color::primaries::{Chromaticity, PrimariesChromaticities, SRGB};
+
+    let Some(mut renderer) = try_renderer() else {
+        eprintln!("skipping: no GPU render node available");
+        return;
+    };
+    let native = PrimariesChromaticities {
+        red: Chromaticity {
+            x: 0.6826,
+            y: 0.3164,
+        },
+        green: Chromaticity {
+            x: 0.2451,
+            y: 0.7139,
+        },
+        blue: Chromaticity {
+            x: 0.1396,
+            y: 0.0439,
+        },
+        white: Chromaticity {
+            x: 0.3125,
+            y: 0.3291,
+        },
+    };
+    for primaries in [SRGB, native] {
+        let params = crate::backend::hdr_pipeline::EncodeParams::new(203.0, 1000.0, primaries);
+        for pixel in [
+            [255u8, 255, 255],
+            [128, 128, 128],
+            [200, 40, 90],
+            [10, 230, 60],
+        ] {
+            let gpu = encode_solid(
+                &mut renderer,
+                pixel.map(|value| value as f32 / 255.0),
+                primaries,
+            );
+            let cpu = crate::backend::hdr_cursor::encode_pixel(pixel, 255, &params);
+            for channel in 0..3 {
+                assert!(
+                    (gpu[channel] * 255.0 - cpu[channel] as f32).abs() <= 1.0,
+                    "{primaries:?} {pixel:?} channel {channel}: GPU {} CPU {}",
+                    gpu[channel] * 255.0,
+                    cpu[channel]
+                );
+            }
+        }
+    }
+}
+
+/// The ICC encode pass looks colors up in the packed LUT exactly as the CPU
+/// sampler (and with it the hardware cursor) does: a wrong slice layout or
+/// half-texel offset shows up as a mismatch here.
+#[test]
+fn icc_encode_pass_matches_the_cpu_lut() {
+    use lcms2::{CIExyY, CIExyYTRIPLE, Profile, Tag, TagSignature, ToneCurve};
+
+    let Some(mut renderer) = try_renderer() else {
+        eprintln!("skipping: no GPU render node available");
+        return;
+    };
+    // A wide-gamut panel with a steeper response and calibration curves:
+    // every part of the LUT does something.
+    let curve = ToneCurve::new(2.4);
+    let mut profile = Profile::new_rgb(
+        &CIExyY {
+            x: 0.3127,
+            y: 0.3290,
+            Y: 1.0,
+        },
+        &CIExyYTRIPLE {
+            Red: CIExyY {
+                x: 0.680,
+                y: 0.320,
+                Y: 1.0,
+            },
+            Green: CIExyY {
+                x: 0.265,
+                y: 0.690,
+                Y: 1.0,
+            },
+            Blue: CIExyY {
+                x: 0.150,
+                y: 0.060,
+                Y: 1.0,
+            },
+        },
+        &[&curve, &curve, &curve],
+    )
+    .unwrap();
+    let vcgt = ToneCurve::new(0.9);
+    assert!(profile.write_tag(
+        TagSignature::VcgtTag,
+        Tag::VcgtCurves([&vcgt, &vcgt, &vcgt])
+    ));
+    let lut = std::sync::Arc::new(
+        crate::color::icc::IccLut::from_icc(
+            std::path::Path::new("probe.icc"),
+            &profile.icc().unwrap(),
+        )
+        .unwrap(),
+    );
+    for pixel in [
+        [255u8, 255, 255],
+        [0, 0, 0],
+        [128, 128, 128],
+        [200, 40, 90],
+        [10, 230, 60],
+        [3, 7, 250],
+    ] {
+        let gpu = encode_solid_with(
+            &mut renderer,
+            pixel.map(|value| value as f32 / 255.0),
+            crate::backend::hdr_pipeline::OutputEncoding::Icc(lut.clone()),
+        );
+        let cpu = crate::backend::hdr_cursor::icc_pixel(pixel, 255, &lut);
+        for channel in 0..3 {
+            assert!(
+                (gpu[channel] * 255.0 - cpu[channel] as f32).abs() <= 1.0,
+                "{pixel:?} channel {channel}: GPU {} CPU {}",
+                gpu[channel] * 255.0,
+                cpu[channel]
+            );
+        }
+    }
+    // And the LUT is not an identity, or the test proves nothing.
+    let red = crate::backend::hdr_cursor::icc_pixel([255, 0, 0], 255, &lut);
+    assert!(red[1] > 20, "{red:?}");
 }

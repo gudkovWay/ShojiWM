@@ -8,6 +8,11 @@ import {
   op_shoji_ipc_listen,
   op_shoji_wake_compositor,
   op_shoji_output_power,
+  op_shoji_input_grab,
+  op_shoji_cursor_set_position,
+  op_shoji_cursor_position,
+  op_shoji_cursor_override,
+  op_shoji_dnd_view,
 } from "ext:core/ops";
 
 globalThis.ShojiRuntimeBridge = ShojiRuntimeBridge;
@@ -17,6 +22,11 @@ globalThis.__SHOJI_REMOVE_UNIX_SOCKET__ = op_shoji_remove_unix_socket;
 globalThis.__SHOJI_IPC_LISTEN__ = op_shoji_ipc_listen;
 globalThis.__SHOJI_WAKE_COMPOSITOR__ = op_shoji_wake_compositor;
 globalThis.__SHOJI_OUTPUT_POWER__ = op_shoji_output_power;
+globalThis.__SHOJI_INPUT_GRAB__ = op_shoji_input_grab;
+globalThis.__SHOJI_CURSOR_SET_POSITION__ = op_shoji_cursor_set_position;
+globalThis.__SHOJI_CURSOR_POSITION__ = op_shoji_cursor_position;
+globalThis.__SHOJI_CURSOR_OVERRIDE__ = op_shoji_cursor_override;
+globalThis.__SHOJI_DND_VIEW__ = op_shoji_dnd_view;
 
 const environment = new Map(Object.entries(op_shoji_environment()));
 const env = {

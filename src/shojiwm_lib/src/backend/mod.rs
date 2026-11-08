@@ -1,14 +1,22 @@
 pub mod async_assets;
 pub mod clipped_memory;
 pub mod clipped_surface;
+pub mod composition;
+pub mod composition_caches;
+pub mod composition_presentation_tests;
 pub mod damage;
 pub mod damage_blink;
 pub mod decoration;
+pub mod dnd;
 pub mod fps_counter;
+pub mod hdr_cursor;
+pub mod hdr_pipeline;
 pub mod icon;
-pub mod overlay;
 pub mod image_copy_capture_render;
+pub mod lock_scene;
+pub mod overlay;
 pub mod paint;
+pub mod scene3d;
 pub mod screencopy_render;
 pub mod shader_effect;
 pub mod signature;
@@ -66,12 +74,27 @@ impl ShojiWMBackend {
     }
 }
 
+/// Takes a window's close snapshot from what it shows now, with whichever backend is
+/// running. Called right before a close can take that content away: a close request, the
+/// client's unmap (a null buffer commit) and the toplevel's destruction.
+pub(crate) fn capture_live_snapshot_for_close(
+    state: &mut ShojiWM,
+    window: &smithay::desktop::Window,
+) -> Result<bool, smithay::backend::renderer::gles::GlesError> {
+    if state.winit_backend.is_some() {
+        winit::capture_live_snapshot_for_close(state, window)
+    } else {
+        tty::capture_live_snapshot_for_close(state, window)
+    }
+}
+
 fn tty_maintenance_debug_enabled() -> bool {
     std::env::var_os("SHOJI_TTY_MAINTENANCE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
+    crate::activation_environment::disable_by_default();
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
@@ -81,6 +104,7 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
     winit::init_winit(&mut event_loop, &mut state)?;
 
     crate::process_env::set_var("WAYLAND_DISPLAY", &state.socket_name);
+    let _control_socket = crate::control_socket::start(&event_loop.handle(), &state.socket_name);
     publish_activation_environment("winit-wayland-display");
 
     state.start_xwayland(&event_loop);
@@ -92,11 +116,14 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
     Ok(())
 }
 
-pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tty_udev(
+    runtime: crate::runtime_api::RuntimeBoot,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
     crate::process_env::set_var("WAYLAND_DISPLAY", &state.socket_name);
+    let _control_socket = crate::control_socket::start(&event_loop.handle(), &state.socket_name);
     publish_activation_environment("tty-wayland-display");
     state.start_xwayland(&event_loop);
 
@@ -106,6 +133,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
     state.tty_session = Some(session.clone());
 
     let udev = UdevBackend::new(&seat_name)?;
+    crate::backlight::start_monitor(&event_loop.handle());
 
     let mut libinput =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
@@ -136,6 +164,9 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             SessionEvent::ActivateSession => {
                 info!("resuming tty session");
                 state.tty_session_active = true;
+                // Keys and buttons let go on another VT sent us no release.
+                state.modifier_tap.reset();
+                state.consumed_pointer_buttons.clear();
                 if let Err(err) = libinput.resume() {
                     warn!(?err, "failed to resume libinput context");
                 }
@@ -191,6 +222,10 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
     }
 
     let selected_devices = select_tty_devices(&candidates)?;
+    state.tty_device_paths = selected_devices
+        .iter()
+        .map(|candidate| (candidate.node, candidate.path.clone()))
+        .collect();
     info!(
         selected = ?selected_devices
             .iter()
@@ -199,7 +234,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
         "selected tty drm devices"
     );
 
-    for candidate in selected_devices {
+    for (index, candidate) in selected_devices.into_iter().enumerate() {
         let outputs_before = state.space.outputs().count();
         info!(
             ?candidate.node,
@@ -207,13 +242,30 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             connectors = ?candidate.connected_connectors,
             "initializing drm device"
         );
-        device_added(
+        let added = device_added(
             &mut state,
             &event_loop.handle(),
             &mut session,
             candidate.node,
             &candidate.path,
-        )?;
+        );
+        match added {
+            Ok(()) => {}
+            // The first one is the GPU clients render with; there is no session without it.
+            Err(err) if index == 0 => return Err(err),
+            Err(err) => {
+                warn!(
+                    ?candidate.node,
+                    path = ?candidate.path,
+                    ?err,
+                    "failed to initialize drm device; its outputs stay dark"
+                );
+                if state.tty_backends.contains_key(&candidate.node) {
+                    device_removed(&mut state, candidate.node);
+                }
+                continue;
+            }
+        }
 
         let outputs_after = state.space.outputs().count();
         if outputs_after == outputs_before {
@@ -241,10 +293,16 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                         return;
                     }
                     info!(?node, ?path, "udev added drm device");
+                    if std::env::var_os("SHOJI_TTY_DRM_DEVICE").is_none() {
+                        state.tty_device_paths.insert(node, path.clone());
+                    }
                     if let Err(err) =
                         device_added(state, &udev_loop_handle, &mut udev_session, node, &path)
                     {
                         warn!(?node, ?path, ?err, "failed to initialize added drm device");
+                        if state.tty_backends.contains_key(&node) {
+                            device_removed(state, node);
+                        }
                     }
                     state.notify_runtime_outputs_changed();
                 }
@@ -253,6 +311,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                         warn!(?device_id, "failed to resolve changed drm node");
                         return;
                     };
+                    info!(?node, "udev drm device changed");
                     if !state.tty_session_active {
                         // Scanning connectors on a paused device half-applies
                         // the change: the scanner records the new topology but
@@ -260,7 +319,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                         // post-resume commit then fails its atomic test
                         // against the stale state. Re-run after resume.
                         info!(
-                            ?node, 
+                            ?node,
                             "tty session paused; deferring drm device change",
                         );
                         if !state.pending_tty_device_changes
@@ -269,6 +328,10 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                             ) {
                             state.pending_tty_device_changes.push(node);
                         }
+                        return;
+                    }
+                    if !state.tty_backends.contains_key(&node) {
+                        tty::open_tty_device(state, node);
                         return;
                     }
                     if let Err(err) = device_changed(state, node) {
@@ -308,6 +371,7 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
                         return;
                     };
                     device_removed(state, node);
+                    state.tty_device_paths.remove(&node);
                 }
             }
         })?;
@@ -429,11 +493,10 @@ pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<
             if crate::backend::tty::render_error_is_config_caused(err.as_ref()) {
                 error!(error = ?err, "tty render iteration failed on a config-caused effect error; continuing");
                 if state.config_error_report.is_none() {
-                    state.config_error_report = Some(
-                        crate::config_error::ConfigErrorReport::runtime(format!(
+                    state.config_error_report =
+                        Some(crate::config_error::ConfigErrorReport::runtime(format!(
                             "rendering failed because of an effect in the config: {err}"
-                        )),
-                    );
+                        )));
                 }
             } else {
                 error!(error = ?err, "tty render iteration failed; shutting down");
@@ -542,26 +605,36 @@ fn select_tty_devices(
         candidates.iter().collect::<Vec<_>>()
     };
 
-    let connected = candidates
+    // Every GPU is opened, also the ones with nothing connected yet: monitors plugged into
+    // them later are found by force-probing on udev change events, as in KWin (see
+    // `tty::open_tty_device` for why a GPU is not opened on demand instead). The first one
+    // opened becomes the GPU clients render with (it hosts the linux-dmabuf global), so it
+    // goes first: the one driving the built-in panel, which on a hybrid laptop is the iGPU.
+    // `primary_gpu` is no help there, since without a `boot_vga` GPU it falls back to the
+    // lowest card number, which may well be the dGPU.
+    let mut connected = candidates
         .iter()
         .copied()
         .filter(|candidate| !candidate.connected_connectors.is_empty())
         .collect::<Vec<_>>();
     if !connected.is_empty() {
-        if let Some(primary_connected) = connected
-            .iter()
-            .copied()
-            .find(|candidate| candidate.is_primary)
-        {
-            return Ok(vec![primary_connected]);
-        }
-
-        let best = connected
-            .iter()
-            .copied()
-            .max_by_key(|candidate| candidate.connected_connectors.len())
-            .unwrap();
-        return Ok(vec![best]);
+        connected.sort_by_key(|candidate| {
+            std::cmp::Reverse((
+                candidate
+                    .connected_connectors
+                    .iter()
+                    .any(|connector| is_internal_panel_connector(connector)),
+                candidate.is_primary,
+                candidate.connected_connectors.len(),
+            ))
+        });
+        connected.extend(
+            candidates
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.connected_connectors.is_empty()),
+        );
+        return Ok(connected);
     }
 
     let primary = candidates
@@ -579,11 +652,21 @@ fn select_tty_devices(
     Ok(vec![&candidates[0]])
 }
 
+/// `cardN-eDP-1` and the like: a laptop's built-in panel.
+fn is_internal_panel_connector(connector: &str) -> bool {
+    let name = connector
+        .split_once('-')
+        .map_or(connector, |(_, name)| name);
+    ["eDP", "LVDS", "DSI"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 fn path_matches_override(path: &Path, override_value: &OsStr) -> bool {
     path == Path::new(override_value) || path.file_name().is_some_and(|name| name == override_value)
 }
 
-fn connected_drm_connectors(card_path: &Path) -> Vec<String> {
+pub(crate) fn connected_drm_connectors(card_path: &Path) -> Vec<String> {
     let Some(card_name) = card_path.file_name().and_then(|name| name.to_str()) else {
         return Vec::new();
     };

@@ -33,7 +33,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Duration,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 fn commit_rate_debug_enabled() -> bool {
     crate::env_flag!("SHOJI_COMMIT_RATE_DEBUG")
@@ -133,8 +133,80 @@ fn viewport_destination_for_fractional_source(
             scaled(src.size.w, prev_src.size.w, prev_dst.w),
             scaled(src.size.h, prev_src.size.h, prev_dst.h),
         )),
-        None => Size::from(((src.size.w.ceil() as i32).max(1), (src.size.h.ceil() as i32).max(1))),
+        None => Size::from((
+            (src.size.w.ceil() as i32).max(1),
+            (src.size.h.ceil() as i32).max(1),
+        )),
     })
+}
+
+/// Pre-commit: a toplevel about to unmap (a null buffer) still shows its last content, so
+/// take its close snapshot now. A client that unmaps a toplevel before, or instead of,
+/// destroying it leaves nothing to capture later, and the snapshot otherwise holds whatever
+/// the window showed when it first appeared or was last resized.
+fn capture_close_snapshot_before_unmap(state: &mut ShojiWM, surface: &WlSurface) {
+    let unmapping = with_states(surface, |states| {
+        matches!(
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .pending()
+                .buffer,
+            Some(BufferAssignment::Removed)
+        )
+    });
+    if !unmapping {
+        return;
+    }
+    let Some(window) = state
+        .space
+        .elements()
+        .find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == surface)
+        })
+        .cloned()
+    else {
+        return;
+    };
+    if let Err(error) = crate::backend::capture_live_snapshot_for_close(state, &window) {
+        warn!(
+            ?error,
+            "failed to capture unmapping toplevel for its closing animation"
+        );
+    }
+}
+
+/// A surface of a toplevel's tree is being destroyed. This runs before smithay takes the
+/// surface out of its tree and drops its buffer, so the window still shows everything. A
+/// client that exits without closing its window first (most do: kitty, zenity) has its
+/// objects destroyed in creation order, the root `wl_surface` ahead of its `xdg_toplevel`,
+/// so by `toplevel_destroyed` there is nothing left to capture. A subsurface the client
+/// destroys ahead of the window is likewise still part of it here.
+fn capture_close_snapshot_before_destroy(state: &mut ShojiWM, surface: &WlSurface) {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    let Some(window) = state
+        .space
+        .elements()
+        .find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+        })
+        .cloned()
+    else {
+        return;
+    };
+    if let Err(error) = crate::backend::capture_live_snapshot_for_close(state, &window) {
+        warn!(
+            ?error,
+            "failed to capture destroyed toplevel for its closing animation"
+        );
+    }
 }
 
 /// The destination `supply_viewport_destination` invented for a surface, kept so the next
@@ -155,7 +227,10 @@ fn supply_viewport_destination(surface: &WlSurface) {
         states
             .data_map
             .insert_if_missing_threadsafe(SuppliedViewportDestination::default);
-        let memo = states.data_map.get::<SuppliedViewportDestination>().unwrap();
+        let memo = states
+            .data_map
+            .get::<SuppliedViewportDestination>()
+            .unwrap();
         let mut supplied = memo.0.lock().unwrap();
         let mut viewport_cache = states.cached_state.get::<ViewportCachedState>();
         let previous = {
@@ -398,6 +473,7 @@ impl CompositorHandler for ShojiWM {
             Vec<crate::ssd::LogicalRect>,
         )> = None;
         let mut cursor_surface_committed = false;
+        let mut dnd_icon_committed = false;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -440,9 +516,9 @@ impl CompositorHandler for ShojiWM {
                             && let Some(attrs) = states
                                 .data_map
                                 .get::<Mutex<smithay::input::pointer::CursorImageAttributes>>()
-                            {
-                                attrs.lock().unwrap().hotspot -= buffer_delta;
-                            }
+                        {
+                            attrs.lock().unwrap().hotspot -= buffer_delta;
+                        }
 
                         // A viewport means the client already sized the cursor itself;
                         // xwayland-satellite does this for X cursors (buffer ÷ its scale,
@@ -522,44 +598,63 @@ impl CompositorHandler for ShojiWM {
                     });
                 }
             }
-            if x11_browser_cpu_debug_enabled()
-                && let Some(window) = mapped_window {
-                    let snapshot = self.snapshot_window(&window);
-                    if is_chrome_like_app_id(snapshot.app_id.as_deref()) {
-                        let (buffer_attached, damage_count, frame_callback_count) = with_states(
-                            surface,
-                            |states| {
-                                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-                                let attrs = attrs.current();
-                                (
-                                    matches!(
-                                        attrs.buffer.as_ref(),
-                                        Some(
-                                            smithay::wayland::compositor::BufferAssignment::NewBuffer(
-                                                _
-                                            )
-                                        )
-                                    ),
-                                    attrs.damage.len(),
-                                    attrs.frame_callbacks.len(),
-                                )
-                            },
-                        );
-                        info!(
-                            window_id = %snapshot.id,
-                            title = %snapshot.title,
-                            app_id = ?snapshot.app_id,
-                            is_xwayland = snapshot.is_xwayland,
-                            surface_id = ?surface.id(),
-                            root_surface_id = ?root.id(),
-                            committed_surface_is_root = surface == &root,
-                            buffer_attached,
-                            damage_count,
-                            frame_callback_count,
-                            "x11 browser cpu: surface commit",
-                        );
+            if mapped_window.is_none()
+                && let Some(icon) = self.dnd.icon_for_surface_mut(&root)
+            {
+                // A drag icon updated. Like the cursor, the surface's buffer
+                // offset moves it relative to the pointer.
+                dnd_icon_committed = true;
+                if surface == &root {
+                    let buffer_delta = with_states(surface, |states| {
+                        states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .buffer_delta
+                            .take()
+                    });
+                    if let Some(buffer_delta) = buffer_delta {
+                        icon.offset += buffer_delta;
                     }
                 }
+            }
+            if x11_browser_cpu_debug_enabled()
+                && let Some(window) = mapped_window
+            {
+                let snapshot = self.snapshot_window(&window);
+                if is_chrome_like_app_id(snapshot.app_id.as_deref()) {
+                    let (buffer_attached, damage_count, frame_callback_count) =
+                        with_states(surface, |states| {
+                            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+                            let attrs = attrs.current();
+                            (
+                                matches!(
+                                    attrs.buffer.as_ref(),
+                                    Some(
+                                        smithay::wayland::compositor::BufferAssignment::NewBuffer(
+                                            _
+                                        )
+                                    )
+                                ),
+                                attrs.damage.len(),
+                                attrs.frame_callbacks.len(),
+                            )
+                        });
+                    info!(
+                        window_id = %snapshot.id,
+                        title = %snapshot.title,
+                        app_id = ?snapshot.app_id,
+                        is_xwayland = snapshot.is_xwayland,
+                        surface_id = ?surface.id(),
+                        root_surface_id = ?root.id(),
+                        committed_surface_is_root = surface == &root,
+                        buffer_attached,
+                        damage_count,
+                        frame_callback_count,
+                        "x11 browser cpu: surface commit",
+                    );
+                }
+            }
         }
         snap_committed_viewport_sources(surface);
         // `on_commit_buffer_handler` drains the damage, so a layer surface's is read
@@ -679,7 +774,7 @@ impl CompositorHandler for ShojiWM {
                 );
             }
             self.window_commit_times.insert(window.clone(), commit_time);
-            if self.window_allows_render(&window) {
+            if self.window_allows_render(&window) || self.window_drawn_by_composition(&window) {
                 self.snapshot_dirty_window_ids.insert(snapshot.id.clone());
                 self.window_source_damage
                     .extend(
@@ -726,12 +821,16 @@ impl CompositorHandler for ShojiWM {
             self.refresh_idle_inhibit_state();
         }
 
-        if cursor_surface_committed || self.is_session_lock_surface_tree_surface(surface) {
+        if cursor_surface_committed
+            || dnd_icon_committed
+            || self.is_session_lock_surface_tree_surface(surface)
+        {
             self.schedule_redraw();
         }
     }
 
-    fn destroyed(&mut self, _surface: &WlSurface) {
+    fn destroyed(&mut self, surface: &WlSurface) {
+        capture_close_snapshot_before_destroy(self, surface);
         self.refresh_idle_inhibit_state();
     }
 
@@ -744,6 +843,7 @@ impl CompositorHandler for ShojiWM {
         // to signal when a commit occurs (by blocking the commit until then).
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             supply_viewport_destination(surface);
+            capture_close_snapshot_before_unmap(state, surface);
 
             let (maybe_dmabuf, acquire_point) = with_states(surface, |data| {
                 let dmabuf = data
@@ -927,15 +1027,32 @@ mod tests {
         // the destination was sanitised to unset and the source 1920 x 1.328125 kept.
         let previous = Some((rect(0.0, 1066.71875, 1920.0, 13.28125), bounds(1156, 8)));
         let dst = viewport_destination_for_fractional_source(
-            rect(0.0, 1078.671875, 1920.0, 1.328125), previous);
-        assert_eq!(dst, Some(bounds(1156, 1)), "the layer's width, and never under a pixel");
+            rect(0.0, 1078.671875, 1920.0, 1.328125),
+            previous,
+        );
+        assert_eq!(
+            dst,
+            Some(bounds(1156, 1)),
+            "the layer's width, and never under a pixel"
+        );
         // No previous scale: the source rounded up.
-        assert_eq!(viewport_destination_for_fractional_source(rect(0.0, 1078.671875, 1920.0, 1.328125), None),
-                   Some(bounds(1920, 2)));
+        assert_eq!(
+            viewport_destination_for_fractional_source(
+                rect(0.0, 1078.671875, 1920.0, 1.328125),
+                None
+            ),
+            Some(bounds(1920, 2))
+        );
         // A whole source needs nothing: an unset destination is legal then.
-        assert_eq!(viewport_destination_for_fractional_source(rect(0.0, 10.0, 1920.0, 200.0), None), None);
+        assert_eq!(
+            viewport_destination_for_fractional_source(rect(0.0, 10.0, 1920.0, 200.0), None),
+            None
+        );
         // A fractional origin alone is legal too; only the size is judged.
-        assert_eq!(viewport_destination_for_fractional_source(rect(0.5, 10.25, 100.0, 50.0), previous), None);
+        assert_eq!(
+            viewport_destination_for_fractional_source(rect(0.5, 10.25, 100.0, 50.0), previous),
+            None
+        );
     }
 
     #[test]

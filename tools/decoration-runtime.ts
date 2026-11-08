@@ -1,4 +1,5 @@
 interface EmbeddedRuntimeBridge {
+  configureLockBackground(background: import("../packages/shoji_wm/src/session-lock").LockBackgroundSelection): boolean;
   createOverlay(output: string, placement: string, maxDuration: number, effect: unknown, persistent: boolean): number;
   waitOverlay(id: number): Promise<void>;
   waitOverlayClosed(id: number): Promise<void>;
@@ -115,6 +116,8 @@ interface EmbeddedRuntimeBridge {
     timerDueMs?: number;
   }): void;
   publishFramePacing(pacing: Record<string, FramePacing>): void;
+  publishOutputCompositions(compositions: Record<string, WireOutputComposition>): void;
+  publishBackgroundEffect(effect: CompiledEffectHandle | null): void;
   log(level: "debug" | "info" | "warn" | "error", message: string): void;
 }
 
@@ -143,7 +146,7 @@ type NativeCompositionUpdate =
   | {
       kind: "patches";
       windowId: string;
-      patches: Array<{ nodeId: string; node: unknown }>;
+      patches: Array<{ nodeId: string; node: unknown; keepChildren?: boolean }>;
     };
 
 type NativeEffectUpdate =
@@ -300,6 +303,7 @@ import {
   hasActiveAnimations,
   hasActiveAnimationsInStore,
   type CompiledEffectHandle,
+  type MaybeSignal,
   type LayerEffectAssignment,
   type PopupEffectAssignment,
   createReactiveLayer,
@@ -315,12 +319,14 @@ import {
   isSignal,
   installAssetResolverBridge,
   installOverlayBridge,
+  installSessionLockBridge,
   installProcessResolverBridge,
   installRuntimeHooks,
   enterWindowEffectDependencyScope,
   invokeKeyBinding,
   managedWindowOnlyDirtyIds,
   takePendingDebugConfig,
+  sessionStartLocked,
   takePendingCursorConfig,
   takePendingDisplayConfig,
   takePendingKeyBindingConfig,
@@ -345,7 +351,8 @@ import {
   type KeyboardLayoutChangeEvent,
   type WindowCompositionFunction,
   type OutputStateSnapshot,
-  type WorkspaceConfig,
+  type OutputInfo,
+  type WorkspaceConfigPayload,
   emitWorkspaceActivate,
   type PollCallback,
   type PollDirtyMode,
@@ -357,7 +364,12 @@ import {
   type RuntimeWindowFullscreenRequestEvent,
   type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
+  type PointerRegionEvent,
   type GestureSwipeEvent,
+  dispatchInputGrabEvent,
+  dispatchDndEvent,
+  installDndWindowResolver,
+  type DndEvent,
   type RuntimeEventConfig,
   type RuntimePersistedState,
   updateOutputState,
@@ -371,8 +383,11 @@ import {
   type WaylandPopup,
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
+  type WindowDecorationClient,
   type WindowDecorationContext,
   type WindowDecorationDecision,
+  type WindowDecorationMode,
+  resolveKdeDefaultDecorationMode,
   resolveWindowDecorationDecision,
   type WindowEffectAssignment,
   type ManagedWindowAnimationEasing,
@@ -382,8 +397,17 @@ import {
   type ManagedWindowState,
   type WindowTransform,
 } from "../packages/shoji_wm/src/index.ts";
-import { peekDirtyWindowNodeIds } from "../packages/shoji_wm/src/runtime-hooks.ts";
+import {
+  clearRuntimeWatchDependencies,
+  peekDirtyWindowNodeIds,
+  withRuntimeWatchDependencyScope,
+} from "../packages/shoji_wm/src/runtime-hooks.ts";
 import { currentOutputList } from "../packages/shoji_wm/src/output.ts";
+import {
+  serializeOutputComposition,
+  type WireOutputComposition,
+} from "../packages/shoji_wm/src/composition.ts";
+import { effect as watchSignals } from "../packages/shoji_wm/src/signals.ts";
 
 function debugSSD(
   message: string,
@@ -509,6 +533,12 @@ interface WindowDecorationPolicyRequest {
   context: WindowDecorationContext;
   displayState: Record<string, OutputStateSnapshot>;
   inputState?: Record<string, InputDeviceInfo>;
+}
+
+interface KdeDecorationDefaultRequest {
+  requestId: number;
+  kind: "kdeDecorationDefault";
+  client: WindowDecorationClient;
 }
 
 interface SchedulerTickRequest {
@@ -653,6 +683,34 @@ interface GestureSwipeRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface PointerRegionRequest {
+  requestId: number;
+  kind: "pointerRegion";
+  event: PointerRegionEvent;
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
+interface DndRequest {
+  requestId: number;
+  kind: "dnd";
+  event: DndEvent;
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
+interface InputGrabRequest {
+  requestId: number;
+  kind: "inputGrab";
+  grabId: number;
+  event: Parameters<typeof dispatchInputGrabEvent>[1];
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface GetEffectConfigRequest {
   requestId: number;
   kind: "getEffectConfig";
@@ -702,6 +760,8 @@ interface WorkspaceActivateRequest {
   kind: "workspaceActivate";
   workspaceId: string;
   groupId?: string;
+  windowId?: string;
+  createName?: string;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
   inputState?: Record<string, InputDeviceInfo>;
@@ -712,6 +772,7 @@ type RuntimeRequest =
   | EvaluateRequest
   | EvaluatePreviewRequest
   | WindowDecorationPolicyRequest
+  | KdeDecorationDefaultRequest
   | SchedulerTickRequest
   | WindowClosedRequest
   | StartCloseRequest
@@ -726,6 +787,9 @@ type RuntimeRequest =
   | WindowActivateRequest
   | PointerMoveRequest
   | GestureSwipeRequest
+  | PointerRegionRequest
+  | InputGrabRequest
+  | DndRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest
   | EvaluatePopupEffectsRequest
@@ -755,7 +819,7 @@ interface EvaluateSuccess {
   // before the open animation kicks in.
   actions?: RuntimeWindowAction[];
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -777,6 +841,14 @@ interface WindowDecorationPolicySuccess {
   decision: WindowDecorationDecision;
 }
 
+interface KdeDecorationDefaultSuccess {
+  requestId: number;
+  ok: true;
+  kind: "kdeDecorationDefault";
+  /** `null`: the config registered no resolver. */
+  decision: { mode: WindowDecorationMode } | null;
+}
+
 interface SchedulerTickSuccess {
   requestId: number;
   ok: true;
@@ -791,7 +863,7 @@ interface SchedulerTickSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -806,7 +878,7 @@ interface WindowClosedSuccess {
   ok: true;
   kind: "windowClosed";
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -889,7 +961,7 @@ interface InvokeHandlerSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -911,7 +983,7 @@ interface InvokeKeyBindingSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -934,7 +1006,7 @@ interface WindowResizeSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
@@ -955,7 +1027,7 @@ interface WindowMoveSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
@@ -980,7 +1052,7 @@ interface WindowStateRequestSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
@@ -1013,7 +1085,7 @@ interface StartCloseSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
@@ -1029,6 +1101,9 @@ interface NativeInteractionSuccess {
     | "pointerMoveAsync"
     | "gestureSwipe"
     | "gestureSwipeAsync"
+    | "pointerRegion"
+    | "inputGrab"
+    | "dnd"
     | "windowMove"
     | "windowResize";
   invoked: boolean;
@@ -1040,7 +1115,7 @@ interface NativeInteractionSuccess {
   actions: RuntimeWindowAction[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -1055,7 +1130,7 @@ interface GetEffectConfigSuccess {
   kind: "getEffectConfig";
   backgroundEffect?: CompiledEffectHandle | null;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -1067,7 +1142,7 @@ interface EvaluateLayerEffectsSuccess {
   effects: RuntimeLayerEffectAssignment[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
@@ -1082,7 +1157,7 @@ interface EvaluatePopupEffectsSuccess {
   effects: RuntimePopupEffectAssignment[];
   nextPollInMs?: number;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   inputConfig?: { config: InputConfigDraft };
@@ -1096,12 +1171,13 @@ interface LifecycleEnableSuccess {
   ok: true;
   kind: "lifecycleEnable";
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
+  startLocked?: boolean;
 }
 
 interface LifecycleDisableSuccess {
@@ -1117,7 +1193,7 @@ interface RuntimeFailure {
   kind?: RuntimeRequest["kind"];
   error: string;
   displayConfig?: { outputs: DisplayConfigDraft };
-  workspaceConfig?: WorkspaceConfig;
+  workspaceConfig?: WorkspaceConfigPayload;
 }
 
 interface RuntimeLayerEffectAssignment {
@@ -1133,7 +1209,7 @@ interface RuntimePopupEffectAssignment {
 }
 
 interface RuntimeEffectConfig {
-  background_effect: CompiledEffectHandle | null;
+  background_effect: MaybeSignal<CompiledEffectHandle | null>;
   window?: (
     window: ReturnType<typeof createCompositionEvaluationCache>["window"],
   ) => WindowEffectAssignment | null;
@@ -1176,7 +1252,7 @@ function pendingDisplayConfigPayload():
   return outputs ? { outputs } : undefined;
 }
 
-function pendingWorkspaceConfigPayload(): WorkspaceConfig | undefined {
+function pendingWorkspaceConfigPayload(): WorkspaceConfigPayload | undefined {
   return takePendingWorkspaceConfig();
 }
 
@@ -1238,6 +1314,7 @@ const decorationPolicyWindowById = new Map<
   DecorationPolicyWindowEntry
 >();
 const openedWindowIds = new Set<string>();
+installDndWindowResolver((id) => cacheByWindowId.get(id)?.cache.window ?? null);
 const initialConfiguredWindowIds = new Set<string>();
 const firstCommittedWindowIds = new Set<string>();
 const animationEntriesByWindowId = new Map<string, Map<symbol, unknown>>();
@@ -1533,6 +1610,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
       composition = resolveComposition(loadedConfig);
       events = resolveEvents(loadedConfig);
       effectConfig = resolveEffectConfig(loadedConfig);
+      installSessionLockBridge(embeddedBridge);
       installOverlayBridge(embeddedBridge, () => activeRequest);
     }
     return {
@@ -1614,7 +1692,11 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
           case "lifecycleEnable":
           case "lifecycleDisable":
           case "windowDecorationPolicy":
+          case "kdeDecorationDefault":
           case "workspaceActivate":
+          case "pointerRegion":
+          case "inputGrab":
+          case "dnd":
             break;
         }
       }
@@ -1666,12 +1748,15 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
           eventConfig,
           processConfig,
           processActions,
+          startLocked: sessionStartLocked(),
         });
       } else if (request.kind === "workspaceActivate") {
         const runtimeConfig = await loadRuntimeConfig();
         const invoked = emitWorkspaceActivate({
           workspaceId: request.workspaceId,
           groupId: request.groupId,
+          windowId: request.windowId,
+          createName: request.createName,
         });
         const mutation = invoked
           ? collectRuntimeMutationState()
@@ -1845,6 +1930,14 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
             ok: true,
             kind: "windowDecorationPolicy",
             decision,
+          });
+        } else if (request.kind === "kdeDecorationDefault") {
+          const mode = resolveKdeDefaultDecorationMode(request.client);
+          await writeResponse(embeddedBridge, {
+            requestId: request.requestId,
+            ok: true,
+            kind: "kdeDecorationDefault",
+            decision: mode ? { mode } : null,
           });
         } else {
           if (request.kind === "schedulerTick") {
@@ -2034,7 +2127,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               requestId: request.requestId,
               ok: true,
               kind: "getEffectConfig",
-              backgroundEffect: effectConfig.background_effect,
+              backgroundEffect: resolveBackgroundEffect(effectConfig),
               displayConfig: pendingDisplayConfigPayload(),
               workspaceConfig: pendingWorkspaceConfigPayload(),
             });
@@ -2303,6 +2396,78 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               processConfig,
               processActions,
             });
+          } else if (request.kind === "pointerRegion") {
+            const result = interactionMutationResult(
+              events.emitPointerRegion(request.event),
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "dnd") {
+            const result = interactionMutationResult(
+              dispatchDndEvent(request.event),
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "inputGrab") {
+            const result = interactionMutationResult(
+              dispatchInputGrabEvent(request.grabId, request.event),
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
           } else if (
             request.kind === "gestureSwipe" ||
             request.kind === "gestureSwipeAsync"
@@ -2529,11 +2694,17 @@ function evaluateCached(
       dirtyUniformBindingKeys,
     );
     if (uniformPatches !== null && uniformPatches.length > 0) {
+      // Snapshot the managed window like the other paths do. A managed-window
+      // write (a transform the config animates, say) that lands with the
+      // uniform writes is not "managed-only", and the scheduler tick drops
+      // its mark for a window that is dirty anyway; reusing the cached
+      // transform here would lose it for good once the uniforms settle.
+      const managed = entry.cache.reevaluateManagedWindow();
       return {
         treeUpdate: "uniforms",
         uniformPatches,
-        transform: entry.cache.lastTransform,
-        managedWindow: entry.cache.lastManagedWindow,
+        transform: managed.transform,
+        managedWindow: managed.managedWindow,
         windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
         dirtyNodeIds: Array.from(
           new Set(uniformPatches.map((patch) => patch.nodeId)),
@@ -2736,6 +2907,19 @@ function writeCachedCompositionUpdate(
       throw new Error(
         `dirty composition node ${nodeId} is missing from ${windowId}`,
       );
+    }
+    // Children the serializer kept (the same objects as last sent) stay in
+    // the compositor's tree: send the node alone. Converting the subtree is
+    // most of a patch's cost, and a root prop would send the whole window.
+    if (
+      previous !== undefined &&
+      haveSameChildren(findSerializedNode(previous, nodeId), node)
+    ) {
+      return {
+        nodeId,
+        node: { ...(node as Record<string, unknown>), children: [] },
+        keepChildren: true,
+      };
     }
     return { nodeId, node };
   });
@@ -3026,6 +3210,17 @@ function topLevelDirtyNodeIds(nodeIds: readonly string[]): string[] {
     selected.push(nodeId);
   }
   return selected;
+}
+
+function haveSameChildren(previous: unknown, next: unknown): boolean {
+  const previousChildren = (previous as { children?: unknown } | undefined)?.children;
+  const nextChildren = (next as { children?: unknown } | undefined)?.children;
+  return (
+    Array.isArray(previousChildren) &&
+    Array.isArray(nextChildren) &&
+    previousChildren.length === nextChildren.length &&
+    previousChildren.every((child, index) => child === nextChildren[index])
+  );
 }
 
 function findSerializedNode(tree: unknown, nodeId: string): unknown {
@@ -3770,7 +3965,8 @@ function evaluatePopupEffects(
 
 function resolveSignals<T>(value: T): T {
   if (isSignal(value)) {
-    return read(value) as T;
+    // A signal may hold more signals (a computed effect with signal uniforms).
+    return resolveSignals(read(value)) as T;
   }
   if (Array.isArray(value)) {
     return value.map((item) => resolveSignals(item)) as T;
@@ -4011,6 +4207,9 @@ function publishScheduleIfChanged(): void {
   if (!schedulePublisher) {
     return;
   }
+  // First: evaluating a composition can register polls the schedule must see.
+  publishOutputCompositionsIfChanged(schedulePublisher);
+  publishBackgroundEffectIfChanged(schedulePublisher);
   const schedule = schedulerDueState();
   const key = JSON.stringify(schedule);
   if (key !== lastPublishedSchedule) {
@@ -4022,6 +4221,168 @@ function publishScheduleIfChanged(): void {
   if (pacingKey !== lastPublishedFramePacing) {
     lastPublishedFramePacing = pacingKey;
     schedulePublisher.publishFramePacing(pacing);
+  }
+}
+
+/** One output's `COMPOSITOR.rendering.composition`, evaluated lazily. */
+interface OutputCompositionSlot {
+  /** The output snapshot it was evaluated for; a change re-evaluates. */
+  outputKey: string;
+  dispose: (() => void) | null;
+  /** A signal it read changed since the last evaluation. */
+  dirty: boolean;
+  plan: WireOutputComposition | null;
+}
+
+const outputCompositionSlots = new Map<string, OutputCompositionSlot>();
+let outputCompositionConfig: unknown;
+let outputCompositionVersion = 0;
+let publishedOutputCompositionVersion = -1;
+let lastPublishedCompositions: string | undefined;
+
+/**
+ * Evaluate a composition and track the signals it read. When one changes the
+ * slot only turns dirty: the next publish evaluates it once, however many
+ * signals changed in between, so a composition never runs per signal write.
+ */
+function evaluateOutputComposition(
+  slot: OutputCompositionSlot,
+  output: OutputInfo,
+  compose: NonNullable<NonNullable<typeof COMPOSITOR.rendering>["composition"]>,
+): void {
+  slot.dispose?.();
+  let first = true;
+  slot.dispose = watchSignals(() => {
+    if (!first) {
+      // Reading nothing here leaves the effect without dependencies.
+      slot.dirty = true;
+      ensureImmediateDirtyPoll();
+      return;
+    }
+    first = false;
+    try {
+      slot.plan = withRuntimeWatchDependencyScope(compositionWatchId(output.name), () =>
+        serializeOutputComposition(compose(output)),
+      );
+    } catch (error) {
+      console.error(`COMPOSITOR.rendering.composition failed for ${output.name}`, error);
+      slot.plan = null;
+    }
+  });
+  slot.dirty = false;
+  outputCompositionVersion++;
+}
+
+function compositionWatchId(outputName: string): string {
+  return `composition:${outputName}`;
+}
+
+function disposeOutputCompositionSlot(name: string, slot: OutputCompositionSlot): void {
+  slot.dispose?.();
+  slot.dispose = null;
+  clearRuntimeWatchDependencies(compositionWatchId(name));
+}
+
+// `COMPOSITOR.effect.background_effect` as last sent to the compositor, and
+// whether one of the signals it read has changed since.
+let backgroundEffectWatch: (() => void) | undefined;
+let backgroundEffectConfig: RuntimeEffectConfig | undefined;
+let backgroundEffectDirty = false;
+const BACKGROUND_EFFECT_WATCH_ID = "background-effect";
+
+/**
+ * Resolve the background effect's signals and watch them: the compositor reads
+ * the effect once (`getEffectConfig`), and later values are published.
+ */
+function resolveBackgroundEffect(
+  config: RuntimeEffectConfig,
+): CompiledEffectHandle | null {
+  backgroundEffectWatch?.();
+  backgroundEffectConfig = config;
+  backgroundEffectDirty = false;
+  let resolved: CompiledEffectHandle | null = null;
+  let first = true;
+  backgroundEffectWatch = watchSignals(() => {
+    if (!first) {
+      // Reading nothing here leaves the effect without dependencies.
+      backgroundEffectDirty = true;
+      ensureImmediateDirtyPoll();
+      return;
+    }
+    first = false;
+    resolved = withRuntimeWatchDependencyScope(
+      BACKGROUND_EFFECT_WATCH_ID,
+      () => (resolveSignals(config.background_effect) as CompiledEffectHandle | null) ?? null,
+    );
+  });
+  return resolved;
+}
+
+function publishBackgroundEffectIfChanged(publisher: EmbeddedRuntimeBridge): void {
+  if (!backgroundEffectDirty || !backgroundEffectConfig) {
+    return;
+  }
+  publisher.publishBackgroundEffect(resolveBackgroundEffect(backgroundEffectConfig));
+}
+
+/** Send every output's composition when any of them changed. */
+function publishOutputCompositionsIfChanged(publisher: EmbeddedRuntimeBridge): void {
+  const config = COMPOSITOR.rendering?.composition;
+  if (config !== outputCompositionConfig) {
+    for (const [name, slot] of outputCompositionSlots) {
+      disposeOutputCompositionSlot(name, slot);
+    }
+    outputCompositionSlots.clear();
+    outputCompositionConfig = config;
+    outputCompositionVersion++;
+  }
+  if (typeof config === "function") {
+    const seen = new Set<string>();
+    for (const output of currentOutputList()) {
+      if (!output.enabled) {
+        continue;
+      }
+      seen.add(output.name);
+      const outputKey = JSON.stringify(output);
+      let slot = outputCompositionSlots.get(output.name);
+      if (!slot || slot.outputKey !== outputKey) {
+        if (slot) {
+          disposeOutputCompositionSlot(output.name, slot);
+        }
+        slot = { outputKey, dispose: null, dirty: true, plan: null };
+        outputCompositionSlots.set(output.name, slot);
+      }
+      if (slot.dirty) {
+        evaluateOutputComposition(slot, output, config);
+      }
+    }
+    for (const [name, slot] of outputCompositionSlots) {
+      if (!seen.has(name)) {
+        disposeOutputCompositionSlot(name, slot);
+        outputCompositionSlots.delete(name);
+        outputCompositionVersion++;
+      }
+    }
+  }
+  if (outputCompositionVersion === publishedOutputCompositionVersion) {
+    return;
+  }
+  publishedOutputCompositionVersion = outputCompositionVersion;
+  const compositions: Record<string, WireOutputComposition> = {};
+  for (const [name, slot] of outputCompositionSlots) {
+    if (slot.plan) {
+      compositions[name] = slot.plan;
+    }
+  }
+  const key = JSON.stringify(compositions);
+  if (key === lastPublishedCompositions) {
+    return;
+  }
+  lastPublishedCompositions = key;
+  try {
+    publisher.publishOutputCompositions(compositions);
+  } catch (error) {
+    console.error("COMPOSITOR.rendering.composition was rejected", error);
   }
 }
 
@@ -4794,7 +5155,7 @@ function resolveEffectConfig(
       loaded.default as
         | {
             effect?: {
-              background_effect?: CompiledEffectHandle | null;
+              background_effect?: MaybeSignal<CompiledEffectHandle | null>;
               window?: RuntimeEffectConfig["window"];
               layer?: RuntimeEffectConfig["layer"];
               popup?: RuntimeEffectConfig["popup"];
@@ -5014,6 +5375,7 @@ function writeResponse(
     | LifecycleDisableSuccess
     | DrainPreloadSuccess
     | WindowDecorationPolicySuccess
+    | KdeDecorationDefaultSuccess
     | RuntimeFailure,
 ): Promise<void> {
   return writeResponseWithRuntimeUpdates(

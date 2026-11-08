@@ -33,7 +33,7 @@ by default (see [Input](#input)).
 | `Super` + `D` | Discord |
 | `Super` + `E` | File manager (Dolphin) |
 | `Super` + `A` | Toggle the start menu (shoji-bar-3) |
-| `Super` (tap) | Toggle the start menu — a quick tap with no other key |
+| `Super` (tap) | Toggle the start menu — a quick tap (under 300 ms) with no other key |
 | `Super` + `V` | Toggle clipboard history (shoji-bar-3) |
 | `Super` + `P` | Screenshot a region (hyprshot → swappy) |
 | `Super` + `Ctrl` + `P` | Screenshot a region, freezing the screen first |
@@ -43,6 +43,7 @@ by default (see [Input](#input)).
 | Shortcut | Action |
 | --- | --- |
 | `Super` + drag | Move a window — hold `Super` and drag anywhere on it |
+| `Super` (hold) | Free the cursor from a game that locks it — [details](./cursor.md#ignoring-app-pointer-locks) |
 | `Super` + `Q` | Close the focused window |
 | `Super` + `M` | Toggle maximize on the focused window |
 | `Super` + `F` | Toggle fullscreen on the focused window (compositor-side, see below) |
@@ -70,6 +71,20 @@ moment later — switch the game to windowed mode first, then press the key.
 | `Super` + `Ctrl` + `↑` / `↓` | Switch to the previous / next workspace |
 | `Super` + `Shift` + `↑` / `↓` | Move the focused window to the previous / next workspace |
 
+### Window switcher (Flip 3D)
+
+| Shortcut | Action |
+| --- | --- |
+| `Super` + `Tab` | Open the switcher with the previous window in front |
+| `Tab` / `Shift` + `Tab` (holding `Super`) | Next / previous window |
+| `←` `→` `↑` `↓`, mouse wheel, touchpad scroll, three-finger swipe | Flip through the windows |
+| Release `Super`, `Return`, `Space` | Switch to the front window |
+| Click a window | Switch to that window |
+| `Escape` | Back to the desktop unchanged |
+
+See [Flip 3D](#flip-3d) below. With `WINDOW_SWITCHER_STYLE = "grid"` in
+`index.tsx`, `Super` + `Tab` opens the [window grid](#window-grid) instead.
+
 ### System (built into the compositor)
 
 These are hard-wired in the compositor itself, not defined by the config — so
@@ -79,6 +94,9 @@ they keep working even if your config is broken.
 | --- | --- |
 | `Super` + `Shift` + `R` | **Hot reload the config** — apply edits to `index.tsx` without restarting (see [Overview → Hot reload](./overview.md#hot-reload)) |
 | `Super` + `Shift` + `Q` | Quit the ShojiWM session |
+
+The same two actions are available as `shoji_wm --reload` and `shoji_wm --quit`
+(see [Keybindings → Quit and reload](./keybindings-and-pointer.md#quit-and-reload)).
 
 ### Debug
 
@@ -116,6 +134,57 @@ and floating per workspace:
 The default config also exposes the workspace layout over an IPC socket so an
 external bar (shoji-bar-3) can render workspace indicators and react to changes.
 
+Bars that speak ext-workspace see the workspaces that have windows plus the
+active one, and can activate them. They can also create a workspace by number:
+`create_workspace` with the name `5` lists workspace 5 (empty) until it is
+activated or gets a window, and activating it switches to it (`COMPOSITOR.workspace.event.onCreate`).
+
+## Flip 3D
+
+`Super` + `Tab` opens a Windows Vista style window switcher
+(`packages/config/src/flip-3d.tsx`). Every window, on every workspace and
+minimized ones too, lifts off the desktop into a receding diagonal stack, most
+recently used in front; the bars stay on screen. Choosing a window switches to
+its workspace, restores it if it was minimized, and focuses it, while the stack
+settles back onto the desktop.
+
+- Opening and closing use the window manager's easing and start and end on
+  the windows' real positions, so the desktop morphs into the stack and back.
+- While the switcher is open it takes all input (an
+  [input grab](./keybindings-and-pointer.md#input-grab)): clicks and keys go to
+  the switcher, not to the windows behind it.
+- The front window glows white: its decoration's shadow turns white while it
+  is selected (`WINDOW_SWITCHER.selectedWindowId`).
+- Window blur, and the blur behind regions clients request
+  (`ext-background-effect-v1`), is switched off while the switcher is open
+  (each window is drawn alone into a texture there, with nothing under it to
+  blur) and fades back in as the stack settles.
+
+The stack's look (how many windows, spacing, tilt) is set by the constants at
+the top of `flip-3d.tsx`. It is built from
+[output composition](./output-composition.md).
+
+## Window grid
+
+An overview style alternative to Flip 3D (`packages/config/src/window-grid.tsx`):
+set `WINDOW_SWITCHER_STYLE` in `index.tsx` to `"grid"` and `Super` + `Tab` lays
+every window out side by side in a flat grid instead, most recently used first.
+The grid stays open until you pick a window, so it works with the mouse alone.
+
+| Input | Action |
+| --- | --- |
+| Hover a window | Select it |
+| Click a window | Switch to that window |
+| Click empty space, `Escape` | Back to the desktop unchanged |
+| `Tab` / `Shift` + `Tab`, `←` `→` `↑` `↓`, mouse wheel | Move the selection |
+| `Return`, `Space` | Switch to the selected window |
+| Release `Super` after pressing `Tab` or an arrow key while holding it | Switch to the selected window (like Alt+Tab) |
+
+Everything else — the morph from and back to the desktop, the white glow on the
+selected window, blur switched off while open — is shared with Flip 3D
+(`window-switcher.tsx`). The grid's padding and gaps are the constants at the
+top of `window-grid.tsx`.
+
 ## Multi-monitor
 
 The default `output.configure` sets per-connector scales and extends all displays
@@ -148,7 +217,17 @@ See [Input devices](./input.md) to change these.
 - **Layer surfaces** (bars, docks) and **layer popups** (menus) are blurred
   behind, unless a surface opts out with the `no_blur` namespace.
 
-See [Effects](./effects.md) for how these are built.
+See [Effects](./effects.md) for how these are built, and
+[Blurring specific windows or layers](./effects.md#blurring-specific-windows-or-layers)
+for choosing which apps and bars get them.
+
+## Drag and drop
+
+While you drag text, files or links between windows, the dragged picture
+sits on a frosted card with a badge for what a drop would do (**+** copy,
+**→** move, **?** ask, **×** refused) and a label naming what is dragged. A
+drop nobody accepts flies back to where the drag started. See
+[Drag and drop](./drag-and-drop.md) to change it.
 
 ## Startup programs & environment
 

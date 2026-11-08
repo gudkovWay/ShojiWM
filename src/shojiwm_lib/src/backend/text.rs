@@ -76,6 +76,8 @@ pub struct LabelSpec {
     pub font_weight: Option<serde_json::Value>,
     pub font_family: Option<Vec<String>>,
     pub text_align: Option<String>,
+    /// `"ellipsis"`: text wider than the label ends in "…".
+    pub text_overflow: Option<String>,
     pub line_height: Option<f32>,
     /// Exact rasterization scale (the layout scale), so the buffer maps
     /// one-to-one onto the node's physical pixels.
@@ -199,20 +201,34 @@ impl TextRasterizer {
         let target_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
         let target_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
         let font_size = spec.font_size.max(1.0) * raster_scale as f32;
-        let line_height =
-            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale as f32;
+        let line_height = spec
+            .line_height
+            .unwrap_or(spec.font_size.max(1.0) + crate::ssd::DEFAULT_LABEL_LINE_GAP as f32)
+            * raster_scale as f32;
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         let attrs = attrs_for_spec(spec);
         let alignment = alignment_for_spec(spec.text_align.as_deref());
 
-        {
-            let mut buffer = buffer.borrow_with(&mut self.font_system);
+        let shape = |buffer: &mut Buffer, font_system: &mut FontSystem, text: &str| {
+            let mut buffer = buffer.borrow_with(font_system);
             buffer.set_size(Some(target_width as f32), Some(target_height as f32));
             buffer.set_wrap(Wrap::None);
-            buffer.set_text(&spec.text, &attrs, Shaping::Advanced, alignment);
+            buffer.set_text(text, &attrs, Shaping::Advanced, alignment);
             buffer.shape_until_scroll(false);
+            buffer
+                .layout_runs()
+                .map(|run| run.line_w)
+                .fold(0.0f32, f32::max)
+        };
+        let width = shape(&mut buffer, &mut self.font_system, &spec.text);
+        if spec.text_overflow.as_deref() == Some("ellipsis") && width > target_width as f32 {
+            let font_system = &mut self.font_system;
+            let text = ellipsize(&spec.text, |candidate| {
+                shape(&mut buffer, font_system, candidate) <= target_width as f32
+            });
+            shape(&mut buffer, font_system, &text);
         }
 
         let runs = buffer.layout_runs().collect::<Vec<_>>();
@@ -247,13 +263,7 @@ impl TextRasterizer {
         })
     }
 
-    pub fn handle_async_ready(
-        &mut self,
-        spec_hash: u64,
-        width: i32,
-        height: i32,
-        pixels: Vec<u8>,
-    ) {
+    pub fn handle_async_ready(&mut self, spec_hash: u64, width: i32, height: i32, pixels: Vec<u8>) {
         self.async_in_flight.remove(&spec_hash);
         self.async_missing.remove(&spec_hash);
         self.async_buffers.insert(
@@ -300,7 +310,9 @@ impl LabelMeasurer {
         }
 
         let font_size = spec.font_size.max(1.0);
-        let line_height = spec.line_height.unwrap_or(font_size.ceil() + 4.0);
+        let line_height = spec
+            .line_height
+            .unwrap_or(font_size.ceil() + crate::ssd::DEFAULT_LABEL_LINE_GAP as f32);
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let attrs = attrs_for_spec(spec);
@@ -336,6 +348,32 @@ pub fn measure_label_intrinsic(spec: &LabelSpec) -> (i32, i32) {
     LABEL_MEASURER.with(|measurer| measurer.borrow_mut().measure(spec))
 }
 
+/// The longest prefix of `text` that `fits` with "…" after it (just "…"
+/// when not even one character does). `text` itself is taken not to fit.
+fn ellipsize(text: &str, mut fits: impl FnMut(&str) -> bool) -> String {
+    // Prefix ends after the first, second, ... character, short of the whole.
+    let ends = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .collect::<Vec<_>>();
+    let truncated = |end: usize| format!("{}…", text[..end].trim_end());
+    let (mut low, mut high) = (0usize, ends.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if fits(&truncated(ends[middle - 1])) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    if low == 0 {
+        "…".to_string()
+    } else {
+        truncated(ends[low - 1])
+    }
+}
+
 pub fn hash_label_spec(spec: &LabelSpec) -> u64 {
     let mut hasher = DefaultHasher::new();
     spec.text.hash(&mut hasher);
@@ -355,6 +393,7 @@ pub fn hash_label_spec(spec: &LabelSpec) -> u64 {
     spec.color.a.hash(&mut hasher);
     spec.font_size.to_bits().hash(&mut hasher);
     spec.text_align.hash(&mut hasher);
+    spec.text_overflow.hash(&mut hasher);
     spec.line_height.map(f32::to_bits).hash(&mut hasher);
     spec.raster_scale.to_bits().hash(&mut hasher);
     spec.font_family.hash(&mut hasher);
@@ -549,9 +588,23 @@ pub(crate) fn memory_text_element(
 
     let physical = label
         .rect_precise
-        .map(|rect| relative_physical_rect_from_root_precise(rect, root_rect, root_subpixel, output_geo, scale))
+        .map(|rect| {
+            relative_physical_rect_from_root_precise(
+                rect,
+                root_rect,
+                root_subpixel,
+                output_geo,
+                scale,
+            )
+        })
         .unwrap_or_else(|| {
-            relative_physical_rect_from_root_snapped_edges(label.rect, root_rect, root_subpixel, output_geo, scale)
+            relative_physical_rect_from_root_snapped_edges(
+                label.rect,
+                root_rect,
+                root_subpixel,
+                output_geo,
+                scale,
+            )
         });
     let element = MemoryRenderBufferRenderElement::from_buffer(
         renderer,
@@ -705,4 +758,30 @@ fn intersect_logical_rect(
     let bottom = (rect.y + rect.height).min(output_geo.loc.y + output_geo.size.h);
 
     (right > left && bottom > top).then(|| LogicalRect::new(left, top, right - left, bottom - top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ellipsize;
+
+    fn at_most(chars: usize) -> impl FnMut(&str) -> bool {
+        move |text: &str| text.chars().count() <= chars
+    }
+
+    #[test]
+    fn ellipsize_keeps_the_longest_prefix_that_fits() {
+        assert_eq!(ellipsize("Hello world", at_most(6)), "Hello…");
+        assert_eq!(ellipsize("Hello world", at_most(9)), "Hello wo…");
+    }
+
+    #[test]
+    fn ellipsize_cuts_on_character_boundaries() {
+        assert_eq!(ellipsize("ようこそ世界", at_most(3)), "よう…");
+    }
+
+    #[test]
+    fn ellipsize_falls_back_to_the_ellipsis_alone() {
+        assert_eq!(ellipsize("Hello", at_most(0)), "…");
+        assert_eq!(ellipsize("H", at_most(1)), "…");
+    }
 }

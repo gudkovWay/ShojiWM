@@ -32,7 +32,8 @@ struct TestRuntimeDir(PathBuf);
 impl TestRuntimeDir {
     fn new(bridge_id: u32) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let path = std::env::temp_dir().join(format!("shoji-test-{}-{bridge_id}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("shoji-test-{}-{bridge_id}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         TEST_RUNTIME_DIR.with(|dir| *dir.borrow_mut() = Some(path.clone()));
         Ok(Self(path))
@@ -50,7 +51,7 @@ impl Drop for TestRuntimeDir {
 use rustyscript::{
     Module, Runtime, RuntimeOptions,
     deno_core::{
-        GarbageCollected, ModuleSource, ModuleSourceCode, ModuleSpecifier,
+        GarbageCollected, ModuleSource, ModuleSourceCode, ModuleSpecifier, OpState,
         error::ModuleLoaderError, extension, op2, v8,
     },
     json_args,
@@ -58,6 +59,7 @@ use rustyscript::{
 };
 use serde::{Deserialize, Serialize};
 
+use shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot;
 use shojiwm_lib::ssd::{
     BackgroundEffectConfig, CompiledEffect, DecorationNode, EffectInput, EffectStage,
     OpaqueRegionPolicy, ShaderStage, SurfacePolicy, WindowEffectConfig,
@@ -69,7 +71,6 @@ use shojiwm_lib::ssd::{
         WindowResizeEventSnapshot, WindowTransform,
     },
 };
-use shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot;
 
 /// Composition requests cross the CppGC bridge as V8 values instead of JSON
 /// frames. Ownership moves into the request envelope, so large snapshots are
@@ -205,6 +206,41 @@ pub enum NativeInteractionRequest {
         #[serde(rename = "requestId")]
         request_id: u64,
         event: GestureSwipeEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
+    PointerRegion {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
+    InputGrab {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "grabId")]
+        grab_id: u64,
+        event: shojiwm_lib::runtime_input_grab::InputGrabEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
+    Dnd {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: shojiwm_lib::dnd::DndEventSnapshot,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
@@ -409,6 +445,9 @@ pub enum NativeInteractionKind {
     PointerMoveAsync,
     GestureSwipe,
     GestureSwipeAsync,
+    PointerRegion,
+    InputGrab,
+    Dnd,
     WindowMove,
     WindowResize,
 }
@@ -420,6 +459,9 @@ impl NativeInteractionKind {
             Self::PointerMoveAsync => "pointerMoveAsync",
             Self::GestureSwipe => "gestureSwipe",
             Self::GestureSwipeAsync => "gestureSwipeAsync",
+            Self::PointerRegion => "pointerRegion",
+            Self::InputGrab => "inputGrab",
+            Self::Dnd => "dnd",
             Self::WindowMove => "windowMove",
             Self::WindowResize => "windowResize",
         }
@@ -538,6 +580,9 @@ struct WireNativeSurfacePolicy {
 struct WireNativeCompositionPatch {
     node_id: String,
     node: WireDecorationNode,
+    /// `node` is sent without children; the compositor's node keeps its own.
+    #[serde(default)]
+    keep_children: bool,
 }
 
 #[op2]
@@ -549,7 +594,9 @@ fn op_shoji_environment() -> HashMap<String, String> {
         let mut environment: HashMap<String, String> = environment;
         TEST_RUNTIME_DIR.with(|dir| {
             let dir = dir.borrow();
-            let dir = dir.as_ref().expect("test runtime must isolate its IPC environment");
+            let dir = dir
+                .as_ref()
+                .expect("test runtime must isolate its IPC environment");
             environment.insert("XDG_RUNTIME_DIR".into(), dir.to_string_lossy().into_owned());
             environment.insert("WAYLAND_DISPLAY".into(), "test".into());
             environment.remove("SHOJI_RUNTIME_WAKE_PID");
@@ -666,6 +713,23 @@ fn op_shoji_output_power(
     Ok(())
 }
 
+/// `COMPOSITOR.input.grab`: start (`active`) or end the config's input grab. Sent like
+/// any other host side effect, so a key binding that opens a grab has it in place before
+/// the next input event.
+#[op2(fast)]
+fn op_shoji_input_grab(id: u32, active: bool) {
+    if let Ok(slot) = WAKE_HOST.lock()
+        && let Some(host) = slot.as_ref()
+    {
+        host.send(shojiwm_lib::runtime_api::HostMessage::InputGrab(
+            shojiwm_lib::runtime_input_grab::RuntimeInputGrabUpdate {
+                id: u64::from(id),
+                active,
+            },
+        ));
+    }
+}
+
 /// The runtime's schedule (`RuntimeSchedule`), published whenever it changes.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -682,6 +746,9 @@ type PublishedSchedule = Arc<Mutex<PublishedHostState>>;
 struct PublishedHostState {
     schedule: Option<shojiwm_lib::runtime_api::RuntimeSchedule>,
     frame_pacing: Option<shojiwm_lib::frame_pacing::FramePacingConfig>,
+    output_compositions:
+        Option<HashMap<String, shojiwm_lib::backend::composition::OutputComposition>>,
+    background_effect: Option<Option<BackgroundEffectConfig>>,
 }
 
 struct BridgeRegistration {
@@ -1136,23 +1203,81 @@ impl ShojiRuntimeBridge {
         #[serde] pacing: HashMap<String, shojiwm_lib::frame_pacing::FramePacing>,
     ) {
         if let Ok(mut slot) = self.schedule.lock() {
-            slot.frame_pacing = Some(shojiwm_lib::frame_pacing::FramePacingConfig {
-                outputs: pacing,
-            });
+            slot.frame_pacing =
+                Some(shojiwm_lib::frame_pacing::FramePacingConfig { outputs: pacing });
         }
     }
 
-    fn create_overlay(&self, #[string] output: String, #[string] placement: String,
-        max_duration: f64, #[serde] effect: WireCompiledEffect, persistent: bool) -> Result<u32, std::io::Error>
-    {
+    // `COMPOSITOR.rendering.composition` for every output; published like the schedule.
+    fn publish_output_compositions(
+        &self,
+        #[serde] compositions: HashMap<
+            String,
+            shojiwm_lib::backend::composition::OutputComposition,
+        >,
+    ) {
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.output_compositions = Some(compositions);
+        }
+    }
+
+    // `COMPOSITOR.effect.background_effect` re-resolved after one of its signals changed;
+    // published like the schedule.
+    fn publish_background_effect(
+        &self,
+        #[serde] effect: Option<WireCompiledEffect>,
+    ) -> Result<(), std::io::Error> {
+        let effect = effect.map(TryInto::try_into).transpose().map_err(
+            |error: shojiwm_lib::ssd::DecorationBridgeError| {
+                std::io::Error::other(error.to_string())
+            },
+        )?;
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.background_effect = Some(effect);
+        }
+        Ok(())
+    }
+
+    fn configure_lock_background(
+        &self,
+        #[serde] background: shojiwm_lib::backend::lock_scene::BackgroundSelection,
+    ) -> Result<bool, std::io::Error> {
+        if shojiwm_lib::backend::lock_scene::configure(&self.overlay_owner, background)? {
+            op_shoji_wake_compositor();
+        }
+        Ok(shojiwm_lib::backend::lock_scene::is_locked())
+    }
+
+    fn create_overlay(
+        &self,
+        #[string] output: String,
+        #[string] placement: String,
+        max_duration: f64,
+        #[serde] effect: WireCompiledEffect,
+        persistent: bool,
+    ) -> Result<u32, std::io::Error> {
         let effect = decode_overlay_effect(effect)?;
-        let host = WAKE_HOST.lock().ok().and_then(|host| host.clone()).unwrap_or_default();
-        shojiwm_lib::backend::overlay::create(&self.overlay_owner, output, placement, max_duration, effect, persistent, host)
+        let host = WAKE_HOST
+            .lock()
+            .ok()
+            .and_then(|host| host.clone())
+            .unwrap_or_default();
+        shojiwm_lib::backend::overlay::create(
+            &self.overlay_owner,
+            output,
+            placement,
+            max_duration,
+            effect,
+            persistent,
+            host,
+        )
     }
 
     #[async_method]
     async fn wait_overlay(&self, id: u32) -> Result<(), std::io::Error> {
-        shojiwm_lib::backend::overlay::get(&self.overlay_owner, id)?.wait(false).await
+        shojiwm_lib::backend::overlay::get(&self.overlay_owner, id)?
+            .wait(false)
+            .await
     }
 
     #[async_method]
@@ -1163,7 +1288,11 @@ impl ShojiRuntimeBridge {
         Ok(())
     }
 
-    fn update_overlay(&self, id: u32, #[serde] effect: WireCompiledEffect) -> Result<(), std::io::Error> {
+    fn update_overlay(
+        &self,
+        id: u32,
+        #[serde] effect: WireCompiledEffect,
+    ) -> Result<(), std::io::Error> {
         if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
             control.update(decode_overlay_effect(effect)?)?;
         }
@@ -1172,7 +1301,9 @@ impl ShojiRuntimeBridge {
 
     #[fast]
     fn dispose_overlay(&self, id: u32) {
-        if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) { control.dispose(); }
+        if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
+            control.dispose();
+        }
     }
 
     #[async_method]
@@ -1239,7 +1370,6 @@ impl ShojiRuntimeBridge {
         });
         set_pending_native_response(&self.pending_native_response, response)
     }
-
 
     #[fast]
     fn add_scheduler_dirty_window(
@@ -1381,9 +1511,11 @@ impl ShojiRuntimeBridge {
                 tiled: flags & (1 << 6) != 0,
                 allow_tearing,
                 z_index: (flags & (1 << 11) != 0).then_some(fields[14] as i32),
-                surface_policy: (flags & (1 << 12) != 0).then_some(shojiwm_lib::ssd::SurfacePolicy {
-                    opaque_region: shojiwm_lib::ssd::OpaqueRegionPolicy::Ignore,
-                }),
+                surface_policy: (flags & (1 << 12) != 0).then_some(
+                    shojiwm_lib::ssd::SurfacePolicy {
+                        opaque_region: shojiwm_lib::ssd::OpaqueRegionPolicy::Ignore,
+                    },
+                ),
                 transform: WindowTransform {
                     origin: TransformOrigin {
                         x: fields[3],
@@ -1522,16 +1654,21 @@ impl ShojiRuntimeBridge {
                             },
                         )?;
                         if node.stable_id.as_deref() != Some(patch.node_id.as_str()) {
-                            return Err(std::io::Error::other(
-                                format!(
-                                    "composition patch id mismatch: envelope={}, node={:?}",
-                                    patch.node_id, node.stable_id
-                                ),
-                            ));
+                            return Err(std::io::Error::other(format!(
+                                "composition patch id mismatch: envelope={}, node={:?}",
+                                patch.node_id, node.stable_id
+                            )));
                         }
-                        Ok(NativeCompositionPatch::ReplaceNode {
-                            node_id: patch.node_id,
-                            node,
+                        Ok(if patch.keep_children {
+                            NativeCompositionPatch::ReplaceProps {
+                                node_id: patch.node_id,
+                                node,
+                            }
+                        } else {
+                            NativeCompositionPatch::ReplaceNode {
+                                node_id: patch.node_id,
+                                node,
+                            }
                         })
                     })
                     .collect::<Result<Vec<_>, std::io::Error>>()?;
@@ -2227,6 +2364,9 @@ fn native_interaction_kind(value: &str) -> Result<NativeInteractionKind, std::io
         "pointerMoveAsync" => Ok(NativeInteractionKind::PointerMoveAsync),
         "gestureSwipe" => Ok(NativeInteractionKind::GestureSwipe),
         "gestureSwipeAsync" => Ok(NativeInteractionKind::GestureSwipeAsync),
+        "pointerRegion" => Ok(NativeInteractionKind::PointerRegion),
+        "inputGrab" => Ok(NativeInteractionKind::InputGrab),
+        "dnd" => Ok(NativeInteractionKind::Dnd),
         "windowMove" => Ok(NativeInteractionKind::WindowMove),
         "windowResize" => Ok(NativeInteractionKind::WindowResize),
         _ => Err(std::io::Error::new(
@@ -2294,7 +2434,9 @@ fn native_shader_uniform_value(
     }
     match value_len {
         1 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Float(values[0])),
-        2 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec2([values[0], values[1]])),
+        2 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec2([
+            values[0], values[1],
+        ])),
         3 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec3([
             values[0], values[1], values[2],
         ])),
@@ -2358,6 +2500,116 @@ fn set_pending_native_response(
     Ok(())
 }
 
+/// The host of the compositor this isolate serves. Kept in the isolate's op
+/// state rather than `WAKE_HOST`, which belongs to whichever runtime started last.
+fn isolate_host(state: &OpState) -> Option<shojiwm_lib::runtime_api::RuntimeHost> {
+    state
+        .try_borrow::<shojiwm_lib::runtime_api::RuntimeHost>()
+        .cloned()
+}
+
+/// `COMPOSITOR.cursor.setPosition`: sent like any other host side effect, so it works
+/// from key bindings, IPC handlers and timers alike.
+#[op2]
+fn op_shoji_cursor_set_position(
+    state: &mut OpState,
+    #[serde] target: shojiwm_lib::cursor::RuntimeCursorPositionTarget,
+) {
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::CursorPosition(
+            target,
+        ));
+    }
+}
+
+/// `COMPOSITOR.cursor.getPosition`: the compositor publishes the cursor after every
+/// pointer motion, so this reads it without a round trip.
+#[op2]
+#[serde]
+fn op_shoji_cursor_position(
+    state: &mut OpState,
+) -> Option<shojiwm_lib::cursor::CursorPositionSnapshot> {
+    isolate_host(state)?.cursor_position()
+}
+
+/// `COMPOSITOR.cursor.overrideKind`: a CSS cursor name, `none` to hide the
+/// cursor, or `null` to give the cursor back to the clients.
+#[op2]
+fn op_shoji_cursor_override(
+    state: &mut OpState,
+    #[string] kind: Option<String>,
+) -> Result<(), std::io::Error> {
+    let kind = kind
+        .as_deref()
+        .map(shojiwm_lib::cursor::CursorOverride::parse)
+        .transpose()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::CursorOverride(kind));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum WireDragViewCommand {
+    #[serde(rename_all = "camelCase")]
+    Show {
+        view_id: u64,
+        drag_id: u64,
+        max_linger_ms: Option<f64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Props {
+        view_id: u64,
+        props: shojiwm_lib::dnd::DragViewProps,
+    },
+    #[serde(rename_all = "camelCase")]
+    Content {
+        view_id: u64,
+        tree: Option<WireDecorationNode>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Dispose { view_id: u64 },
+}
+
+/// `drag.show()` and its view's updates.
+#[op2]
+fn op_shoji_dnd_view(
+    state: &mut OpState,
+    #[serde] command: WireDragViewCommand,
+) -> Result<(), std::io::Error> {
+    use shojiwm_lib::dnd::DragViewCommand;
+    let command = match command {
+        WireDragViewCommand::Show {
+            view_id,
+            drag_id,
+            max_linger_ms,
+        } => DragViewCommand::Show {
+            view_id,
+            drag_id,
+            max_linger_ms: max_linger_ms
+                .filter(|ms| ms.is_finite())
+                .map(|ms| ms.max(0.0) as u64),
+        },
+        WireDragViewCommand::Props { view_id, props } => DragViewCommand::Props { view_id, props },
+        WireDragViewCommand::Content { view_id, tree } => DragViewCommand::Content {
+            view_id,
+            content: tree
+                .map(shojiwm_lib::ssd::DecorationNode::try_from)
+                .transpose()
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+                })?,
+        },
+        WireDragViewCommand::Dispose { view_id } => DragViewCommand::Dispose { view_id },
+    };
+    if let Some(host) = isolate_host(state) {
+        host.send(shojiwm_lib::runtime_api::HostMessage::DragView(command));
+    }
+    Ok(())
+}
+
 extension!(
     shoji_runtime_bridge,
     ops = [
@@ -2369,6 +2621,11 @@ extension!(
         op_shoji_process_id,
         op_shoji_wake_compositor,
         op_shoji_output_power,
+        op_shoji_input_grab,
+        op_shoji_cursor_set_position,
+        op_shoji_cursor_position,
+        op_shoji_cursor_override,
+        op_shoji_dnd_view,
     ],
     objects = [
         ShojiRuntimeBridge,
@@ -2782,6 +3039,7 @@ impl EmbeddedRuntime {
         script_path: PathBuf,
         config_path: PathBuf,
         working_dir: Option<PathBuf>,
+        host: Option<shojiwm_lib::runtime_api::RuntimeHost>,
     ) -> Result<Self, String> {
         let bridge_id = NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed);
         let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2820,6 +3078,7 @@ impl EmbeddedRuntime {
                     &script_path,
                     &config_path,
                     working_dir.as_deref(),
+                    host,
                     &ready_tx,
                 );
                 shojiwm_lib::backend::overlay::close_owner(&overlay_owner_for_thread);
@@ -2916,6 +3175,12 @@ impl EmbeddedRuntime {
         }
         if let Some(pacing) = slot.frame_pacing.take() {
             messages.push(HostMessage::FramePacing(pacing));
+        }
+        if let Some(compositions) = slot.output_compositions.take() {
+            messages.push(HostMessage::OutputCompositions(compositions));
+        }
+        if let Some(effect) = slot.background_effect.take() {
+            messages.push(HostMessage::BackgroundEffect(effect));
         }
         messages
     }
@@ -3077,6 +3342,7 @@ fn run_runtime(
     script_path: &PathBuf,
     config_path: &std::path::Path,
     working_dir: Option<&std::path::Path>,
+    host: Option<shojiwm_lib::runtime_api::RuntimeHost>,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     #[cfg(test)]
@@ -3116,6 +3382,9 @@ fn run_runtime(
         ..Default::default()
     })
     .map_err(|error| format!("failed to create RustyScript runtime: {error}"))?;
+    if let Some(host) = host {
+        runtime.deno_runtime().op_state().borrow_mut().put(host);
+    }
 
     runtime
         .set_current_dir(&runtime_working_dir)
@@ -3143,7 +3412,10 @@ fn run_runtime(
     // in V8's own arena instead of returning them to the OS. Hint V8 to
     // shrink its heap before `runtime` drops here, so this isolate's peak
     // doesn't linger past its own teardown.
-    runtime.deno_runtime().v8_isolate().low_memory_notification();
+    runtime
+        .deno_runtime()
+        .v8_isolate()
+        .low_memory_notification();
 
     result
 }

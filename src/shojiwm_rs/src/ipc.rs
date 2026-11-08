@@ -70,9 +70,16 @@ impl Client {
 }
 
 /// The socket path `shoji_wm/ipc` uses: `$XDG_RUNTIME_DIR/shojiwm-$WAYLAND_DISPLAY.sock`.
+///
+/// Inside the compositor the display is its own socket name, not
+/// `WAYLAND_DISPLAY`: the config runs before the compositor points that
+/// variable at itself, and nested in another compositor it would name the
+/// parent, whose IPC socket this would then replace.
 pub fn default_socket_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+    let display = crate::runtime::wayland_display()
+        .or_else(|| std::env::var("WAYLAND_DISPLAY").ok())
+        .unwrap_or_else(|| "wayland-0".into());
     PathBuf::from(runtime_dir).join(format!("shojiwm-{display}.sock"))
 }
 
@@ -148,17 +155,23 @@ impl IpcServer {
                                     let Ok(line) = line else {
                                         break;
                                     };
-                                    let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                                    let Ok(message) = serde_json::from_str::<Value>(line.trim())
+                                    else {
                                         continue;
                                     };
-                                    let Some(method) = message.get("method").and_then(Value::as_str) else {
+                                    let Some(method) =
+                                        message.get("method").and_then(Value::as_str)
+                                    else {
                                         continue;
                                     };
                                     sender.send(Request {
                                         client: client.clone(),
                                         id: message.get("id").filter(|id| !id.is_null()).cloned(),
                                         method: method.to_owned(),
-                                        params: message.get("params").cloned().unwrap_or(Value::Null),
+                                        params: message
+                                            .get("params")
+                                            .cloned()
+                                            .unwrap_or(Value::Null),
                                     });
                                 }
                                 client.alive.store(false, Ordering::Relaxed);
@@ -177,7 +190,11 @@ impl IpcServer {
 
     /// Answer `method`; the result (or error) goes back to the caller when
     /// it sent an `id`.
-    pub fn handle(&self, method: &str, handler: impl Fn(&Value) -> Result<Value, String> + 'static) {
+    pub fn handle(
+        &self,
+        method: &str,
+        handler: impl Fn(&Value) -> Result<Value, String> + 'static,
+    ) {
         self.handlers
             .borrow_mut()
             .insert(method.to_owned(), Rc::new(handler));
@@ -201,7 +218,12 @@ impl IpcServer {
     pub fn client_count(&self) -> usize {
         self.clients
             .lock()
-            .map(|clients| clients.iter().filter(|client| client.alive.load(Ordering::Relaxed)).count())
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter(|client| client.alive.load(Ordering::Relaxed))
+                    .count()
+            })
             .unwrap_or(0)
     }
 

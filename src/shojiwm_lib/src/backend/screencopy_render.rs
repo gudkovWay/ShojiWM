@@ -16,12 +16,12 @@ use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Offscreen};
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
-use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
 
-use crate::backend::tty::TtyRenderElements;
-use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::screencopy::{
+    Screencopy, ScreencopyBuffer, ScreencopyManagerState, screencopy_shm_buffer_range,
+};
 use crate::state::ShojiWM;
 
 /// Render and submit all queued screencopies that target `output`.
@@ -32,17 +32,19 @@ use crate::state::ShojiWM;
 /// Render queued screencopies for `output`.
 ///
 /// `content_elements` is the output's normal render minus the cursor;
-/// `cursor_elements` is the cursor stack. The cursor is composited on top of
+/// `cursor_elements` is the cursor stack. `present_at` is the vblank this
+/// frame was rendered for. The cursor is composited on top of
 /// content only when the client requested `overlay_cursor=1`. That gives us
 /// HIDDEN vs EMBEDDED cursor modes for output captures, since our compositor's
 /// normal render path always includes the cursor.
-pub fn process_screencopy_queue_for_output(
+pub fn process_screencopy_queue_for_output<E: RenderElement<GlesRenderer>>(
     screencopy_state: &mut ScreencopyManagerState,
     loop_handle: &LoopHandle<'_, ShojiWM>,
     renderer: &mut GlesRenderer,
     output: &Output,
-    content_elements: &[TtyRenderElements],
-    cursor_elements: &[TtyRenderElements],
+    content_elements: &[E],
+    cursor_elements: &[E],
+    present_at: Option<std::time::Duration>,
 ) {
     timescope::scope!("screencopy queue output");
     let profile = crate::env_flag!("SHOJI_SCREENCOPY_PROFILE");
@@ -53,8 +55,37 @@ pub fn process_screencopy_queue_for_output(
 
     screencopy_state.with_queues_mut(|queue| {
         loop {
+            // A client that keeps several copies queued gets one frame per
+            // render, each `ready` held back to the vblank that frame is shown
+            // on: frames arrive at a steady display cadence with the content
+            // shown at that moment. A client with a single copy in flight gets
+            // `ready` right away instead — holding it back would make its next
+            // request miss the render-ahead frame and halve its frame rate.
+            let pipelined = queue.is_pipelined();
+            if pipelined && present_at.is_some() && queue.last_served_target == present_at {
+                if ShojiWM::motion_trace_enabled() {
+                    tracing::info!(
+                        output = %output_name,
+                        present_at_ms = present_at.map(|t| t.as_secs_f64() * 1000.0),
+                        "motion trace: screencopy skipped, vblank already served"
+                    );
+                }
+                return;
+            }
+            let queue_output = queue.last_output.clone();
             let (damage_tracker, front) = queue.split();
             let Some(front) = front else {
+                if pipelined
+                    && processed == 0
+                    && queue_output.as_ref() == Some(output)
+                    && ShojiWM::motion_trace_enabled()
+                {
+                    tracing::info!(
+                        output = %output_name,
+                        present_at_ms = present_at.map(|t| t.as_secs_f64() * 1000.0),
+                        "motion trace: screencopy starved, no copy queued"
+                    );
+                }
                 return;
             };
             if front.output() != output {
@@ -67,10 +98,10 @@ pub fn process_screencopy_queue_for_output(
                 ScreencopyBuffer::Shm(_) => "shm",
             };
             let render_started_at = std::time::Instant::now();
-            // Compose a per-frame element list by reference (TtyRenderElements
-            // isn't Clone-able as a whole). Cursor is included only when the
+            // Compose a per-frame element list by reference (render elements
+            // aren't Clone-able as a whole). Cursor is included only when the
             // client requested overlay_cursor (= EMBEDDED in portal terms).
-            let composed_refs: Vec<&TtyRenderElements> = if front.overlay_cursor() {
+            let composed_refs: Vec<&E> = if front.overlay_cursor() {
                 cursor_elements
                     .iter()
                     .chain(content_elements.iter())
@@ -104,7 +135,26 @@ pub fn process_screencopy_queue_for_output(
                         }
                         let has_sync = sync.is_some();
                         let screencopy = queue.pop();
-                        screencopy.submit_after_sync(false, sync, loop_handle);
+                        let ready_at = if pipelined { present_at } else { None };
+                        screencopy.submit_after_sync(false, sync, ready_at, loop_handle);
+                        if ShojiWM::motion_trace_enabled() {
+                            let now = std::time::Duration::from(
+                                smithay::utils::Clock::<smithay::utils::Monotonic>::new().now(),
+                            );
+                            tracing::info!(
+                                output = %output_name,
+                                present_at_ms = present_at.map(|t| t.as_secs_f64() * 1000.0),
+                                lead_ms = present_at
+                                    .map(|t| (t.as_secs_f64() - now.as_secs_f64()) * 1000.0),
+                                last_served_ms = queue
+                                    .last_served_target
+                                    .map(|t| t.as_secs_f64() * 1000.0),
+                                pipelined,
+                                "motion trace: screencopy served"
+                            );
+                        }
+                        queue.last_served_target = present_at;
+                        queue.last_output = Some(output.clone());
                         processed += 1;
                         if profile {
                             tracing::info!(
@@ -115,6 +165,9 @@ pub fn process_screencopy_queue_for_output(
                                 with_damage,
                                 "screencopy: submitted frame"
                             );
+                        }
+                        if pipelined {
+                            return;
                         }
                     }
                     None => {
@@ -151,19 +204,16 @@ pub fn process_screencopy_queue_for_output(
 }
 
 /// `(sync point, damage regions)` produced by a screencopy render pass.
-type ScreencopyRenderResult = Result<
-    (Option<SyncPoint>, Option<Vec<Rectangle<i32, Physical>>>),
-    Box<dyn std::error::Error>,
->;
+type ScreencopyRenderResult =
+    Result<(Option<SyncPoint>, Option<Vec<Rectangle<i32, Physical>>>), Box<dyn std::error::Error>>;
 
-fn render_for_screencopy(
+fn render_for_screencopy<E: RenderElement<GlesRenderer>>(
     renderer: &mut GlesRenderer,
     output: &Output,
-    elements: &[&TtyRenderElements],
+    elements: &[&E],
     damage_tracker: &mut OutputDamageTracker,
     screencopy: &Screencopy,
-) -> ScreencopyRenderResult
-{
+) -> ScreencopyRenderResult {
     use smithay::output::OutputModeSource;
 
     let OutputModeSource::Static {
@@ -187,8 +237,7 @@ fn render_for_screencopy(
     let relocated_elements = elements
         .iter()
         .map(|element| {
-            // `element` is `&&TtyRenderElements`; deref once so the wrapped
-            // type stays `&TtyRenderElements`.
+            // `element` is `&&E`; deref once so the wrapped type stays `&E`.
             RelocateRenderElement::from_element(
                 *element,
                 region_loc.upscale(-1),
@@ -276,24 +325,78 @@ fn render_to_shm(
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     timescope::scope!("screencopy render_to_shm");
-    shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
-        if !(buffer_data.format == wl_shm::Format::Xrgb8888
-            && buffer_data.width == size.w
-            && buffer_data.height == size.h
-            && buffer_data.stride == size.w * 4
-            && shm_len == buffer_data.stride as usize * buffer_data.height as usize)
-        {
+    shm::with_buffer_contents_mut(buffer, |shm_buffer, pool_len, buffer_data| {
+        let Some(buffer_range) = screencopy_shm_buffer_range(pool_len, buffer_data, size) else {
             return Err::<(), Box<dyn std::error::Error>>("invalid shm buffer format/size".into());
-        }
+        };
         let mapping =
             render_and_download(renderer, size, scale, transform, Fourcc::Xrgb8888, elements)?;
         let bytes = renderer.map_texture(&mapping)?;
         unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
+            copy_frame_to_shm(shm_buffer, pool_len, buffer_range, bytes)?;
         }
         Ok(())
     })??;
     Ok(())
+}
+
+unsafe fn copy_frame_to_shm(
+    pool: *mut u8,
+    pool_len: usize,
+    buffer_range: std::ops::Range<usize>,
+    frame: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if buffer_range.start > buffer_range.end || buffer_range.end > pool_len {
+        return Err("shm buffer lies outside its pool".into());
+    }
+    let buffer_len = buffer_range.end - buffer_range.start;
+    if frame.len() < buffer_len {
+        return Err("downloaded frame is smaller than the buffer".into());
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(frame.as_ptr(), pool.add(buffer_range.start), buffer_len);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shm_copy_leaves_bytes_outside_buffer_untouched() {
+        let mut pool = vec![0xA5; 10];
+        let frame = [1, 2, 3, 4];
+
+        unsafe {
+            copy_frame_to_shm(pool.as_mut_ptr(), pool.len(), 3..7, &frame).unwrap();
+        }
+
+        assert_eq!(pool, [0xA5, 0xA5, 0xA5, 1, 2, 3, 4, 0xA5, 0xA5, 0xA5]);
+    }
+
+    #[test]
+    fn shm_copy_rejects_a_short_frame_without_writing() {
+        let mut pool = vec![0xA5; 10];
+
+        let result = unsafe { copy_frame_to_shm(pool.as_mut_ptr(), pool.len(), 3..7, &[1, 2, 3]) };
+
+        assert!(result.is_err());
+        assert_eq!(pool, [0xA5; 10]);
+    }
+
+    #[test]
+    fn shm_copy_rejects_invalid_ranges_without_writing() {
+        let mut pool = vec![0xA5; 10];
+        let frame = [1, 2, 3, 4];
+        let reversed_range = std::ops::Range { start: 7, end: 3 };
+
+        for range in [8..12, reversed_range] {
+            let result = unsafe { copy_frame_to_shm(pool.as_mut_ptr(), pool.len(), range, &frame) };
+            assert!(result.is_err());
+        }
+        assert_eq!(pool, [0xA5; 10]);
+    }
 }
 
 fn render_and_download(

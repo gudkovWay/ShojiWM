@@ -95,6 +95,7 @@ COMPOSITOR.event.onFocus((window, focused) => {
 | --- | --- |
 | `onPointerMove(event)` / `onPointerMoveAsync(event)` | ポインターが移動したとき |
 | `onGestureSwipe(event)` / `onGestureSwipeAsync(event)` | マルチフィンガースワイプが進行したとき |
+| `onPointerRegion(event)` | [ポインター領域](./keybindings-and-pointer.md#ポインター領域)にポインターが入った・出た・押し込んだとき |
 | `onOutputChange(event)` | 出力が追加／削除／再構成されたとき |
 | `onInputDeviceChange(...)` | 入力デバイスのセットが変わったとき（ホットプラグ） |
 | `onCreateLayer(...)` / `onUpdateLayer(...)` / `onDestroyLayer(...)` | レイヤーシェルサーフェス（バー／ドック／壁紙）がマップ／更新／アンマップされたとき |
@@ -104,6 +105,13 @@ COMPOSITOR.event.onFocus((window, focused) => {
 `onPointerMove` と `onGestureSwipe` は、ネイティブランタイムブリッジを通じて
 コンポジターの入力経路上で同期実行されます。ウィンドウ管理状態を最小遅延で更新する
 短いハンドラではこちらを推奨します。ブロッキング I/O や重い処理は行わないでください。
+
+ポインターの移動が設定に届くのは、マウスの報告レートに関わらずディスプレイの
+リフレッシュごとに最大1回程度です。`onPointerMove`、`onPointerMoveAsync`、および
+`onWindowMove` / `onWindowResize` の `update` フェーズには最新の位置が渡され、
+`onPointerMove` の `delta` は前回のイベントからの移動量をすべて含みます。ボタン押下
+などの他の入力イベントより前に、必ず最新の位置が届きます。クライアントには従来どおり
+すべての報告が届きます。
 
 `onPointerMoveAsync` と `onGestureSwipeAsync` はランタイムワーカーで実行され、
 `Promise` を返せます。ランタイムが処理中の場合、高頻度な入力は途中のサンプルが

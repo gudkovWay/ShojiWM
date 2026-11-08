@@ -18,6 +18,38 @@ export interface WaylandWindowSnapshot {
   readonly interaction: WindowCompositionInteractionSnapshot;
   /** Output whose frames drive this window's runtime work. / このウィンドウのランタイム処理を駆動する出力。 */
   readonly outputName?: string;
+  /** What plasmashell asked for this window; absent without a plasma surface. / plasmashell がこのウィンドウに要求した内容。plasma surface が無ければ省略。 */
+  readonly plasma?: PlasmaSurfaceState;
+  /** The window's taskbar entry (global logical px), from KDE's `set_minimized_geometry`. / KDE の `set_minimized_geometry` によるタスクバー上の位置（グローバル論理 px）。 */
+  readonly minimizedGeometry?: WindowPosition;
+}
+
+/** The `role` of KDE's `org_kde_plasma_surface.set_role`. / KDE の `org_kde_plasma_surface.set_role` の役割。 */
+export type PlasmaSurfaceRole =
+  | "normal"
+  | "desktop"
+  | "panel"
+  | "onscreendisplay"
+  | "notification"
+  | "tooltip"
+  | "criticalnotification"
+  | "appletpopup";
+
+/**
+ * What plasmashell asked for one of its windows (Kickoff, tray popups, OSDs,
+ * notifications) through KDE's `org_kde_plasma_surface` protocol.
+ * plasmashell が自身のウィンドウ（Kickoff、トレイのポップアップ、OSD、通知）に
+ * KDE の `org_kde_plasma_surface` プロトコルで要求した内容。
+ */
+export interface PlasmaSurfaceState {
+  readonly role: PlasmaSurfaceRole;
+  /** Global logical position from `set_position`, if the shell sent one. / `set_position` によるグローバル論理座標（送られた場合のみ）。 */
+  readonly x?: number;
+  readonly y?: number;
+  readonly skipTaskbar: boolean;
+  readonly skipSwitcher: boolean;
+  /** A panel that wants keyboard focus (e.g. for a search field). / キーボードフォーカスを求めるパネル（検索欄など）。 */
+  readonly panelTakesFocus: boolean;
 }
 
 export type WindowDecorationMode = "client" | "server";
@@ -55,6 +87,22 @@ export type WindowDecorationResolver = (
   context: WindowDecorationContext,
 ) => WindowDecorationDecision;
 
+/**
+ * The process of a client that bound the legacy KDE decoration manager. It
+ * has no window yet, so there is no app id or title.
+ */
+export interface WindowDecorationClient {
+  readonly pid?: number;
+  /** `/proc/<pid>/exe`, e.g. `/usr/bin/thunar`, when readable. */
+  readonly executable?: string;
+  /** The command line, split into its arguments. */
+  readonly command: readonly string[];
+}
+
+export type KdeDefaultDecorationResolver = (
+  client: WindowDecorationClient,
+) => WindowDecorationMode;
+
 export interface CompositorWindowDecorationController {
   /**
    * Register the policy that selects CSD (`client`) or SSD (`server`). The
@@ -62,6 +110,20 @@ export interface CompositorWindowDecorationController {
    * changes and during config reload.
    */
   configure(resolver: WindowDecorationResolver): void;
+  /**
+   * Choose the default mode the legacy KDE decoration protocol announces to
+   * each client. GTK 3 applications (Thunar, ...) decide on their own title
+   * bar from this alone, once at startup, and ignore later per-window
+   * answers from `configure`; return `server` to have them leave the title
+   * bar to the compositor. Without a resolver the default is `client`.
+   *
+   * The resolver runs once per client, when it starts, so a change applies
+   * to applications started afterwards. Applications that draw their own
+   * title bar anyway (Firefox, GTK header bars) still ask for CSD, and
+   * `configure` should keep honoring that request: forcing `server` on
+   * them gives two title bars.
+   */
+  kdeDefaultMode(resolver: KdeDefaultDecorationResolver): void;
 }
 
 export type WaylandLayerKind = "background" | "bottom" | "top" | "overlay";
@@ -211,6 +273,22 @@ export interface WaylandWindow {
   readonly isTransient: import("./signals").ReadonlySignal<boolean>;
   /** `id` of the parent window if this is a transient, otherwise `undefined`. / トランジェントの場合は親ウィンドウの `id`、そうでない場合は `undefined`。 */
   readonly parentId: import("./signals").ReadonlySignal<string | undefined>;
+  /**
+   * Role and position plasmashell asked for this window (KDE
+   * `org_kde_plasma_surface`); `undefined` for every other window.
+   * plasmashell がこのウィンドウに要求した役割と位置（KDE
+   * `org_kde_plasma_surface`）。それ以外のウィンドウでは `undefined`。
+   */
+  readonly plasma: import("./signals").ReadonlySignal<PlasmaSurfaceState | undefined>;
+  /**
+   * Where the taskbar shows this window (global logical px), from KDE's
+   * `org_kde_plasma_window.set_minimized_geometry`; `undefined` when no
+   * taskbar set one. A minimize animation can fly the window there.
+   * KDE の `org_kde_plasma_window.set_minimized_geometry` によるタスクバー上の
+   * 位置（グローバル論理 px）。未設定なら `undefined`。最小化アニメーションの
+   * 行き先に使えます。
+   */
+  readonly minimizedGeometry: import("./signals").ReadonlySignal<WindowPosition | undefined>;
   /** Window icon provided by the client or resolved from the desktop entry. / クライアントまたはデスクトップエントリから提供されるウィンドウアイコン。 */
   readonly icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   /** Current pointer/drag interaction state for use in composition code. / 合成コードで使用するポインター・ドラッグの現在のインタラクション状態。 */
@@ -510,7 +588,8 @@ export type CompositionNodeType =
   | "Window"
   | "WindowBorder"
   | "Popup"
-  | "Fragment";
+  | "Fragment"
+  | "DragIcon";
 
 /**
  * Base props inherited by all composition components.
@@ -996,6 +1075,11 @@ export interface CompositorEffectConfig {
    * オプトインし、コンポジターがその領域の背後にのみこのエフェクトを描画します。
    * `null` で無効化。
    *
+   * May be a signal, and shader uniforms inside it may be signals too: the
+   * compositor picks up a new value on the next frame.
+   * Signal にでき、中のシェーダーユニフォームにも Signal を使えます。値が変わると
+   * 次のフレームから反映されます。
+   *
    * @example
    * ```ts
    * COMPOSITOR.effect.background_effect = compileEffect({
@@ -1004,7 +1088,7 @@ export interface CompositorEffectConfig {
    * });
    * ```
    */
-  background_effect: CompiledEffectHandle | null;
+  background_effect: MaybeSignal<CompiledEffectHandle | null>;
   /**
    * Per-window effect factory. Called once per mapped toplevel; return `null`
    * to apply no effect to that window.
@@ -1149,6 +1233,30 @@ export interface CompositorRenderingConfig {
    * ```
    */
   framePacing?: FramePacing | ((output: OutputInfo) => FramePacing);
+  /**
+   * How each output is put together. Return the default stacking
+   * (`<DefaultComposition />`) or rearrange it: render parts into textures
+   * with `renderTexture`, draw them flat with `<TextureView>` or in 3D with
+   * `<Scene3D>`/`<Plane>`, show windows of hidden workspaces with
+   * `<Windows windows={...} />`. Re-evaluated only when signals it reads
+   * change. Session lock, cursor and error overlays always stay on top.
+   * Without it every output uses the default stacking.
+   *
+   * 各出力の組み立て方。既定の重なり（`<DefaultComposition />`）を返すか、
+   * 組み替えます: `renderTexture` で一部をテクスチャに描き、`<TextureView>` で平面に、
+   * `<Scene3D>`/`<Plane>` で 3D に描き、`<Windows windows={...} />` で非表示の
+   * ワークスペースのウィンドウも表示できます。読んだ signal が変わったときだけ
+   * 再評価されます。ロック画面・カーソル・エラー表示は常に最前面です。
+   * 未設定ならすべての出力が既定の重なりです。
+   *
+   * @example
+   * ```tsx
+   * COMPOSITOR.rendering.composition = (output) => <DefaultComposition />;
+   * ```
+   */
+  composition?: (
+    output: OutputInfo,
+  ) => import("./types").CompositionRenderable | import("./types").CompositionRenderable[];
 }
 
 /** Frame pacing of an output; see `COMPOSITOR.rendering.framePacing`. / 出力のフレームの出し方。 */
@@ -1158,6 +1266,25 @@ export interface OutputMode {
   width: number;
   height: number;
   refreshRate: number;
+  /**
+   * DRM pixel clock in kHz. Absent on backends with no DRM mode behind them.
+   * Cannot be derived from the fields above — blanking is time actually spent
+   * transmitting, so 3840x2160@60 clocks at 594 MHz, not the 497.7 MHz its
+   * active pixels imply. Link-bandwidth arithmetic must use this.
+   * DRM のピクセルクロック（kHz）。ブランキングを含むため上記の値からは
+   * 算出できません。帯域計算にはこの値を使ってください。
+   */
+  clockKhz?: number;
+}
+
+/** What an HDMI sink says its link can carry. / HDMI シンクのリンク能力。 */
+export interface HdmiLinkInfo {
+  /** Inferred from what the sink advertises, e.g. "HDMI 2.0". */
+  standard: string;
+  /** Max TMDS character rate in kHz, when the sink states one. */
+  maxTmdsKhz?: number;
+  /** Total usable link bandwidth in Gbit/s. */
+  maxBandwidthGbps?: number;
 }
 
 /** Panel power for `COMPOSITOR.output.setPower`. / `COMPOSITOR.output.setPower` で指定する電源状態。 */
@@ -1253,6 +1380,85 @@ export interface OutputExtendConfigEntry {
    * （多くのパネルでは `"unknown"`）のままになります。
    */
   subpixel?: OutputSubpixel;
+  /**
+   * Drive this output as HDR10 (PQ/BT.2020 signaling) when its EDID
+   * advertises ST 2084 support; ignored otherwise. Experimental. `true` uses
+   * the defaults; an object sets the HDR settings and turns HDR on (unless it
+   * says `enabled: false`). SDR content keeps its look at `sdrLuminance`; HDR
+   * content from color-managed clients (Chrome, mpv, games) is shown up to the
+   * display's peak.
+   * この出力の EDID が ST 2084 対応を示す場合、HDR10(PQ/BT.2020)で
+   * 駆動します（実験的機能）。`true` は既定の設定で、オブジェクトを渡すと
+   * HDR の設定をしたうえで HDR を有効にします（`enabled: false` を除く）。
+   * SDR の内容は `sdrLuminance` の明るさでそのまま表示され、色管理に対応した
+   * クライアント（Chrome・mpv・ゲーム）の HDR の内容はディスプレイの最大輝度
+   * まで表示されます。
+   */
+  hdr?: boolean | OutputHdrConfig;
+  /**
+   * Path of this monitor's ICC profile (`~/` allowed), e.g. one made with
+   * DisplayCAL. Colors are converted from sRGB to what the profile describes,
+   * calibration curves (`vcgt`) included. Applied while the output runs SDR;
+   * an HDR output ignores it.
+   * このモニターの ICC プロファイルのパス（`~/` 可）。DisplayCAL などで作成した
+   * ものを指定します。色を sRGB からプロファイルが示すモニターの特性へ変換し、
+   * キャリブレーションカーブ（`vcgt`）も適用します。SDR で動作している間だけ
+   * 有効で、HDR の出力では無視されます。
+   */
+  icc?: string;
+}
+
+/**
+ * HDR settings of an output (`hdr: { ... }`).
+ * 出力の HDR 設定（`hdr: { ... }`）。
+ */
+export interface OutputHdrConfig {
+  /**
+   * `false` keeps these settings but drives the output as SDR. Default `true`.
+   * `false` にすると設定を残したまま SDR で駆動します。既定は `true`。
+   */
+  enabled?: boolean;
+  /**
+   * What SDR white (ordinary windows) is shown at: a luminance in cd/m²
+   * (10..=1000), or `"backlight"` to follow the panel's brightness setting,
+   * which the panel itself ignores in HDR. Unset follows the backlight on
+   * panels that have one (laptops), else 203 (ITU-R BT.2408). HDR content
+   * above SDR white gets whatever is left up to the peak.
+   * SDR の白（通常のウィンドウ）を表示する明るさ。cd/m² の数値（10〜1000）か、
+   * パネルの明るさ設定に連動する `"backlight"`（HDR 中はパネル自体が明るさ
+   * 設定を無視するため）。省略時はバックライトのあるパネル（ノート PC）では
+   * 連動、それ以外は 203（ITU-R BT.2408）。SDR の白から最大輝度までが HDR の
+   * 内容に使われます。
+   */
+  sdrLuminance?: number | "backlight";
+  /**
+   * How colors are shown. `"native"` (default) stretches them over the
+   * panel's own gamut, as the panel itself does in SDR mode, so a wide-gamut
+   * panel looks the same with HDR on and off. It applies to all content alike,
+   * so color-managed clients (Chrome, HDR video) get the same vivid look as
+   * every other window. `"srgb"` shows exact colors, which look duller on such
+   * a panel.
+   * 色の出し方。`"native"`（既定）は SDR モードのパネルと同じくパネル本来の
+   * 色域に広げて表示し、広色域パネルでも HDR のオン・オフで見た目が変わり
+   * ません。すべての内容に同じく効くので、色管理に対応したクライアント
+   * （Chrome や HDR 動画）も他のウィンドウと同じ鮮やかさになります。`"srgb"` は
+   * 正確な色で、そうしたパネルではくすんで見えます。
+   */
+  sdrGamut?: "native" | "srgb";
+  /**
+   * Real peak luminance of this display in cd/m². Only needed when the EDID
+   * advertises ST 2084 but omits its luminance fields, which is common — the
+   * compositor otherwise has to assume 1000. Ignored outside 50..=10000.
+   * このディスプレイの実際の最大輝度（cd/m²）。EDID が ST 2084 対応を示し
+   * ながら輝度情報を持たない場合にのみ必要です（その場合は 1000 と仮定され
+   * ます）。50〜10000 の範囲外は無視されます。
+   */
+  maxLuminance?: number;
+  /**
+   * Real black level of this display in cd/m². Ignored outside 0..=10.
+   * このディスプレイの実際の黒レベル（cd/m²）。0〜10 の範囲外は無視されます。
+   */
+  minLuminance?: number;
 }
 
 export interface OutputDisabledConfigEntry {
@@ -1309,6 +1515,21 @@ export interface OutputStateSnapshot {
    */
   detectedSubpixel?: OutputSubpixel;
   availableModes: OutputMode[];
+  /** EDID advertises HDR (CTA-861 static metadata block). */
+  hdrSupported: boolean;
+  /**
+   * Link capability for HDMI connectors. Absent for non-HDMI outputs and for
+   * sinks publishing no vendor block.
+   *
+   * Supporting HDR and being able to deliver it are different questions. PQ
+   * needs 10 bits per component, which costs `pixelClock * 10/8` of TMDS
+   * character rate; 3840x2160@60 therefore needs 742.5 MHz and does not fit
+   * HDMI 2.0's 600 MHz ceiling, even on a sink whose EDID advertises both the
+   * mode and ST 2084. The driver then falls back to 8 bpc or subsampled
+   * chroma, and PQ tolerates neither.
+   * HDMI コネクタのリンク能力。HDR 対応と実際に伝送できるかは別問題です。
+   */
+  hdmi?: HdmiLinkInfo;
 }
 
 export interface OutputInfo extends OutputStateSnapshot {
@@ -1416,8 +1637,47 @@ export interface WorkspaceGroupConfig {
   workspaces: WorkspaceConfigEntry[];
 }
 
+/**
+ * One of KDE's virtual desktops (plasmashell's Pager shows them).
+ * KDE の仮想デスクトップ 1 つ（plasmashell の Pager に表示されます）。
+ */
+export interface VirtualDesktopEntry {
+  /**
+   * Activating the desktop sends `workspace.event.onActivate` with this id.
+   * デスクトップの activate はこの id で `workspace.event.onActivate` に届きます。
+   */
+  id: string;
+  name: string;
+  active?: boolean;
+  /** The windows on this desktop. / このデスクトップ上のウィンドウ。 */
+  windowIds?: string[];
+}
+
+/**
+ * KDE's virtual desktops (`org_kde_plasma_virtual_desktop_management`).
+ * KDE の仮想デスクトップ（`org_kde_plasma_virtual_desktop_management`）。
+ */
+export interface VirtualDesktopConfig {
+  /** In order: a desktop's position is its index. / 並び順がそのまま位置になります。 */
+  desktops: VirtualDesktopEntry[];
+  /** Rows the Pager lays the desktops out in (default 1). / Pager の行数（既定 1）。 */
+  rows?: number;
+  /**
+   * Windows that are really minimized (not just on another desktop).
+   * 本当に最小化されているウィンドウ（別デスクトップにいるだけのものは含めない）。
+   */
+  minimizedWindowIds?: string[];
+}
+
 export interface WorkspaceConfig {
   groups: WorkspaceGroupConfig[];
+  /**
+   * Also show the workspaces to KDE's Pager as virtual desktops. Leaving it
+   * out removes the desktops again.
+   * ワークスペースを KDE の Pager に仮想デスクトップとしても公開します。
+   * 省略するとデスクトップは削除されます。
+   */
+  virtualDesktops?: VirtualDesktopConfig;
 }
 
 export type WorkspaceConfigureFactory = () => WorkspaceConfig;
@@ -1425,6 +1685,31 @@ export type WorkspaceConfigureFactory = () => WorkspaceConfig;
 export interface WorkspaceActivateEvent {
   groupId?: string;
   workspaceId: string;
+}
+
+/**
+ * A client (an ext-workspace bar) asked to create a workspace.
+ * クライアント（ext-workspace 対応バー）がワークスペースの作成を要求したイベント。
+ */
+export interface WorkspaceCreateEvent {
+  /** The group (`WorkspaceGroupConfig.id`) to create it in. / 作成先のグループ。 */
+  groupId?: string;
+  /**
+   * The name the client asked for; the config decides what to create.
+   * クライアントが指定した名前。何を作るかは設定側が決めます。
+   */
+  name: string;
+}
+
+/**
+ * A client (KDE's Pager or taskbar) asked to move a window to a workspace.
+ * クライアント（KDE の Pager やタスクバー）がウィンドウをワークスペースへ
+ * 移動するよう要求したイベント。
+ */
+export interface WorkspaceMoveWindowEvent {
+  /** A `virtualDesktops` desktop id. / `virtualDesktops` のデスクトップ id。 */
+  workspaceId: string;
+  windowId: string;
 }
 
 export interface WorkspaceController {
@@ -1448,6 +1733,24 @@ export interface WorkspaceController {
      * 呼ばれます。
      */
     onActivate(listener: (event: WorkspaceActivateEvent) => void): () => void;
+    /**
+     * Called when a client such as KDE's Pager asks to move a window to a
+     * workspace (only with `virtualDesktops` configured).
+     * KDE の Pager などのクライアントがウィンドウをワークスペースへ移動するよう
+     * 要求したときに呼ばれます（`virtualDesktops` 設定時のみ）。
+     */
+    onMoveWindow(listener: (event: WorkspaceMoveWindowEvent) => void): () => void;
+    /**
+     * Called when a client such as a bar asks to create a workspace
+     * (ext-workspace `create_workspace`). Bars are offered the request only
+     * while a listener is registered. Publish the new workspace from
+     * `configure` (and call `reconfigure`) so the client sees it.
+     * バーなどのクライアントがワークスペースの作成を要求したときに呼ばれます
+     * （ext-workspace の `create_workspace`）。リスナーがある間だけバーに
+     * この要求を許可します。新しいワークスペースは `configure` から公開し
+     * （`reconfigure` を呼び）、クライアントに見えるようにしてください。
+     */
+    onCreate(listener: (event: WorkspaceCreateEvent) => void): () => void;
   };
 }
 
@@ -1652,17 +1955,32 @@ export type KeyBindingEventPhase = "press" | "release";
 
 export interface KeyBindingOptions {
   on?: KeyBindingEventPhase;
+  /**
+   * Tap bindings (a bare modifier with `on: "release"`) only: fire only when
+   * the modifier is released within this many ms of being pressed, so holding
+   * it for a while (a drag, a combination never completed) does not trigger it.
+   * タップバインド（修飾キー単体＋`on: "release"`）専用: 押してからこの ms 以内に
+   * 離したときだけ発火します。長押し（ドラッグや途中でやめた組み合わせ）では発火しません。
+   */
+  within?: number;
 }
 
 /**
- * Registers compositor-level keyboard and discrete mouse-wheel shortcuts.
- * コンポジターレベルのキーボードおよびマウスホイールショートカットを登録します。
+ * Registers compositor-level keyboard, side-button and discrete mouse-wheel shortcuts.
+ * コンポジターレベルのキーボード、サイドボタンおよびマウスホイールショートカットを登録します。
  *
  * Shortcuts are identified by a string `id` (shown in help UIs). The `shortcut`
  * string uses modifier+key notation such as `"Super+T"`, `"Super+Shift+Left"`,
- * or `"Super+WheelScrollUp"`.
+ * `"Super+WheelScrollUp"` or `"Super+MouseForward"`.
+ * `MouseBack` and `MouseForward` use the standard Linux side-button codes.
+ * Side-button shortcuts only accept `on: "press"`; their release is consumed
+ * with the press, while unmatched buttons keep reaching applications.
  * ショートカットは文字列 `id` で識別されます（ヘルプ UI などに表示されます）。
- * `shortcut` は `"Super+T"` や `"Super+Shift+Left"` のような記法を使います。
+ * `shortcut` は `"Super+T"`、`"Super+Shift+Left"`、`"Super+WheelScrollUp"`、
+ * `"Super+MouseForward"` のような記法を使います。
+ * `MouseBack` と `MouseForward` は Linux 標準のサイドボタンのコードを使います。
+ * サイドボタンのショートカットは `on: "press"` のみ指定でき、リリースも押下と一緒に
+ * 消費されます。一致しなかったボタンはこれまでどおりアプリケーションに届きます。
  *
  * @example
  * ```ts
@@ -1676,7 +1994,7 @@ export interface KeyBindingOptions {
  */
 export interface KeyBindingController {
   /**
-   * Register a keyboard or mouse-wheel shortcut. `id` must be unique;
+   * Register a keyboard, side-button or mouse-wheel shortcut. `id` must be unique;
    * registering the same id twice replaces the previous binding.
    * ショートカットを登録します。`id` は一意である必要があります。
    * 同じ `id` を2回登録すると前のバインドが上書きされます。
@@ -1721,6 +2039,132 @@ export interface PointerController {
    * えーと、マウスの右クリック、ウィンドウのサイズ変更
    */
   bindWindowResizeModifier(modifier: string): void;
+
+  /**
+   * Define (or replace) the pointer region `id`: a rectangle placed on each
+   * output (or only `options.output`) by `anchor`, then moved by `offset`.
+   * The compositor hit-tests it on every pointer motion and reports only
+   * transitions through `COMPOSITOR.event.onPointerRegion`.
+   * ポインター領域 `id` を定義（同じ id なら置き換え）します。各出力（または
+   * `options.output` のみ）に `anchor` で配置し `offset` でずらした矩形です。
+   * 判定はポインター移動ごとにコンポジター側で行い、出入りだけが
+   * `COMPOSITOR.event.onPointerRegion` に届きます。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.pointer.defineRegion("top-strip", {
+   *   anchor: "top",
+   *   size: { width: 400, height: 2 },
+   *   outerEdgesOnly: true,
+   * });
+   * ```
+   */
+  defineRegion(id: string, options: PointerRegionOptions): void;
+
+  /**
+   * Remove the pointer region `id` (no `leave` is reported).
+   * ポインター領域 `id` を削除します（`leave` は届きません）。
+   */
+  removeRegion(id: string): void;
+
+  /**
+   * A hot corner: `handler` runs when the pointer reaches `corner` (after
+   * `delay` ms there, or once pushed `pressure` px into it). Built on
+   * `defineRegion` with the region id `hot-corner:<id>`; binding the same
+   * `id` again replaces it. Returns a function that removes it.
+   * ホットコーナー: ポインターが `corner` に届いたとき（`delay` ms 留まった後、
+   * または `pressure` px 押し込んだとき）に `handler` を実行します。
+   * `defineRegion`（領域 id は `hot-corner:<id>`）の上に作られたラッパーで、
+   * 同じ `id` で再登録すると置き換わります。戻り値の関数で解除できます。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.pointer.bindHotCorner("overview", "top-left", () => {
+   *   openWindowSwitcher();
+   * }, { delay: 150 });
+   * ```
+   */
+  bindHotCorner(
+    id: string,
+    corner: HotCorner,
+    handler: (event: import("./events").PointerRegionEvent) => void,
+    options?: HotCornerOptions,
+  ): () => void;
+}
+
+/**
+ * Where a pointer region sits on its output. The region's own point of the
+ * same name is placed on the output's: `"bottom-right"` puts the region's
+ * bottom-right corner on the output's bottom-right corner.
+ * 領域を出力のどこに置くか。領域の同名の点を出力の同名の点に合わせます
+ * （`"bottom-right"` なら領域の右下を出力の右下に）。
+ */
+export type PointerRegionAnchor =
+  | "top-left"
+  | "top"
+  | "top-right"
+  | "left"
+  | "center"
+  | "right"
+  | "bottom-left"
+  | "bottom"
+  | "bottom-right";
+
+export interface PointerRegionOptions {
+  /** Only this output. Default: a copy on every output. / 特定の出力のみ。省略時は全出力 */
+  output?: string;
+  /** Default `"top-left"`. */
+  anchor?: PointerRegionAnchor;
+  /**
+   * Moves the region after anchoring, in screen axes (x right, y down),
+   * logical px. 配置後の移動量（x は右、y は下が正、論理px）。
+   */
+  offset?: { x?: number; y?: number };
+  /** Logical px. The part outside the output is cut off. / 出力からはみ出た分は切り捨て */
+  size: { width: number; height: number };
+  /**
+   * Disable the region on an output where an edge it touches continues into
+   * another output (the pointer just passes through there). Default `false`.
+   * 領域が接する辺の先に別の出力が続く場合、その出力では無効にします
+   * （ポインターが通り抜けるだけなので）。既定 `false`。
+   */
+  outerEdgesOnly?: boolean;
+  /**
+   * Once inside, the region grows by this many px before the pointer counts
+   * as leaving, so jitter at its edge does not repeat `enter`. Default `0`.
+   * 入った後はこの px だけ領域を広げて判定し、縁での揺れで `enter` が
+   * 繰り返されないようにします。既定 `0`。
+   */
+  leaveMargin?: number;
+  /**
+   * Report a `pressure` event once the pointer, inside the region, has been
+   * pushed this many px against the edge of the output layout.
+   * 領域内で画面配置の端へこの px 押し込んだら `pressure` を1回通知します。
+   */
+  pressure?: number;
+  /** Inactive on an output showing a fullscreen window. Default `false`. / 全画面ウィンドウ表示中は無効 */
+  ignoreWhenFullscreen?: boolean;
+  /** Inactive while a pointer button is held (e.g. dragging). Default `false`. / ボタン押下中（ドラッグ中など）は無効 */
+  ignoreWhileButtonHeld?: boolean;
+}
+
+export type HotCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+
+export interface HotCornerOptions {
+  /** Only this output. Default: every output. / 特定の出力のみ。省略時は全出力 */
+  output?: string;
+  /** Side of the square corner region, logical px. Default `1`. / 角の正方形の一辺 */
+  size?: number;
+  /** Stay this many ms in the corner before `handler` runs. Default `0`. / 発火までの滞在時間 */
+  delay?: number;
+  /** Run on this much push into the corner instead of on entering it. / 入ったときではなく押し込み量で発火 */
+  pressure?: number;
+  /** Default `8`. See `PointerRegionOptions.leaveMargin`. */
+  leaveMargin?: number;
+  /** Default `true`. */
+  ignoreWhenFullscreen?: boolean;
+  /** Default `true`. */
+  ignoreWhileButtonHeld?: boolean;
 }
 
 export interface InputDeviceKindFlags {
@@ -1886,6 +2330,26 @@ export interface InputController {
    * 登録済みの `configure` ファクトリーを即時再実行します。
    */
   reconfigure(): void;
+  /**
+   * Take all keyboard, pointer button, scroll and swipe input until the
+   * returned grab is released, for modal UIs drawn by the compositor (a
+   * window switcher). Clients lose the pointer meanwhile; the cursor still
+   * moves. Key bindings do not fire while a grab is held. The compositor ends
+   * the grab itself (`onCancel`) when the screen locks or a handler throws.
+   * 返り値のグラブを解放するまで、キーボード・ポインタボタン・スクロール・スワイプの
+   * 入力をすべて受け取ります（ウィンドウスイッチャーなどのモーダル UI 用）。
+   * その間クライアントはポインタを失い、キーバインドは発火しません。
+   *
+   * @example
+   * ```ts
+   * const grab = COMPOSITOR.input.grab({
+   *   onKey(event) {
+   *     if (event.key === "Escape" && event.state === "pressed") grab.release();
+   *   },
+   * });
+   * ```
+   */
+  grab(options: import("./input-grab").InputGrabOptions): import("./input-grab").InputGrab;
 }
 
 /** Desktop cursor theme and logical size. / デスクトップカーソルのテーマと論理サイズ。 */
@@ -1912,6 +2376,139 @@ export interface CursorController {
   configure(config: CursorConfig): void;
   /** Reload the current theme and discard decoded cursor caches. / 現在のテーマをキャッシュ破棄して再読込します。 */
   reload(): void;
+
+  /**
+   * Move the cursor, either to global logical coordinates or to a point of an
+   * output placed like a pointer region (`anchor` defaults to `"center"`).
+   * Clients see it as an ordinary motion; `onPointerMove` does not fire, pointer
+   * regions do. Ignored while a client holds the pointer locked or confined,
+   * while a pointer button is held, and while the screen is locked.
+   * カーソルを移動します。全体の論理座標か、出力上の点（ポインター領域と同じ
+   * `anchor` 指定、既定は `"center"`）を指定します。クライアントには通常の移動として
+   * 届き、`onPointerMove` は発火せず、ポインター領域は判定されます。アプリがポインターを
+   * ロック・閉じ込め中、ボタン押下中、画面ロック中は無視されます。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.cursor.setPosition({ x: 800, y: 500 });
+   * COMPOSITOR.cursor.setPosition({ output: "DP-1", anchor: "center" });
+   * ```
+   */
+  setPosition(position: CursorPositionTarget): void;
+
+  /**
+   * Where the cursor is, as of the last pointer motion (`undefined` before the
+   * first one). / 直近のポインター移動時点のカーソル位置（最初の移動前は `undefined`）。
+   */
+  getPosition(): CursorPosition | undefined;
+
+  /**
+   * Ignore client pointer locks and confinements (a game holding the cursor)
+   * while `true`. The client is told its lock was released; a lock it made for
+   * one use only is gone, as when the cursor leaves its window.
+   * `true` の間、アプリによるカーソルのロック・閉じ込め（ゲームなど）を無視します。
+   * アプリにはロック解除が通知されます。1回限りのロックは、カーソルがウィンドウを
+   * 出たときと同じく消えます。
+   */
+  setAppLockIgnored(ignored: boolean): void;
+
+  /**
+   * Ignore client pointer locks while `modifier` (e.g. `"Super"`) is held, so
+   * the cursor can leave a game without quitting it. Built on
+   * `setAppLockIgnored`; the compositor tracks the modifier itself.
+   * `modifier`（例: `"Super"`）を押している間、アプリのロックを無視します。
+   * ゲームを終了せずにカーソルを外へ出せます。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.cursor.bindAppLockIgnoreModifier("Super");
+   * ```
+   */
+  bindAppLockIgnoreModifier(modifier: string): void;
+
+  /**
+   * Show `kind` everywhere, whatever the window under the pointer asks for,
+   * until called again; `"none"` hides the cursor, `null` gives it back to the
+   * windows. Takes precedence over the resize cursors of window borders too.
+   * Not shown in a nested (windowed) session, where the host draws the cursor.
+   * ポインターの下のウィンドウの指定に関係なく `kind` のカーソルを表示します（再度
+   * 呼ぶまで）。`"none"` で非表示、`null` でウィンドウ側の指定に戻します。ウィンドウ枠の
+   * リサイズカーソルより優先されます。ネスト（ウィンドウ内）実行ではホストが
+   * カーソルを描くため反映されません。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.dnd.event.onStart((drag) => {
+   *   const stop = effect(() => {
+   *     COMPOSITOR.cursor.overrideKind(drag.action.value === "none" ? "no-drop" : null);
+   *   });
+   *   drag.onEnd(() => {
+   *     stop();
+   *     COMPOSITOR.cursor.overrideKind(null);
+   *   });
+   * });
+   * ```
+   */
+  overrideKind(kind: CursorKind | "none" | null): void;
+}
+
+/**
+ * Cursor shapes, named like CSS `cursor` values.
+ * カーソルの形（CSS の `cursor` と同じ名前）。
+ */
+export type CursorKind =
+  | "default"
+  | "context-menu"
+  | "help"
+  | "pointer"
+  | "progress"
+  | "wait"
+  | "cell"
+  | "crosshair"
+  | "text"
+  | "vertical-text"
+  | "alias"
+  | "copy"
+  | "move"
+  | "no-drop"
+  | "not-allowed"
+  | "grab"
+  | "grabbing"
+  | "e-resize"
+  | "n-resize"
+  | "ne-resize"
+  | "nw-resize"
+  | "s-resize"
+  | "se-resize"
+  | "sw-resize"
+  | "w-resize"
+  | "ew-resize"
+  | "ns-resize"
+  | "nesw-resize"
+  | "nwse-resize"
+  | "col-resize"
+  | "row-resize"
+  | "all-scroll"
+  | "zoom-in"
+  | "zoom-out"
+  | "dnd-ask"
+  | "all-resize";
+
+export type CursorPositionTarget =
+  | { x: number; y: number }
+  | {
+      output: string;
+      /** Default `"center"`. */
+      anchor?: PointerRegionAnchor;
+      /** Moves the point after anchoring (x right, y down). */
+      offset?: { x?: number; y?: number };
+    };
+
+export interface CursorPosition {
+  x: number;
+  y: number;
+  /** The output under the cursor. */
+  outputName?: string;
 }
 
 export interface BorderValue {
@@ -1938,8 +2535,17 @@ export interface BoxShadowValue {
 }
 
 export interface WindowResizeHitArea {
+  /** Grab band outside the frame, added to the visible border. / ボーダーに加えてフレーム外側に広がるつかみ幅。 */
   edgePx?: MaybeSignal<number>;
+  /** Corner grab length along each edge, from the band's outer corner. / つかみ領域の外側の角から各辺に沿ったコーナー判定の長さ。 */
   cornerPx?: MaybeSignal<number>;
+  /**
+   * Grab band inside the frame, past the visible border: for frames drawn by
+   * the border's children (a title bar, side borders) that should resize from
+   * their outer edge. / ボーダーの内側に広がるつかみ幅。子要素で描いた枠
+   * （タイトルバーや左右の枠）の外縁でリサイズするためのものです。
+   */
+  insetPx?: MaybeSignal<number>;
 }
 
 export interface WindowBorderInteraction {
@@ -2015,6 +2621,12 @@ export interface SSDStyle {
   fontWeight?: MaybeSignal<FontWeight>;
   fontFamily?: MaybeSignal<FontFamily>;
   textAlign?: MaybeSignal<"start" | "center" | "end">;
+  /**
+   * `"ellipsis"`: a label too long for its box ends in "…" (default
+   * `"clip"`: it is cut off). / `"ellipsis"` で、枠に収まらないラベルの末尾を
+   * 「…」にします（既定の `"clip"` は切り落とし）。
+   */
+  textOverflow?: MaybeSignal<"clip" | "ellipsis">;
   lineHeight?: MaybeSignal<number>;
 }
 
@@ -2237,6 +2849,13 @@ export interface AppIconProps extends ComponentProps {
    * URL 文字列または `{ name?, bytes? }` を受け付けます。
    */
   icon?: MaybeSignal<WindowIcon | undefined>;
+  /**
+   * Image file drawn when the icon cannot be found (an app id without a
+   * theme icon, or no icon at all). Resolved like `<Image src>`.
+   * アイコンが見つからないとき（テーマにないアプリ ID やアイコンなし）に
+   * 描く画像ファイル。`<Image src>` と同じく解決されます。
+   */
+  fallback?: string;
   style?: SSDStyle;
   id?: string;
 }
@@ -2649,6 +3268,46 @@ export interface CompositorDefinition {
    */
   cursor: CursorController;
   /**
+   * Drag and drop: what is drawn while the user drags data between windows.
+   * ドラッグアンドドロップ：ウィンドウ間でデータをドラッグ中に描くもの。
+   *
+   * @example Fade the icon in, shrink it away on a drop, fly it back on a cancel
+   * / アイコンをフェードイン、ドロップで縮めて消し、キャンセルで元の位置へ戻す
+   * ```tsx
+   * const appear = animationVariable("drag-appear");
+   * const finish = animationVariable("drag-finish");
+   *
+   * COMPOSITOR.dnd.event.onStart((drag) => {
+   *   const a = drag.animation.variable(appear);
+   *   const f = drag.animation.variable(finish);
+   *   drag.animation.start(appear, { from: 0, to: 1, duration: 120 });
+   *   const [end, setEnd] = signal<DragEnd | null>(null);
+   *   const view = drag.show({
+   *     anchor: computed(() => (end.value ? "global" : "pointer")),
+   *     x: computed(() => {
+   *       const e = end.value;
+   *       if (!e) return 0;
+   *       return e.accepted ? e.position.x : e.position.x + (drag.origin.x - e.position.x) * f.value;
+   *     }),
+   *     y: computed(() => {
+   *       const e = end.value;
+   *       if (!e) return 0;
+   *       return e.accepted ? e.position.y : e.position.y + (drag.origin.y - e.position.y) * f.value;
+   *     }),
+   *     opacity: computed(() => a.value * (end.value?.accepted ? 1 - f.value : 1)),
+   *     scale: computed(() => 0.9 + 0.1 * a.value),
+   *   });
+   *   drag.onEnd((e) => {
+   *     setEnd(e);
+   *     drag.animation
+   *       .start(finish, { from: 0, to: 1, duration: e.accepted ? 150 : 250 })
+   *       .then(() => view.dispose());
+   *   });
+   * });
+   * ```
+   */
+  dnd: import("./dnd").DndController;
+  /**
    * Environment variable controller for child processes spawned by the compositor.
    * コンポジターが起動する子プロセスが継承する環境変数を管理します。
    *
@@ -2708,6 +3367,18 @@ export interface CompositorDefinition {
    * ```
    */
   pointer: PointerController;
+  /**
+   * Session-wide settings.
+   * セッション全体の設定。
+   *
+   * @example Start locked: the lock screen doubles as the login screen
+   * / ロックした状態で起動（ロック画面をログイン画面として使う）
+   * ```ts
+   * COMPOSITOR.session.startLocked = true;
+   * COMPOSITOR.process.once("locker", { command: ["hyprlock"] });
+   * ```
+   */
+  session: SessionController;
   runtime: RuntimeController;
   /**
    * Per-window scene-tree composition. Assign a function to control what chrome
@@ -2764,6 +3435,36 @@ export interface CompositorDefinition {
 
 export interface PreloadController {}
 
+export interface SessionController {
+  /** Select exact runtime roots behind a transparent lock; returns protocol lock state. */
+  configureLockBackground: typeof import("./session-lock").configureLockBackground;
+  /**
+   * Start with the session locked: only ext-session-lock surfaces (and any
+   * explicitly configured lock background roots) are drawn. Input reaches only
+   * the locker, until a locker (Quickshell's
+   * `WlSessionLock`, hyprlock, swaylock, ...) locks and then unlocks. The
+   * config has to start that locker itself. With automatic login this makes
+   * the lock screen the login screen. Default `false`.
+   *
+   * Read once, when the config first loads (set it at the top level of the
+   * config); a hot reload does not lock. A config that fails to load starts
+   * unlocked, since its locker would not start either. `Ctrl+Alt+F<n>` still
+   * switches VTs while locked, in case the locker never shows up.
+   *
+   * セッションをロックした状態で起動します。ロッカー（Quickshell の
+   * `WlSessionLock`、hyprlock、swaylock など）がロックして解除するまで、
+   * ext-session-lock のサーフェス以外は描画されず、入力もそこにしか届きません。
+   * ロッカーは設定側で起動してください。自動ログインと組み合わせると
+   * ロック画面がログイン画面になります。既定値は `false`。
+   *
+   * 設定の初回読み込み時に一度だけ読まれます（設定のトップレベルで指定して
+   * ください）。ホットリロードではロックしません。設定の読み込みに失敗した
+   * 場合はロッカーも起動しないため、ロックせずに起動します。ロッカーが現れない
+   * ときのため、ロック中も `Ctrl+Alt+F<n>` で VT を切り替えられます。
+   */
+  startLocked: boolean;
+}
+
 /**
  * Debug knobs. Toggles here are surfaced into compositor overlays / logs and
  * do not affect production behavior. Read-write properties take effect on the
@@ -2780,7 +3481,9 @@ export interface DebugController {
 
   /**
    * Enable or disable the built-in timescope profiler. Disabling after it was
-   * enabled dumps `summary.txt` and `report.html` under `~/shoji_wm/logs/`.
+   * enabled dumps `summary.txt` and `report.html` in the session log directory:
+   * `$XDG_STATE_HOME/shoji_wm/logs/`, defaulting to
+   * `~/.local/state/shoji_wm/logs/`, or `SHOJI_LOG_DIR` when set.
    */
   enableProfile(enabled: boolean): void;
 
@@ -2864,6 +3567,8 @@ export interface ReactiveWaylandWindowSignals {
   isResizable: import("./signals").ReadonlySignal<boolean>;
   isTransient: import("./signals").ReadonlySignal<boolean>;
   parentId: import("./signals").ReadonlySignal<string | undefined>;
+  plasma: import("./signals").ReadonlySignal<PlasmaSurfaceState | undefined>;
+  minimizedGeometry: import("./signals").ReadonlySignal<WindowPosition | undefined>;
   icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
   output: import("./signals").ReadonlySignal<string | undefined>;

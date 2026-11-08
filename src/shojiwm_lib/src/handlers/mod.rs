@@ -7,9 +7,9 @@ mod xwayland;
 // Wl Seat
 //
 
-use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
+use smithay::input::dnd::{DndGrabHandler, DndTarget, GrabType, Source};
 use smithay::input::keyboard::LedState;
-use smithay::input::pointer::{Focus, PointerHandle};
+use smithay::input::pointer::PointerHandle;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::desktop::{PopupKind, WindowSurfaceType, find_popup_root_surface, layer_map_for_output};
@@ -152,6 +152,9 @@ smithay::delegate_dispatch2!(ShojiWM);
 
 impl PointerConstraintsHandler for ShojiWM {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        if self.app_lock_ignored {
+            return;
+        }
         if pointer.current_focus().as_ref() != Some(surface) {
             return;
         }
@@ -235,29 +238,54 @@ impl SessionLockHandler for ShojiWM {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
-        crate::backend::overlay::close_all("Session locked");
-        self.output_overlays.clear();
-        self.session_lock_active = true;
-        self.layer_shell_on_demand_focus = None;
-        // Park the focus owner rather than dropping it: `unlock` restores it.
-        // Taken directly instead of through
-        // `set_window_keyboard_focus_target_surface` so the lock is not
-        // recorded as a focus change in `previous_window_keyboard_focus_owner`.
-        self.session_lock_focus_owner = self.window_keyboard_focus_owner.take();
-        self.window_keyboard_focus = None;
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(
-                self,
-                Option::<WlSurface>::None,
-                SERIAL_COUNTER.next_serial(),
-            );
+        // Only one client holds the lock: a second locker would be able to
+        // unlock it again (ext-session-lock-v1 says to refuse it). Dropping
+        // `confirmation` answers `finished`. A locker that died leaves the
+        // session locked, and a new one may take over.
+        if self
+            .session_locker
+            .as_ref()
+            .is_some_and(|locker| locker.is_alive())
+        {
+            tracing::warn!("refused a session lock: another client holds the lock");
+            return;
         }
+        // Already locked when a locker died, or when the session started
+        // locked: the session is hidden and focus parked already, and parking
+        // again would lose the owner `unlock` restores.
+        if !self.session_lock_active {
+            self.end_runtime_input_grab(Some("sessionLock"));
+            crate::backend::overlay::close_all("Session locked");
+            self.output_overlays.clear();
+            self.set_session_lock_active(true);
+            for targets in self.composition_targets.values_mut() {
+                targets.clear_presentation();
+            }
+            self.layer_shell_on_demand_focus = None;
+            // Park the focus owner rather than dropping it: `unlock` restores it.
+            // Taken directly instead of through
+            // `set_window_keyboard_focus_target_surface` so the lock is not
+            // recorded as a focus change in `previous_window_keyboard_focus_owner`.
+            self.session_lock_focus_owner = self.window_keyboard_focus_owner.take();
+            self.window_keyboard_focus = None;
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                keyboard.set_focus(
+                    self,
+                    Option::<WlSurface>::None,
+                    SERIAL_COUNTER.next_serial(),
+                );
+            }
+        }
+        self.session_lock_surfaces
+            .retain(|_, surface| surface.alive());
+        self.session_locker = Some(confirmation.ext_session_lock().clone());
         confirmation.lock();
         self.schedule_redraw();
     }
 
     fn unlock(&mut self) {
-        self.session_lock_active = false;
+        self.set_session_lock_active(false);
+        self.session_locker = None;
         self.session_lock_surfaces.clear();
         self.pointer_contents = crate::state::PointerContents::default();
         if let Some(keyboard) = self.seat.get_keyboard() {
@@ -293,6 +321,18 @@ impl SessionLockHandler for ShojiWM {
     }
 
     fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
+        // A client whose lock was refused can still create lock surfaces;
+        // they must not replace the lock screen of the client holding it.
+        let holder = self
+            .session_locker
+            .as_ref()
+            .and_then(|locker| locker.client());
+        if holder.is_none() || holder != surface.wl_surface().client() {
+            tracing::warn!(
+                "ignored a lock surface from a client that does not hold the session lock"
+            );
+            return;
+        }
         let Some(output) = self.output_for_lock_resource(&surface, &output) else {
             tracing::warn!("session lock surface could not be matched to an output");
             return;
@@ -309,12 +349,11 @@ impl SessionLockHandler for ShojiWM {
     }
 }
 
-// ext-image-capture-source-v1 + ext-image-copy-capture-v1 (Phase 5b-i skeleton)
+// ext-image-capture-source-v1 + ext-image-copy-capture-v1
 //
-// This wires up the protocol globals and the four handler traits. Actual
-// frame rendering is deferred to Phase 5b-ii (outputs reusing the existing
-// screencopy_render machinery) and 5b-iii (per-toplevel render). For now
-// `frame()` always fails with Unknown so clients see well-defined behaviour.
+// Output and toplevel (ext-foreign-toplevel-image-capture-source-v1) sources.
+// `frame()` only queues the request; the backend renders it on its next pass
+// (see `backend::image_copy_capture_render`).
 
 impl ImageCaptureSourceHandler for ShojiWM {
     fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
@@ -380,6 +419,17 @@ impl ImageCopyCaptureHandler for ShojiWM {
         // Route the frame to the next render pass for whichever output /
         // toplevel owns its source. The render code drains the queue.
         use crate::backend::image_copy_capture_render::{CaptureTarget, PendingCapture};
+
+        // The first frame of a session must not wait for the source to change,
+        // so make sure a render pass comes even when nothing is damaged. Later
+        // frames wait for the next pass, which is what the protocol asks for.
+        let first_frame = session
+            .user_data()
+            .get_or_insert(|| std::cell::Cell::new(true))
+            .replace(false);
+        if first_frame {
+            self.schedule_redraw();
+        }
 
         let draw_cursor = session.draw_cursor();
         let source = session.source();
@@ -482,6 +532,27 @@ fn resolve_source_size(
         }
     }
     None
+}
+
+impl crate::protocols::hyprland_toplevel_export::HyprlandToplevelExportHandler for ShojiWM {
+    fn hyprland_toplevel_export_state(
+        &mut self,
+    ) -> &mut crate::protocols::hyprland_toplevel_export::HyprlandToplevelExportState {
+        &mut self.hyprland_toplevel_export_state
+    }
+
+    fn hyprland_toplevel_export_size(
+        &self,
+        handle: &crate::wlr_foreign_toplevel::WlrForeignToplevelHandle,
+    ) -> Option<smithay::utils::Size<i32, smithay::utils::Buffer>> {
+        use crate::wlr_foreign_toplevel::WlrForeignToplevelManagerHandler;
+        let window = self.wlr_foreign_toplevel_window(handle)?;
+        crate::backend::image_copy_capture_render::compute_desired_buffer_size(&self.space, &window)
+    }
+
+    fn hyprland_toplevel_export_queued(&mut self) {
+        self.schedule_redraw();
+    }
 }
 
 impl XdgActivationHandler for ShojiWM {
@@ -911,10 +982,24 @@ impl DmabufHandler for ShojiWM {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
+        if let Some(import) = self.winit_dmabuf_import.as_mut() {
+            if import(&dmabuf) {
+                let _ = notifier.successful::<ShojiWM>();
+            } else {
+                notifier.failed();
+            }
+            return;
+        }
+        // Every output is rendered on the GPU clients render with (`tty_render_node`), so that
+        // is the one that has to take the buffer; another GPU importing it is no use.
+        let render_node = self
+            .tty_render_node
+            .filter(|node| self.tty_backends.contains_key(node));
         let imported = self
             .tty_backends
-            .values_mut()
-            .any(|backend| backend.renderer.import_dmabuf(&dmabuf, None).is_ok());
+            .iter_mut()
+            .filter(|(node, _)| render_node.is_none_or(|render_node| **node == render_node))
+            .any(|(_, backend)| backend.renderer.import_dmabuf(&dmabuf, None).is_ok());
 
         if imported || self.tty_backends.is_empty() {
             let _ = notifier.successful::<ShojiWM>();
@@ -956,30 +1041,32 @@ impl DataDeviceHandler for ShojiWM {
     }
 }
 
-impl DndGrabHandler for ShojiWM {}
+impl DndGrabHandler for ShojiWM {
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        validated: bool,
+        _seat: Seat<Self>,
+        location: smithay::utils::Point<f64, Logical>,
+    ) {
+        self.queue_end_drag(crate::dnd::DragEndKind::Dropped, validated, location);
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>, location: smithay::utils::Point<f64, Logical>) {
+        self.queue_end_drag(crate::dnd::DragEndKind::Cancelled, false, location);
+    }
+}
+
 impl WaylandDndGrabHandler for ShojiWM {
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,
-        _icon: Option<WlSurface>,
+        icon: Option<WlSurface>,
         seat: Seat<Self>,
         serial: Serial,
         type_: GrabType,
     ) {
-        match type_ {
-            GrabType::Pointer => {
-                let ptr = seat.get_pointer().unwrap();
-                let start_data = ptr.grab_start_data().unwrap();
-
-                // create a dnd grab to start the operation
-                let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
-                ptr.set_grab(self, grab, serial, Focus::Keep);
-            }
-            GrabType::Touch => {
-                // smallvil lacks touch handling
-                source.cancel();
-            }
-        }
+        self.start_drag(source, icon, seat, serial, type_);
     }
 }
 
@@ -1037,8 +1124,66 @@ impl crate::protocols::screencopy::ScreencopyHandler for ShojiWM {
     }
 }
 
+impl crate::protocols::color_management::ColorManagementHandler for ShojiWM {
+    fn color_management_state(
+        &mut self,
+    ) -> &mut crate::protocols::color_management::ColorManagementState {
+        &mut self.color_management_state
+    }
+
+    fn output_image_description(
+        &mut self,
+        wl_output: &smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) -> crate::color::ImageDescription {
+        Output::from_resource(wl_output)
+            .and_then(|output| {
+                self.output_color
+                    .get(output.name().as_str())
+                    .map(|state| state.description)
+            })
+            .unwrap_or(crate::color::ImageDescription::SRGB)
+    }
+
+    fn surface_preferred_description(
+        &mut self,
+        surface: &WlSurface,
+    ) -> crate::color::ImageDescription {
+        // What the surface is mostly shown on: the HDR10 signal of an HDR
+        // output, whose target volume tells the client how far past SDR white
+        // it may go, and sRGB everywhere else. A surface not shown yet has no
+        // primary output and gets sRGB; `refresh_preferred_descriptions` tells
+        // the client once that changes.
+        let output = smithay::wayland::compositor::with_states(surface, |states| {
+            smithay::desktop::utils::surface_primary_scanout_output(surface, states)
+        });
+        output
+            .and_then(|output| self.output_color.get(output.name().as_str()))
+            .filter(|color| matches!(color.mode, crate::color::OutputColorMode::Hdr10 { .. }))
+            .map_or(crate::color::ImageDescription::SRGB, |color| {
+                color.description
+            })
+    }
+
+    fn defer_image_description_info(
+        &mut self,
+        info: smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1,
+        description: crate::color::ImageDescription,
+    ) {
+        // Idle callbacks run after the current wayland dispatch completes,
+        // so the `done` destructor event cannot destroy the info object
+        // inside the dispatch that created it (wayland-backend would then
+        // write the object's data through a freed pointer; issue #1). If
+        // the client is gone by the time this runs, the sends are no-ops.
+        self.loop_handle.insert_idle(move |_state| {
+            crate::protocols::color_management::send_information(&info, &description);
+        });
+    }
+}
+
 crate::delegate_screencopy!(ShojiWM);
+crate::delegate_hyprland_toplevel_export!(ShojiWM);
 crate::delegate_tearing_control!(ShojiWM);
 crate::delegate_output_power!(ShojiWM);
+crate::delegate_color_management!(ShojiWM);
 crate::delegate_wlr_foreign_toplevel!(ShojiWM);
 crate::workspace_manager::delegate_ext_workspace_manager!(ShojiWM);

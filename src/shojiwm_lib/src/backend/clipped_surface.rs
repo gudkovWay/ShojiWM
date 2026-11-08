@@ -146,10 +146,119 @@ pub struct ClippedSurfaceElement {
     sample_buffer_size: [f32; 2],
     sample_uv_snap_axes: [f32; 2],
     sample_uv_compensation_enabled: f32,
+    /// Per-surface color management, resolved once at element construction.
+    /// `src_transfer == 0.0` is the untagged fast path and makes the shader
+    /// skip the conversion entirely, so nothing changes for sRGB clients.
+    color: SurfaceColor,
+}
+
+/// The shader's color-management uniforms for one surface.
+#[derive(Debug, Clone, Copy)]
+struct SurfaceColor {
+    /// See [`COLOR_UNIFORM_NAMES`] for the layout.
+    scalars: [f32; COLOR_UNIFORM_NAMES.len()],
+    /// Content primaries -> sRGB-relative compositing values, column-major.
+    src_to_compositing: [f32; 9],
 }
 
 #[derive(Debug)]
 struct ClippedSurfaceProgram(GlesTexProgram);
+
+/// The shader's color-management uniforms, in the order `color_uniforms`
+/// returns them.
+const COLOR_UNIFORM_NAMES: [&str; 7] = [
+    "src_transfer",
+    "src_ref_nits",
+    "src_pq_lo",
+    "src_pq_hi",
+    "dst_pq_hi",
+    "dst_headroom",
+    "encode_gamma",
+];
+
+/// The shader's color-management uniforms for a surface's image description,
+/// converted for the output being rendered (`crate::color::render_color_target`);
+/// see [`COLOR_UNIFORM_NAMES`]. `src_transfer == 0.0` is the passthrough
+/// (untagged, or sRGB in sRGB primaries).
+fn color_uniforms(image_description: Option<crate::color::ImageDescription>) -> SurfaceColor {
+    let target = crate::color::render_color_target();
+    // Into sRGB-relative values, whatever the compositing primaries are. The
+    // compositing space treats its values as sRGB-relative content that the
+    // encode then shows in `RenderColorTarget::primaries` — exact sRGB, or
+    // stretched over the panel's native gamut. Converting tagged content
+    // exactly into native primaries instead would leave it out of that
+    // stretch, and Chrome, which hands over even its SDR UI as PQ/BT.2020 on
+    // an HDR output, looked duller than every untagged window next to it. A
+    // per-pixel guess at "SDR-looking" pixels cannot tell UI from video
+    // midtones and bands at its threshold; one linear map for everything
+    // cannot.
+    let src_to_compositing = |primaries: crate::color::ColorPrimaries| {
+        crate::color::colorimetry::to_gl_mat3(
+            &crate::color::colorimetry::chromaticity_conversion_matrix(
+                primaries.chromaticities(),
+                crate::color::primaries::SRGB,
+            ),
+        )
+    };
+    match image_description {
+        Some(description) => {
+            let transfer = match description.tf {
+                // sRGB in sRGB primaries is what untagged content is, so it
+                // shares the untagged path — including being taken to be in
+                // the compositing primaries. In a wider gamut it still needs
+                // the matrix, so it takes the decode-only branch.
+                crate::color::TransferCharacteristics::Srgb
+                    if description.primaries == crate::color::ColorPrimaries::Srgb =>
+                {
+                    0.0
+                }
+                crate::color::TransferCharacteristics::Srgb => 3.0,
+                crate::color::TransferCharacteristics::St2084Pq => 1.0,
+                crate::color::TransferCharacteristics::ExtLinear => 2.0,
+            };
+            let luminances = description.effective_luminances();
+            // MaxCLL, or the declared maximum when it is missing or 0
+            // ("unknown"); see `ImageDescription::content_peak_nits`.
+            let max_nits = description.content_peak_nits();
+            // BT.2390 operates on PQ signals, so encode the knee here
+            // rather than paying four pow() calls per fragment for values
+            // that are constant across the surface.
+            let to_pq = |nits: f32| crate::color::colorimetry::pq_inverse_eotf(nits as f64) as f32;
+            SurfaceColor {
+                scalars: [
+                    transfer,
+                    luminances.reference,
+                    to_pq(luminances.min),
+                    to_pq(max_nits),
+                    // The content's reference white lands on compositing-space
+                    // 1.0, so the target peak is that white times the headroom.
+                    to_pq(luminances.reference * target.headroom),
+                    target.headroom,
+                    target.encode_gamma,
+                ],
+                src_to_compositing: src_to_compositing(description.primaries),
+            }
+        }
+        None => SurfaceColor {
+            scalars: [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                target.headroom,
+                target.encode_gamma,
+            ],
+            src_to_compositing: src_to_compositing(crate::color::ColorPrimaries::Srgb),
+        },
+    }
+}
+
+/// Whether content with this description needs converting into the
+/// compositing space, i.e. is anything but untagged or plain sRGB.
+pub fn needs_color_conversion(image_description: Option<crate::color::ImageDescription>) -> bool {
+    color_uniforms(image_description).scalars[0] != 0.0
+}
 
 fn clipped_uniforms_debug_enabled() -> bool {
     std::env::var_os("SHOJI_CLIPPED_UNIFORMS_DEBUG")
@@ -198,16 +307,7 @@ impl ClippedSurfaceElement {
         mask_rect
     }
 
-    pub fn new(
-        renderer: &mut GlesRenderer,
-        inner: WaylandSurfaceRenderElement<GlesRenderer>,
-        output_scale: Scale<f64>,
-        clip_scale: Scale<f64>,
-        output_origin: Point<i32, Logical>,
-        clip: ContentClip,
-        forced_geometry: Option<Rectangle<i32, Physical>>,
-        debug_label: Option<String>,
-    ) -> Result<Self, GlesError> {
+    fn program(renderer: &mut GlesRenderer) -> Result<GlesTexProgram, GlesError> {
         if renderer
             .egl_context()
             .user_data()
@@ -273,6 +373,38 @@ impl ClippedSurfaceElement {
                         "sample_uv_compensation_enabled",
                         smithay::backend::renderer::gles::UniformType::_1f,
                     ),
+                    UniformName::new(
+                        "src_transfer",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "src_to_compositing",
+                        smithay::backend::renderer::gles::UniformType::Matrix3x3,
+                    ),
+                    UniformName::new(
+                        "src_ref_nits",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "src_pq_lo",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "src_pq_hi",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "dst_pq_hi",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "dst_headroom",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
+                    UniformName::new(
+                        "encode_gamma",
+                        smithay::backend::renderer::gles::UniformType::_1f,
+                    ),
                 ],
             )?);
             renderer
@@ -281,11 +413,27 @@ impl ClippedSurfaceElement {
                 .insert_if_missing(|| compiled);
         }
 
-        let program = renderer
+        Ok(renderer
             .egl_context()
             .user_data()
             .get::<ClippedSurfaceProgram>()
-            .expect("clipped surface shader should be cached");
+            .expect("clipped surface shader should be cached")
+            .0
+            .clone())
+    }
+
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        inner: WaylandSurfaceRenderElement<GlesRenderer>,
+        output_scale: Scale<f64>,
+        clip_scale: Scale<f64>,
+        output_origin: Point<i32, Logical>,
+        clip: ContentClip,
+        forced_geometry: Option<Rectangle<i32, Physical>>,
+        debug_label: Option<String>,
+        image_description: Option<crate::color::ImageDescription>,
+    ) -> Result<Self, GlesError> {
+        let program = Self::program(renderer)?;
 
         let element_geometry = inner.geometry(output_scale);
         // ContentClip callers pass forced_geometry when the compositor has an explicit
@@ -370,12 +518,16 @@ impl ClippedSurfaceElement {
             // below) makes it flip by ±1px with the window's position phase
             // at fractional scales, so the corner mask trembles against the
             // window while it moves.
-            let elem_w_px = (element_rect_precise.width * output_scale_x).round().max(1.0);
-            let elem_h_px = (element_rect_precise.height * output_scale_y).round().max(1.0);
+            let elem_w_px = (element_rect_precise.width * output_scale_x)
+                .round()
+                .max(1.0);
+            let elem_h_px = (element_rect_precise.height * output_scale_y)
+                .round()
+                .max(1.0);
             let logical_per_px_x = element_rect_precise.width.max(0.0001) / elem_w_px;
             let logical_per_px_y = element_rect_precise.height.max(0.0001) / elem_h_px;
-            let left_px = ((clip.mask_rect_precise.x - clip.rect_precise.x) * output_scale_x)
-                .round();
+            let left_px =
+                ((clip.mask_rect_precise.x - clip.rect_precise.x) * output_scale_x).round();
             let top_px =
                 ((clip.mask_rect_precise.y - clip.rect_precise.y) * output_scale_y).round();
             let right_px = (((clip.mask_rect_precise.x + clip.mask_rect_precise.width)
@@ -517,10 +669,16 @@ impl ClippedSurfaceElement {
             }
         }
 
+        // Resolve the surface's color-management tag into shader uniforms once,
+        // here, rather than per-fragment. `src_transfer == 0.0` is the untagged
+        // path and makes the shader skip the conversion, so sRGB clients are
+        // byte-identical to before.
+        let color = color_uniforms(image_description);
+
         Ok(Self {
             inner,
             geometry: render_geometry,
-            program: program.0.clone(),
+            program,
             debug_label,
             slot_rect: snapped_slot_rect,
             mask_rect: snapped_mask_rect,
@@ -542,6 +700,49 @@ impl ClippedSurfaceElement {
             } else {
                 0.0
             },
+            color,
+        })
+    }
+
+    /// The color-management conversion alone, for a tagged surface that is not
+    /// clipped: an untransformed root surface with no ancestor clip, or a
+    /// subsurface. Nothing is cropped — the slot and mask cover the whole
+    /// element with square corners — so it draws like the raw surface element
+    /// apart from the conversion.
+    pub fn color_only(
+        renderer: &mut GlesRenderer,
+        inner: WaylandSurfaceRenderElement<GlesRenderer>,
+        output_scale: Scale<f64>,
+        image_description: crate::color::ImageDescription,
+    ) -> Result<Self, GlesError> {
+        let program = Self::program(renderer)?;
+        let geometry = inner.geometry(output_scale);
+        let output_scale = output_scale.x.abs().max(0.0001) as f32;
+        let whole_element = SnappedLogicalRect {
+            x: 0.0,
+            y: 0.0,
+            width: geometry.size.w as f32 / output_scale,
+            height: geometry.size.h as f32 / output_scale,
+        };
+        let color = color_uniforms(Some(image_description));
+        Ok(Self {
+            inner: ClippedSurfaceInner::Mapped(inner),
+            geometry,
+            program,
+            debug_label: None,
+            slot_rect: whole_element,
+            mask_rect: whole_element,
+            corner_radius: [0.0; 4],
+            rect_bounds_enabled: 0.0,
+            output_scale,
+            clip_scale: output_scale,
+            sample_uv_tl: [0.0; 2],
+            sample_uv_br: [1.0; 2],
+            adjusted_sample_uv_br: [1.0; 2],
+            sample_buffer_size: [1.0; 2],
+            sample_uv_snap_axes: [0.0; 2],
+            sample_uv_compensation_enabled: 0.0,
+            color,
         })
     }
 
@@ -691,6 +892,21 @@ impl ClippedSurfaceElement {
                 self.sample_uv_compensation_enabled,
             ),
         ]
+        .into_iter()
+        .chain(
+            COLOR_UNIFORM_NAMES
+                .iter()
+                .zip(self.color.scalars)
+                .map(|(name, value)| Uniform::new(*name, value)),
+        )
+        .chain([Uniform::new(
+            "src_to_compositing",
+            smithay::backend::renderer::gles::UniformValue::Matrix3x3 {
+                matrices: vec![self.color.src_to_compositing],
+                transpose: false,
+            },
+        )])
+        .collect()
     }
 }
 
@@ -851,7 +1067,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_sample_uv_compensation;
+    use super::{color_uniforms, compute_sample_uv_compensation};
     use cgmath::Vector2;
     use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
 
@@ -996,5 +1212,50 @@ mod tests {
         assert_eq!(snapped_with_absolute_global.y, 0.0);
         assert_eq!(snapped_with_absolute_global.width, 799.2);
         assert_eq!(snapped_with_absolute_global.height, 600.0);
+    }
+
+    /// Tagged content becomes sRGB-relative values on every target, so the
+    /// native-gamut stretch reaches it as it reaches untagged windows.
+    #[test]
+    fn tagged_content_is_converted_to_srgb_relative_values_on_every_target() {
+        use crate::color::colorimetry::{chromaticity_conversion_matrix, to_gl_mat3};
+        use crate::color::primaries::{BT2020, Chromaticity, PrimariesChromaticities, SRGB};
+
+        let pq_bt2020 = crate::color::ImageDescription {
+            primaries: crate::color::ColorPrimaries::Bt2020,
+            tf: crate::color::TransferCharacteristics::St2084Pq,
+            luminances: None,
+            max_cll: None,
+            max_fall: None,
+            target_luminance: None,
+        };
+        let expected = to_gl_mat3(&chromaticity_conversion_matrix(BT2020, SRGB));
+        let native = PrimariesChromaticities {
+            red: Chromaticity {
+                x: 0.6826,
+                y: 0.3164,
+            },
+            green: Chromaticity {
+                x: 0.2451,
+                y: 0.7139,
+            },
+            blue: Chromaticity {
+                x: 0.1396,
+                y: 0.0439,
+            },
+            white: Chromaticity {
+                x: 0.3125,
+                y: 0.3291,
+            },
+        };
+        for primaries in [SRGB, native] {
+            let _target =
+                crate::color::RenderColorTargetGuard::new(crate::color::RenderColorTarget {
+                    headroom: 3.0,
+                    encode_gamma: 2.2,
+                    primaries,
+                });
+            assert_eq!(color_uniforms(Some(pq_bt2020)).src_to_compositing, expected);
+        }
     }
 }

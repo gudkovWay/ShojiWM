@@ -14,6 +14,7 @@ import {
   dualKawaseBlur,
   type SSDStyle,
   type WaylandWindow,
+  type WindowDecorationState,
   computed,
   useState,
   shaderStage,
@@ -26,6 +27,7 @@ import {
   popupSource,
   Popup,
   type ReadonlySignal,
+  DefaultComposition,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
@@ -47,6 +49,10 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 import { ISLAND_GLASS } from "./effect/island-glass";
+import { createFlip3D } from "./flip-3d";
+import { createWindowGrid } from "./window-grid";
+import { installDragAndDrop } from "./drag-and-drop";
+import type { TitlebarButton } from "./window-switcher";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -73,16 +79,71 @@ COMPOSITOR.window.decoration.configure((_window, context) => {
   return { mode: context.clientPreference ?? "server" };
 });
 
+// GTK 3 applications (Thunar, ...) choose between their own title bar and
+// ours once, at startup, from this default alone: "server" drops theirs.
+// Firefox and GTK header bars still ask for CSD, and the policy above keeps
+// honoring that. Forcing "server" on Firefox makes it re-request CSD over and
+// over (ShojiWM stops answering after a few, but this loop once pinned
+// Firefox's CPU) and leaves two title bars.
+COMPOSITOR.window.decoration.kdeDefaultMode(() => "server");
+
 // enable triple buffer mode for massive performance
 COMPOSITOR.rendering.framePacing = "throughput";
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
+
+// Window switcher (Super+Tab): "flip-3d" stacks the windows in 3D
+// (./flip-3d.tsx), "grid" lays them out side by side (./window-grid.tsx).
+const WINDOW_SWITCHER_STYLE = "flip-3d" as "flip-3d" | "grid";
+const WINDOW_SWITCHER = (
+  WINDOW_SWITCHER_STYLE === "grid" ? createWindowGrid : createFlip3D
+)({
+  windowManager: HYBRID_WINDOW_MANAGER,
+  stackOrder: (window) =>
+    window.state[WINDOW_STATE_FULLSCREEN]()
+      ? FULLSCREEN_Z_INDEX
+      : windowZIndex(window),
+  // The grid's selected card: its title bar buttons work.
+  titlebarButtonAt,
+});
+
+// Drag and drop: the dragged image on a card with the action and the kind of
+// data, flying back when a drop is refused (./drag-and-drop.tsx).
+installDragAndDrop();
+COMPOSITOR.rendering.composition = (output) =>
+  WINDOW_SWITCHER.compose(output) ?? <DefaultComposition />;
+
+// Window backdrop effects end with this stage so they can fade back in after
+// the switcher closes.
+const backdropFade = () =>
+  shaderStage(loadShader("./src/effect/backdrop-fade.frag"), {
+    uniforms: { strength: WINDOW_SWITCHER.backdropStrength },
+  });
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 const FULLSCREEN_Z_INDEX = 2_000_000_000;
 const FLOATING_WINDOW_Z_INDEX_BASE = 1_500_000_000;
 const WINDOW_STACK_Z_INDEX_RANGE = 100_000_000;
 const FOCUSED_TILED_WINDOW_Z_INDEX = 1_000_000_000;
 const REORDERING_TILED_WINDOW_Z_INDEX = -2_000_000_000;
+
+/** Where a (non-fullscreen) window sits in the stack; higher is on top. */
+function windowZIndex(window: WaylandWindow): number {
+  const stackZIndex = HYBRID_WINDOW_MANAGER.getWindowZIndex(window)();
+  if (!window.state[WINDOW_STATE_WORKSPACE_TILED]()) {
+    return stackZIndex;
+  }
+  const stackOffset = Math.max(
+    -WINDOW_STACK_Z_INDEX_RANGE,
+    Math.min(WINDOW_STACK_Z_INDEX_RANGE, stackZIndex),
+  );
+  if (!window.state[WINDOW_STATE_TILED]()) {
+    return FLOATING_WINDOW_Z_INDEX_BASE + stackOffset;
+  }
+  if (window.state[WINDOW_STATE_TILE_REORDERING]()) {
+    return REORDERING_TILED_WINDOW_Z_INDEX;
+  }
+  return window.isFocused() ? FOCUSED_TILED_WINDOW_Z_INDEX : stackOffset;
+}
 
 COMPOSITOR.onDisable((event) => {
   if (event.isReloading) {
@@ -147,21 +208,54 @@ function scheduleWorkspaceBroadcast() {
   });
 }
 
+// Workspaces a bar asked to create (by number). The view lists only
+// workspaces with windows plus the active one, so these are listed as well
+// until they show up there on their own.
+const requestedWorkspaces = new Map<string, Set<number>>();
+
 COMPOSITOR.workspace.configure(() => {
   const view = HYBRID_WINDOW_MANAGER.viewForIpc();
   return {
-    groups: view.monitors.map((monitor) => ({
-      id: monitor.name,
-      outputs: [monitor.name],
-      workspaces: monitor.workspaces.map((workspace) => ({
-        id: `${monitor.name}:${workspace.index}`,
-        name: String(workspace.index),
-        coordinates: [Math.max(0, workspace.index - 1)],
-        active: workspace.active,
-        hidden: !workspace.active && workspace.windowCount === 0,
-      })),
-    })),
+    groups: view.monitors.map((monitor) => {
+      const listed = new Set(monitor.workspaces.map((workspace) => workspace.index));
+      const requested = requestedWorkspaces.get(monitor.name) ?? new Set();
+      for (const index of requested) {
+        if (listed.has(index)) {
+          requested.delete(index);
+        }
+      }
+      const workspaces = [
+        ...monitor.workspaces,
+        ...[...requested].map((index) => ({ index, active: false, windowCount: 0 })),
+      ].sort((a, b) => a.index - b.index);
+      return {
+        id: monitor.name,
+        outputs: [monitor.name],
+        workspaces: workspaces.map((workspace) => ({
+          id: `${monitor.name}:${workspace.index}`,
+          name: String(workspace.index),
+          coordinates: [Math.max(0, workspace.index - 1)],
+          active: workspace.active,
+          hidden:
+            !workspace.active &&
+            workspace.windowCount === 0 &&
+            !requested.has(workspace.index),
+        })),
+      };
+    }),
   };
+});
+
+// ext-workspace `create_workspace`: the name is the workspace number.
+COMPOSITOR.workspace.event.onCreate((event) => {
+  const index = Number(event.name);
+  if (!event.groupId || !Number.isInteger(index) || index < 1) {
+    return;
+  }
+  const requested = requestedWorkspaces.get(event.groupId) ?? new Set<number>();
+  requested.add(index);
+  requestedWorkspaces.set(event.groupId, requested);
+  scheduleWorkspaceBroadcast();
 });
 
 COMPOSITOR.workspace.event.onActivate((event) => {
@@ -372,9 +466,10 @@ function toggleLauncher() {
   });
 }
 COMPOSITOR.key.bind("launcher", "Super+A", toggleLauncher);
-// Super tap (fires on release only, when no other key/button was pressed in between).
+// Super tap: fires on a quick release (within 300 ms) with no other key/button pressed in between.
 COMPOSITOR.key.bind("launcher-tap", "Super", toggleLauncher, {
   on: "release",
+  within: 300,
 });
 // The same launcher panel with its field pointed at the clipboard's history.
 function toggleClipboard() {
@@ -406,6 +501,9 @@ COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
 COMPOSITOR.key.bind("toggle-tiling-mode", "Super+S", () => {
   HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
   scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("window-switcher", "Super+Tab", () => {
+  WINDOW_SWITCHER.open(HYBRID_WINDOW_MANAGER.getCurrentMonitorName());
 });
 COMPOSITOR.key.bind("close-focused-window", "Super+Q", () => {
   HYBRID_WINDOW_MANAGER.closeFocusedWindow();
@@ -474,12 +572,14 @@ COMPOSITOR.output.configure((context) => {
     position: "auto",
     scale: 1.8,
     transform: "normal",
+    hdr: false,
   };
   display["eDP-2"] = {
     mode: "extend",
     resolution: "best",
     position: "auto",
     scale: 1.8,
+    hdr: false,
   };
   display["HDMI-A-1"] = {
     mode: "extend",
@@ -558,12 +658,18 @@ HYBRID_WINDOW_MANAGER.configureWorkspaceGestureSpeed({
   workspaceScrollSnapBreakoutPx: 48,
 });
 
-COMPOSITOR.effect.background_effect = compileEffect({
+// Blur behind the regions clients ask for (ext-background-effect). Off while
+// the window switcher is shown, then faded back in like the window backdrops.
+const BACKGROUND_BLUR = compileEffect({
   input: backdropSource(),
   capturePadding: 24,
   invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-  pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+  alpha: "preserve",
+  pipeline: [dualKawaseBlur({ radius: 4, passes: 2 }), backdropFade()],
 });
+COMPOSITOR.effect.background_effect = computed(() =>
+  WINDOW_SWITCHER.blurSuspended() ? null : BACKGROUND_BLUR,
+);
 
 const LAYER_BLUR_MASK = compileLayerEffect({
   input: backdropSource(),
@@ -748,6 +854,7 @@ COMPOSITOR.event.onWindowResize((event) => {
 
 COMPOSITOR.pointer.bindWindowMoveModifier("Super");
 COMPOSITOR.pointer.bindWindowResizeModifier("Super");
+COMPOSITOR.cursor.bindAppLockIgnoreModifier("Super");
 
 COMPOSITOR.event.onWindowMove((event) => {
   HYBRID_WINDOW_MANAGER.onWindowMove(event);
@@ -770,24 +877,44 @@ COMPOSITOR.event.onWindowActivateRequest((event) => {
   scheduleWorkspaceBroadcast();
 });
 
-function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
-  const client = window.position;
-  return {
-    x: client.x - WINDOW_BORDER_PX,
-    y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
-    width: client.width + WINDOW_BORDER_PX * 2,
-    height: client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2,
-  };
-}
-
-COMPOSITOR.window.composition = (window: WaylandWindow) => {
-  const decoration = window.decoration();
-  const useClientDecoration =
+function usesClientDecoration(decoration: WindowDecorationState): boolean {
+  return (
     decoration.mode === "client" &&
     !(
       decoration.clientPreference === "server" &&
       decoration.configuredMode === "server"
-    );
+    )
+  );
+}
+
+// Must match the frame the composition below draws: a client-decorated window
+// gets only the border, so counting the title bar would size its client 30px
+// past what the layout meant (and past the client's own maximum). The border
+// is drawn for both, so it is counted for both; a config that drops the
+// border for client-decorated windows must drop WINDOW_BORDER_PX here too.
+function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
+  const client = window.position;
+  const titlebar = usesClientDecoration(window.decoration.peek())
+    ? 0
+    : TITLEBAR_HEIGHT;
+  return {
+    x: client.x - WINDOW_BORDER_PX,
+    y: client.y - titlebar - WINDOW_BORDER_PX,
+    width: client.width + WINDOW_BORDER_PX * 2,
+    height: client.height + titlebar + WINDOW_BORDER_PX * 2,
+  };
+}
+
+/**
+ * The title bar's button size, padding and gap. `titlebarButtonAt` finds the
+ * buttons with the same numbers, so change them here.
+ */
+const TITLEBAR_BUTTON_SIZE = 16;
+const TITLEBAR_PADDING_X = 8;
+const TITLEBAR_GAP = 8;
+
+COMPOSITOR.window.composition = (window: WaylandWindow) => {
+  const useClientDecoration = usesClientDecoration(window.decoration());
   const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
   const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
   const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
@@ -808,25 +935,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   // force no corner rounding CSD
   const tiled = true;
 
-  const stackZIndex = HYBRID_WINDOW_MANAGER.getWindowZIndex(window);
-  const zIndex = computed(() => {
-    if (!window.state[WINDOW_STATE_WORKSPACE_TILED]()) {
-      return stackZIndex();
-    }
-    const stackOffset = Math.max(
-      -WINDOW_STACK_Z_INDEX_RANGE,
-      Math.min(WINDOW_STACK_Z_INDEX_RANGE, stackZIndex()),
-    );
-    if (!window.state[WINDOW_STATE_TILED]()) {
-      return FLOATING_WINDOW_Z_INDEX_BASE + stackOffset;
-    }
-    if (window.state[WINDOW_STATE_TILE_REORDERING]()) {
-      return REORDERING_TILED_WINDOW_Z_INDEX;
-    }
-    return window.isFocused()
-      ? FOCUSED_TILED_WINDOW_Z_INDEX
-      : stackOffset;
-  });
+  const zIndex = computed(() => windowZIndex(window));
   const minimizeVisualIdle = window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE];
   const inactive = computed(
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
@@ -836,10 +945,14 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     focused ? "#d7ba7d" : "#4f5666",
   );
   // A soft drop shadow under the frame; the focused window floats a bit higher.
-  const windowShadow = window.isFocused((focused) =>
-    focused
-      ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
-      : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
+  // The window selected in the window switcher glows white instead (it fits
+  // in the switcher's texture margin).
+  const windowShadow = computed(() =>
+    WINDOW_SWITCHER.selectedWindowId() === window.id
+      ? [{ blur: 28, spread: 4, color: "#ffffffd0" }]
+      : window.isFocused()
+        ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
+        : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
   );
   const titlebarBackground = window.isFocused((focused) =>
     focused ? "#1f243080" : "#2a2f3a80",
@@ -850,8 +963,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   const titlebarStyle: SSDStyle = {
     height: TITLEBAR_HEIGHT,
-    paddingX: 8,
-    gap: 8,
+    paddingX: TITLEBAR_PADDING_X,
+    gap: TITLEBAR_GAP,
     alignItems: "center",
     background: titlebarBackground,
   };
@@ -872,15 +985,21 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
           glass_tint: 0.9,
         },
       }),
+      backdropFade(),
     ],
+    alpha: "preserve",
   });
 
   const titleOnlyShader = compileEffect({
     input: backdropSource(),
     capturePadding: 24,
     invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+    alpha: "preserve",
+    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 }), backdropFade()],
   });
+  // No backdrop effects while the window switcher shows the windows as
+  // textures: there is nothing under a window there to blur.
+  const blurSuspended = WINDOW_SWITCHER.blurSuspended();
 
   const appIcon = (
     <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
@@ -903,19 +1022,28 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const maximizeButton = <MaximizeButton window={window} />;
   const closeButton = <CloseButton window={window} />;
 
+  const titlebarContent = [
+    appIcon,
+    label,
+    minimizeButton,
+    maximizeButton,
+    closeButton,
+  ];
   var innerComponents = (
     <Box direction="column">
-      <ShaderEffect
-        shader={titleOnlyShader}
-        direction="row"
-        style={titlebarStyle}
-      >
-        {appIcon}
-        {label}
-        {minimizeButton}
-        {maximizeButton}
-        {closeButton}
-      </ShaderEffect>
+      {blurSuspended ? (
+        <Box direction="row" style={titlebarStyle}>
+          {titlebarContent}
+        </Box>
+      ) : (
+        <ShaderEffect
+          shader={titleOnlyShader}
+          direction="row"
+          style={titlebarStyle}
+        >
+          {titlebarContent}
+        </ShaderEffect>
+      )}
       <ClientWindow />
     </Box>
   );
@@ -923,16 +1051,17 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const TERMINALS = ["kitty", "ghostty"];
 
   if (TERMINALS.includes(window.appId() ?? "")) {
-    innerComponents = (
+    const terminalContent = [
+      <Box direction="row" style={titlebarStyle}>
+        {titlebarContent}
+      </Box>,
+      <ClientWindow />,
+    ];
+    innerComponents = blurSuspended ? (
+      <Box direction="column">{terminalContent}</Box>
+    ) : (
       <ShaderEffect shader={backgroundShader} direction="column">
-        <Box direction="row" style={titlebarStyle}>
-          {appIcon}
-          {label}
-          {minimizeButton}
-          {maximizeButton}
-          {closeButton}
-        </Box>
-        <ClientWindow />
+        {terminalContent}
       </ShaderEffect>
     );
   }
@@ -1035,6 +1164,35 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   );
 };
 
+/**
+ * The title bar button at `(x, y)`, logical px from the top-left corner of
+ * `window.rect` (the frame: border, then the title bar). From the right:
+ * close, maximize, minimize. Each button takes the whole title bar height
+ * and half the gap on both sides, so a scaled-down card still has a usable
+ * target.
+ */
+function titlebarButtonAt(window: WaylandWindow, x: number, y: number): TitlebarButton | null {
+  if (
+    window.state[WINDOW_STATE_FULLSCREEN].peek() ||
+    usesClientDecoration(window.decoration.peek())
+  ) {
+    return null;
+  }
+  if (y < WINDOW_BORDER_PX || y > WINDOW_BORDER_PX + TITLEBAR_HEIGHT) {
+    return null;
+  }
+  const buttons: TitlebarButton[] = ["close", "maximize", "minimize"];
+  const pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_GAP;
+  const right = window.rect.width - WINDOW_BORDER_PX - TITLEBAR_PADDING_X;
+  for (let i = 0; i < buttons.length; i++) {
+    const center = right - TITLEBAR_BUTTON_SIZE / 2 - i * pitch;
+    if (Math.abs(x - center) <= pitch / 2) {
+      return buttons[i];
+    }
+  }
+  return null;
+}
+
 const CloseButton = ({ window }: { window: WaylandWindow }) => {
   const [hover, setHover] = useState(false);
 
@@ -1046,8 +1204,8 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src="./assets/x.svg"
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1061,8 +1219,8 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },
@@ -1137,8 +1295,8 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src={src}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1152,8 +1310,8 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },
@@ -1193,8 +1351,8 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
       <Image
         src="./assets/minus.svg"
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           position: "absolute",
           zIndex: 1,
           pointerEvents: "none",
@@ -1208,8 +1366,8 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
       <Button
         onHoverChange={setHover}
         style={{
-          width: 16,
-          height: 16,
+          width: TITLEBAR_BUTTON_SIZE,
+          height: TITLEBAR_BUTTON_SIZE,
           borderRadius: 8,
           background: "#FFFFFF20",
           border: { px: 1, color: borderColor },

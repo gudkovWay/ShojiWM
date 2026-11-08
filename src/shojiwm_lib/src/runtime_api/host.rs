@@ -64,6 +64,28 @@ pub enum HostMessage {
     Schedule(RuntimeSchedule),
     /// The frame pacing the config chose per output (`COMPOSITOR.rendering.framePacing`).
     FramePacing(crate::frame_pacing::FramePacingConfig),
+    /// Every output's custom composition (`COMPOSITOR.rendering.composition`).
+    /// Replaces the previous set: outputs missing from it use the default
+    /// stacking again.
+    OutputCompositions(
+        std::collections::HashMap<String, crate::backend::composition::OutputComposition>,
+    ),
+    /// Start or end the config's input grab (`COMPOSITOR.input.grab`). While
+    /// it is held, input arrives as `InputRequest::InputGrab`.
+    InputGrab(crate::runtime_input_grab::RuntimeInputGrabUpdate),
+    /// `COMPOSITOR.effect.background_effect` changed after it was first read
+    /// (one of its signals moved). Replaces the effect; `None` turns it off.
+    BackgroundEffect(Option<crate::ssd::BackgroundEffectConfig>),
+    /// Move the cursor (`COMPOSITOR.cursor.setPosition`).
+    CursorPosition(crate::cursor::RuntimeCursorPositionTarget),
+    /// Show one cursor everywhere, or stop (`COMPOSITOR.cursor.overrideKind`).
+    CursorOverride(Option<crate::cursor::CursorOverride>),
+    /// Show, move, restyle or dispose of a drag view (`drag.show()`).
+    DragView(crate::dnd::DragViewCommand),
+    /// Start the session locked (`COMPOSITOR.session.startLocked`), like
+    /// [`RuntimeLauncher::start_locked`](super::RuntimeLauncher::start_locked).
+    /// Honored only while the config first loads, before any client runs.
+    StartLocked,
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)
@@ -92,6 +114,7 @@ pub struct RuntimeConfigDelta {
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub debug_config: Option<RuntimeDebugConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
+    pub start_locked: bool,
 }
 
 impl RuntimeConfigDelta {
@@ -105,6 +128,7 @@ impl RuntimeConfigDelta {
             && self.process_config.is_none()
             && self.debug_config.is_none()
             && self.process_actions.is_empty()
+            && !self.start_locked
     }
 
     pub fn publish(self, host: &RuntimeHost) {
@@ -112,6 +136,10 @@ impl RuntimeConfigDelta {
             return;
         }
         let mut messages = Vec::new();
+        // Before anything that could start a client (process config/actions).
+        if self.start_locked {
+            messages.push(HostMessage::StartLocked);
+        }
         messages.extend(self.display_config.map(HostMessage::Display));
         messages.extend(self.workspace_config.map(HostMessage::Workspace));
         messages.extend(self.key_binding_config.map(HostMessage::KeyBindings));
@@ -139,6 +167,7 @@ struct HostInner {
     queue: Mutex<VecDeque<HostMessage>>,
     wake_requested: AtomicBool,
     ping: Mutex<Option<Ping>>,
+    cursor_position: Mutex<Option<crate::cursor::CursorPositionSnapshot>>,
 }
 
 impl std::fmt::Debug for RuntimeHost {
@@ -189,6 +218,20 @@ impl RuntimeHost {
     /// for compositor-side state such as output overlays.
     pub fn notify(&self) {
         self.ping();
+    }
+
+    /// Record where the cursor is, for `COMPOSITOR.cursor.getPosition`.
+    /// Compositor side, after every pointer motion.
+    pub fn set_cursor_position(&self, position: crate::cursor::CursorPositionSnapshot) {
+        if let Ok(mut slot) = self.inner.cursor_position.lock() {
+            *slot = Some(position);
+        }
+    }
+
+    /// The cursor as of the last pointer motion; `None` before the first one.
+    /// Readable from the runtime's own thread.
+    pub fn cursor_position(&self) -> Option<crate::cursor::CursorPositionSnapshot> {
+        self.inner.cursor_position.lock().ok()?.clone()
     }
 
     /// Next queued message, oldest first. Compositor side.

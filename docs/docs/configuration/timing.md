@@ -145,6 +145,10 @@ and interleave. Keep state per `outputName`.
 A poll created without `output` throws an error that names the new signature.
 
 :::note
-The Rust SDK (`shojiwm_rs`) keeps a single clock: `set_interval` / `set_timeout`
-are driven by every rendered frame, as before.
+The Rust SDK (`shojiwm_rs`) keeps time the same way:
+`create_poll(interval_ms, output, |handle| ..)` (`handle.now_ms()`),
+`window.create_poll`, `create_poll_for_each_output`, and
+`Animation::new(..).on_output(window.output())` for an animation on a window's
+output. `set_interval` / `set_timeout` are bound to no output: they run on
+whichever output renders next.
 :::

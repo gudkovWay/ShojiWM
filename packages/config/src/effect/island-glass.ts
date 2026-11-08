@@ -8,12 +8,14 @@ import {
 export const ISLAND_GLASS_OPTIONS = {
   // Match LiquidIslandQS LiquidGroup.tint.a; required to retain its edge AA.
   surfaceOpacity: 0.20,
-  rimWidth: 50,
-  refraction: 50,
-  chromaticShift: 0.90,
-  highlight: 0.4,
+  rimWidth: 80,
+  refraction: 80,
+  chromaticShift: 1.90,
+  highlight: 0.6,
+  // Width of the rim light along the edge.
+  highlightWidth: 2,
   blurRadius: 2,
-  blurPasses: 2,
+  blurPasses: 1,
   blurMix: 1,
   normalSmoothing: 3,
   edgeSoftness: 2,
@@ -22,6 +24,8 @@ export const ISLAND_GLASS_OPTIONS = {
   // 0: glass, 1: mask, 2: distance, 3: surface gradient.
   debugView: 0,
 };
+
+const directionSmoothing = Math.max(ISLAND_GLASS_OPTIONS.normalSmoothing, ISLAND_GLASS_OPTIONS.rimWidth * 0.2);
 
 // Float local boundary offsets / signed distances retain subpixel precision.
 // Overwritten from the current mask each refresh; no temporal feedback.
@@ -98,6 +102,28 @@ export const ISLAND_GLASS = compileLayerEffect({
           uniforms: { axis: [0, 1] as const, smoothing_px: ISLAND_GLASS_OPTIONS.normalSmoothing },
           textures: { field_input: get("island-float-step") },
         }),
+        save("island-float-step"),
+        // The bend direction comes from a much smoother copy, which rounds it
+        // around corners sharper than the rim.
+        shaderStage(loadShader("./src/effect/island-smooth.frag"), {
+          uniforms: { axis: [1, 0] as const, smoothing_px: directionSmoothing },
+          textures: { field_input: get("island-float-step") },
+        }),
+        save("island-direction"),
+        shaderStage(loadShader("./src/effect/island-smooth.frag"), {
+          uniforms: { axis: [0, 1] as const, smoothing_px: directionSmoothing },
+          textures: { field_input: get("island-direction") },
+        }),
+        save("island-direction"),
+        // Where the shape is thinner than the rim, the lens flattens out at
+        // its middle instead of creasing there.
+        shaderStage(loadShader("./src/effect/island-ridge.frag"), {
+          uniforms: { rim_width_px: ISLAND_GLASS_OPTIONS.rimWidth },
+          textures: {
+            field_input: get("island-float-step"),
+            direction_input: get("island-direction"),
+          },
+        }),
         // renderToIfDirty() keeps this final float texture as the state without
         // copying it, so stateSource() below reads it in the same raw
         // multi-texture coordinate system.
@@ -116,6 +142,7 @@ export const ISLAND_GLASS = compileLayerEffect({
         refraction_px: ISLAND_GLASS_OPTIONS.refraction,
         chromatic_shift_px: ISLAND_GLASS_OPTIONS.chromaticShift,
         highlight_strength: ISLAND_GLASS_OPTIONS.highlight,
+        highlight_width_px: ISLAND_GLASS_OPTIONS.highlightWidth,
         debug_view: ISLAND_GLASS_OPTIONS.debugView,
         blur_mix: ISLAND_GLASS_OPTIONS.blurMix,
         edge_softness_px: ISLAND_GLASS_OPTIONS.edgeSoftness,

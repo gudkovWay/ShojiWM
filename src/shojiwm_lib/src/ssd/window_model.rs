@@ -43,6 +43,15 @@ pub struct WaylandWindowSnapshot {
     /// `primary_output_name_for_window`); `None` when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_name: Option<String>,
+    /// What plasmashell asked for this window through `org_kde_plasma_surface`
+    /// (role, position); `None` for a window without a plasma surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plasma: Option<crate::protocols::plasma_shell::PlasmaSurfaceSnapshot>,
+    /// The window's taskbar entry in global logical coordinates, from KDE's
+    /// `org_kde_plasma_window.set_minimized_geometry`; `None` when no taskbar
+    /// set one. A config's minimize animation can fly the window there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimized_geometry: Option<WindowPositionSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -98,6 +107,21 @@ pub struct WindowDecorationPolicyContextSnapshot {
     pub client_preference: Option<WindowDecorationModeSnapshot>,
     pub can_negotiate: bool,
     pub reason: WindowDecorationPolicyReasonSnapshot,
+}
+
+/// The process behind a client that bound the legacy KDE decoration manager,
+/// before it has any window: the manager's default mode is decided per
+/// client, from this.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowDecorationClientSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// `/proc/<pid>/exe`, when readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// `/proc/<pid>/cmdline`, split into its arguments.
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -225,6 +249,23 @@ pub struct GestureSwipeEventSnapshot {
     pub velocity_y: f64,
     pub output_name: Option<String>,
     pub device: Option<crate::runtime_input::RuntimeInputDeviceSnapshot>,
+    pub timestamp: u64,
+}
+
+/// A touchpad pinch: `scale` is the fingers' spread relative to the start
+/// (1 at the start, above 1 spreading), `rotation` the change in angle since
+/// the last update in degrees, clockwise positive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GesturePinchEventSnapshot {
+    pub phase: GestureSwipePhaseSnapshot,
+    pub fingers: u32,
+    pub scale: f64,
+    pub rotation: f64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub position: Option<PointerMovePointSnapshot>,
+    pub output_name: Option<String>,
     pub timestamp: u64,
 }
 
@@ -392,16 +433,19 @@ pub enum ManagedWindowAnimationMode {
     Multiply,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[derive(Default)]
 pub enum ManagedWindowAnimationEasingSnapshot {
     #[default]
     Linear,
-    CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+    CubicBezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
 }
-
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -548,6 +592,25 @@ pub struct WaylandOutputSnapshot {
     /// Subpixel layout the kernel reported for the connector: what `subpixel`
     /// falls back to when the display config names none.
     pub detected_subpixel: OutputSubpixelSnapshot,
+    /// EDID advertises HDR (CTA-861 static metadata). Can
+    /// be used to check display capabilities.
+    pub hdr_supported: bool,
+    /// Link capability for HDMI connectors, so a config UI can tell which
+    /// modes are actually reachable at a given bit depth. `None` for non-HDMI
+    /// outputs and for sinks that publish no vendor block.
+    pub hdmi: Option<HdmiLinkSnapshot>,
+}
+
+/// What the HDMI sink says its link can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HdmiLinkSnapshot {
+    /// Inferred from what the sink advertises, e.g. "HDMI 2.0".
+    pub standard: &'static str,
+    /// Max TMDS character rate in kHz, when the sink states one.
+    pub max_tmds_khz: Option<u32>,
+    /// Total usable link bandwidth in Gbit/s.
+    pub max_bandwidth_gbps: Option<f32>,
 }
 
 /// A panel's physical subpixel layout, spelled as the display config accepts it.
@@ -625,6 +688,14 @@ pub struct OutputModeSnapshot {
     pub width: i32,
     pub height: i32,
     pub refresh_rate: f64,
+    /// DRM pixel clock in kHz. `None` for outputs with no DRM mode behind
+    /// them (nested/winit backends).
+    ///
+    /// Link-bandwidth arithmetic needs this and cannot derive it: width *
+    /// height * refresh understates the real rate, because blanking is time
+    /// actually spent transmitting. 3840x2160@60 is 594 MHz, not the 497.7
+    /// MHz the active pixels alone suggest.
+    pub clock_khz: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -887,6 +958,8 @@ impl ShojiWM {
                 bytes: None,
             }),
             interaction: DecorationInteractionSnapshot::default(),
+            plasma: crate::protocols::plasma_shell::plasma_surface_snapshot(toplevel.wl_surface()),
+            minimized_geometry: self.plasma_minimized_geometry(window),
         }
     }
 
@@ -911,6 +984,8 @@ impl ShojiWM {
                 parent_id: None,
                 icon: None,
                 interaction: DecorationInteractionSnapshot::default(),
+                plasma: None,
+                minimized_geometry: None,
             };
         };
 
@@ -986,6 +1061,8 @@ impl ShojiWM {
                 bytes: None,
             }),
             interaction: DecorationInteractionSnapshot::default(),
+            plasma: None,
+            minimized_geometry: self.plasma_minimized_geometry(window),
         }
     }
 

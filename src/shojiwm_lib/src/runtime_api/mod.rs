@@ -19,12 +19,13 @@ mod handle;
 mod host;
 mod message;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsStr, path::PathBuf};
 
 pub use handle::RuntimeHandle;
 pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost, RuntimeSchedule};
 pub use message::{
-    CompositionPatch, DecorationRequest, OVERLAY_STAGE_INDEX, PAINT_STAGE_INDEX, SHADER_INPUT_STAGE_INDEX, EffectRequest, InputRequest, RuntimeEvent, RuntimeReply, RuntimeRequest,
+    CompositionPatch, DecorationRequest, EffectRequest, InputRequest, OVERLAY_STAGE_INDEX,
+    PAINT_STAGE_INDEX, RuntimeEvent, RuntimeReply, RuntimeRequest, SHADER_INPUT_STAGE_INDEX,
     SchedulerTickRequest, WindowRequest, WorkspaceRequest,
 };
 
@@ -119,6 +120,14 @@ pub trait RuntimeLauncher {
     /// Construct the runtime. Must not block on loading the config; that
     /// happens in [`ConfigRuntime::preload`].
     fn launch(&self, context: LaunchContext) -> Box<dyn ConfigRuntime>;
+
+    /// Whether the session starts locked: nothing but session-lock surfaces
+    /// is drawn, and input reaches only them, until a locker
+    /// (ext-session-lock) locks and then unlocks. With automatic login this
+    /// makes the lock screen the login screen.
+    fn start_locked(&self) -> bool {
+        false
+    }
 }
 
 /// Everything a launcher gets to build its runtime from.
@@ -134,6 +143,11 @@ pub struct LaunchContext {
     /// without the leading dashes.
     pub extra: BTreeMap<String, String>,
     pub host: RuntimeHost,
+    /// The compositor's own Wayland socket name (`wayland-1`), when it has one.
+    /// Use it rather than `WAYLAND_DISPLAY`: the config is loaded before the
+    /// compositor points `WAYLAND_DISPLAY` at itself, and nested in another
+    /// compositor that variable names the parent until then.
+    pub wayland_display: Option<String>,
 }
 
 /// Runtime used when no config runtime is available: every request falls back
@@ -173,6 +187,20 @@ impl RuntimeBoot {
     }
 
     pub fn launch(&self, host: RuntimeHost) -> RuntimeHandle {
+        self.launch_with_display(host, None)
+    }
+
+    /// See [`RuntimeLauncher::start_locked`].
+    pub fn start_locked(&self) -> bool {
+        self.launcher.start_locked()
+    }
+
+    /// [`launch`](Self::launch) for a compositor listening on `wayland_display`.
+    pub fn launch_with_display(
+        &self,
+        host: RuntimeHost,
+        wayland_display: Option<&OsStr>,
+    ) -> RuntimeHandle {
         let context = LaunchContext {
             config_path: self
                 .config_path
@@ -182,6 +210,7 @@ impl RuntimeBoot {
             dev: self.dev,
             extra: self.extra.clone(),
             host: host.clone(),
+            wayland_display: wayland_display.map(|display| display.to_string_lossy().into_owned()),
         };
         RuntimeHandle::new(self.launcher.name(), self.launcher.launch(context), host)
     }

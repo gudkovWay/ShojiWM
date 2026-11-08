@@ -1,4 +1,6 @@
 /// <reference path="./runtime-globals.d.ts" />
+export { configureLockBackground, installSessionLockBridge } from "./session-lock";
+export type { LockBackgroundSelection } from "./session-lock";
 import type {
   CompositionRenderable,
   AppIconProps,
@@ -71,11 +73,15 @@ import type {
   OutputPositionPreference,
   OutputResolutionPreference,
   OutputStateSnapshot,
+  VirtualDesktopConfig,
+  VirtualDesktopEntry,
   WorkspaceActivateEvent,
   WorkspaceConfig,
   WorkspaceConfigEntry,
   WorkspaceConfigureFactory,
   WorkspaceController,
+  WorkspaceCreateEvent,
+  WorkspaceMoveWindowEvent,
   WorkspaceGroupConfig,
   EnvController,
   EnvUpdateOperation,
@@ -176,6 +182,12 @@ import type {
   KeyBindingOptions,
   KeyBindingEventPhase,
   PointerController,
+  PointerRegionAnchor,
+  PointerRegionOptions,
+  CursorPosition,
+  CursorPositionTarget,
+  HotCorner,
+  HotCornerOptions,
   PreloadController,
   RuntimeController,
   DebugController,
@@ -184,6 +196,7 @@ import type {
   SSDRebuildSuppressionViolationPolicy,
 } from "./types";
 import { createCompositorEventController } from "./events";
+import { installPointerRegionEventSource } from "./pointer";
 import { suppressSSDRebuild, withSSDRebuildSuppressed } from "./runtime-hooks";
 import {
   KEY_BINDING_CONTROLLER,
@@ -202,8 +215,10 @@ import { INPUT_CONTROLLER, installInputDeviceChangeEmitter } from "./input";
 import { OUTPUT_CONTROLLER, installOutputChangeEmitter } from "./output";
 import { WORKSPACE_CONTROLLER } from "./workspace";
 import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+import { SESSION_CONTROLLER } from "./session";
 import { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 import { CURSOR_CONTROLLER, takePendingCursorConfig } from "./cursor";
+import { DND_CONTROLLER } from "./dnd";
 import {
   WINDOW_DECORATION_CONTROLLER,
   resolveWindowDecorationDecision,
@@ -227,6 +242,45 @@ import { resolveAssetPath } from "./shader";
 import { overlay } from "./overlay";
 export type { CompositorEffectController } from "./types";
 export { compileOverlayEffect, snapshotSource, installOverlayBridge } from "./overlay";
+export {
+  Layers,
+  Windows,
+  LayerPopups,
+  TextureView,
+  Solid,
+  Scene3D,
+  Plane,
+  DefaultComposition,
+  renderTexture,
+  Transform3D,
+  transform3d,
+  multiplyMat4,
+  perspective,
+  lookAt,
+  screenCamera,
+  outputLogicalSize,
+  projectPoint,
+  pickPlane,
+  serializeOutputComposition,
+} from "./composition";
+export type {
+  LayerName,
+  Mat4,
+  Camera,
+  CompositionColor,
+  CompositionRect,
+  LayersProps,
+  WindowsProps,
+  TextureViewProps,
+  SolidProps,
+  Scene3DProps,
+  PlaneProps,
+  RenderTexture,
+  RenderTextureOptions,
+  ScreenCameraOptions,
+  PickablePlane,
+  WireOutputComposition,
+} from "./composition";
 export type { OverlayOptions, OverlayHandle, OverlayEffectHandle, SnapshotSourceHandle } from "./overlay";
 import { serializeCompositionTree } from "./serialize";
 export {
@@ -343,6 +397,9 @@ export {
   type KeyboardLayoutChangeListener,
   type PointerMoveEvent,
   type PointerMovePoint,
+  type PointerRegionEvent,
+  type PointerRegionListener,
+  type PointerRegionPhase,
   type RuntimeEventConfig,
   type WindowMoveEvent,
   type WindowMoveListener,
@@ -378,13 +435,16 @@ export {
   commitWorkspaceConfigurationRegistration,
   emitWorkspaceActivate,
   takePendingWorkspaceConfig,
+  type WorkspaceConfigPayload,
 } from "./workspace";
 export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 export {
   WINDOW_DECORATION_CONTROLLER,
+  resolveKdeDefaultDecorationMode,
   resolveWindowDecorationDecision,
 } from "./window-decoration";
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
+export { SESSION_CONTROLLER, sessionStartLocked } from "./session";
 export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
 export {
   CURSOR_CONTROLLER,
@@ -412,6 +472,39 @@ export {
   takePendingInputConfig,
   updateInputState,
 } from "./input";
+export {
+  DND_CONTROLLER,
+  DragIcon,
+  dispatchDndEvent,
+  installDndWindowResolver,
+  type DndController,
+  type DndEvent,
+  type DndEventController,
+  type DragAction,
+  type DragActions,
+  type DragEnd,
+  type DragIconInfo,
+  type DragIconProps,
+  type DragPoint,
+  type DragSession,
+  type DragStartListener,
+  type DragView,
+  type DragViewOptions,
+} from "./dnd";
+export {
+  dispatchInputGrabEvent,
+  resetInputGrab,
+  type InputGrab,
+  type InputGrabCancelReason,
+  type InputGrabKeyEvent,
+  type InputGrabModifiers,
+  type InputGrabOptions,
+  type InputGrabPoint,
+  type InputGrabPointerButtonEvent,
+  type InputGrabPointerMotionEvent,
+  type InputGrabScrollEvent,
+  type InputGrabState,
+} from "./input-grab";
 export {
   PROCESS_CONTROLLER,
   beginProcessConfigRegistration,
@@ -543,6 +636,7 @@ export type {
   WindowCompositionFunction,
   WindowCompositionPhase,
   CompositionChild,
+  CompositionRenderable,
   CompositionElementNode,
   ReactiveWaylandWindow,
   ReactiveWaylandWindowHandle,
@@ -583,6 +677,7 @@ export type {
   EffectOutsets,
   LayerEffectRegion,
   OutputConfigEntry,
+  OutputHdrConfig,
   OutputConfigureContext,
   OutputConfigureFactory,
   OutputController,
@@ -643,6 +738,8 @@ export type {
   SurfacePolicyTarget,
   CompositorWindowController,
   CompositorWindowDecorationController,
+  KdeDefaultDecorationResolver,
+  WindowDecorationClient,
   WindowDecorationContext,
   WindowDecorationDecision,
   WindowDecorationMode,
@@ -660,6 +757,8 @@ export type {
   WaylandWindowActions,
   WaylandWindowSnapshot,
   WaylandWindow,
+  PlasmaSurfaceRole,
+  PlasmaSurfaceState,
   LayerPosition,
   ReactiveWaylandLayer,
   ReactiveWaylandLayerHandle,
@@ -685,6 +784,13 @@ export type {
   KeyBindingOptions,
   KeyBindingEventPhase,
   PointerController,
+  PointerRegionAnchor,
+  PointerRegionOptions,
+  CursorPosition,
+  CursorPositionTarget,
+  CursorKind,
+  HotCorner,
+  HotCornerOptions,
   InputAccelProfile,
   InputClickMethod,
   InputConfigDraft,
@@ -854,17 +960,30 @@ export const Label = defineIntrinsicComponent<LabelProps>("Label");
  */
 export const Button = defineIntrinsicComponent<ButtonProps>("Button");
 
+const AppIconIntrinsic = defineIntrinsicComponent<AppIconProps>("AppIcon");
+
 /**
- * Renders a window's application icon. Pass `window.icon` for reactive updates.
+ * Renders a window's application icon. Pass `window.icon` for reactive updates,
+ * and `fallback` (a path relative to the config package root) for windows
+ * whose icon cannot be found.
  * ウィンドウのアプリケーションアイコンを描画します。
- * `window.icon` を渡すとリアクティブに更新されます。
+ * `window.icon` を渡すとリアクティブに更新されます。`fallback` には、
+ * アイコンが見つからないときに描く画像を設定パッケージルートからの相対パスで
+ * 渡します。
  *
  * @example
  * ```tsx
- * <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
+ * <AppIcon icon={window.icon} fallback="assets/app.svg"
+ *   style={{ width: 16, height: 16 }} />
  * ```
  */
-export const AppIcon = defineIntrinsicComponent<AppIconProps>("AppIcon");
+export function AppIcon(props: AppIconProps) {
+  return AppIconIntrinsic(
+    props.fallback === undefined
+      ? props
+      : { ...props, fallback: resolveAssetPath(props.fallback) },
+  );
+}
 
 const ImageIntrinsic = defineIntrinsicComponent<ImageProps>("Image");
 
@@ -1058,8 +1177,10 @@ function createCompositorDefinition(): CompositorDefinition {
     process: PROCESS_CONTROLLER,
     key: KEY_BINDING_CONTROLLER,
     pointer: POINTER_CONTROLLER,
+    session: SESSION_CONTROLLER,
     input: INPUT_CONTROLLER,
     cursor: CURSOR_CONTROLLER,
+    dnd: DND_CONTROLLER,
     runtime: RUNTIME_CONTROLLER,
     window: WINDOW_CONTROLLER,
     layer: LAYER_CONTROLLER,
@@ -1085,6 +1206,10 @@ installOutputChangeEmitter((event) => {
 installInputDeviceChangeEmitter((event) => {
   COMPOSITOR.event.emitInputDeviceChange(event);
 });
+
+installPointerRegionEventSource((listener) =>
+  COMPOSITOR.event.onPointerRegion(listener),
+);
 
 export function windowAction(action: WindowActionType): WindowActionDescriptor {
   return {

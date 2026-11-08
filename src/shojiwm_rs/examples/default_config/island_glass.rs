@@ -12,6 +12,8 @@ struct IslandGlassOptions {
     refraction: f64,
     chromatic_shift: f64,
     highlight: f64,
+    /// Width of the rim light along the edge.
+    highlight_width: f64,
     blur_radius: i32,
     blur_passes: i32,
     blur_mix: f64,
@@ -25,12 +27,13 @@ struct IslandGlassOptions {
 
 const OPTIONS: IslandGlassOptions = IslandGlassOptions {
     surface_opacity: 0.20,
-    rim_width: 50.0,
-    refraction: 50.0,
-    chromatic_shift: 0.90,
-    highlight: 0.4,
+    rim_width: 80.0,
+    refraction: 80.0,
+    chromatic_shift: 1.90,
+    highlight: 0.6,
+    highlight_width: 2.0,
     blur_radius: 2,
-    blur_passes: 2,
+    blur_passes: 1,
     blur_mix: 1.0,
     normal_smoothing: 3.0,
     edge_softness: 2.0,
@@ -53,6 +56,8 @@ pub fn island_glass() -> SurfaceEffect {
             .uniform("smoothing_px", smoothing)
             .texture("field_input", saved(input))
     };
+
+    let direction_smoothing = OPTIONS.normal_smoothing.max(OPTIONS.rim_width * 0.2);
 
     let mut distance_pipeline = vec![
         // Float-prefilter the silhouette before selecting boundary seeds. The
@@ -84,10 +89,24 @@ pub fn island_glass() -> SurfaceEffect {
         save("island-float-step"),
         smooth([1.0, 0.0], OPTIONS.normal_smoothing, "island-float-step").into(),
         save("island-float-step"),
+        smooth([0.0, 1.0], OPTIONS.normal_smoothing, "island-float-step").into(),
+        save("island-float-step"),
+        // The bend direction comes from a much smoother copy, which rounds it
+        // around corners sharper than the rim.
+        smooth([1.0, 0.0], direction_smoothing, "island-float-step").into(),
+        save("island-direction"),
+        smooth([0.0, 1.0], direction_smoothing, "island-direction").into(),
+        save("island-direction"),
+        // Where the shape is thinner than the rim, the lens flattens out at
+        // its middle instead of creasing there.
         // render_to_if_dirty keeps this final float texture as the state
         // without copying it, so state_source below reads it in the same raw
         // multi-texture coordinate system.
-        smooth([0.0, 1.0], OPTIONS.normal_smoothing, "island-float-step").into(),
+        shader_stage("./src/effect/island-ridge.frag")
+            .uniform("rim_width_px", OPTIONS.rim_width)
+            .texture("field_input", saved("island-float-step"))
+            .texture("direction_input", saved("island-direction"))
+            .into(),
     ]);
 
     let effect = Effect::new(backdrop_source())
@@ -125,6 +144,7 @@ pub fn island_glass() -> SurfaceEffect {
                 .uniform("refraction_px", OPTIONS.refraction)
                 .uniform("chromatic_shift_px", OPTIONS.chromatic_shift)
                 .uniform("highlight_strength", OPTIONS.highlight)
+                .uniform("highlight_width_px", OPTIONS.highlight_width)
                 .uniform("debug_view", OPTIONS.debug_view)
                 .uniform("blur_mix", OPTIONS.blur_mix)
                 .uniform("edge_softness_px", OPTIONS.edge_softness)

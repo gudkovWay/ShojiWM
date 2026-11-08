@@ -137,9 +137,11 @@ const UNMAXIMIZE_GRAB_ANIMATION_DURATION = 90;
 // See `lastRestoreAtMs`: a restore and an activate closer together than this
 // are one taskbar click, so the minimize-raise toggle must not fire.
 const RESTORE_ACTIVATE_GRACE_MS = 100;
-const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);
+export const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);
 const WINDOW_OPEN_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
+/** Offset between floating windows that would otherwise open on the same spot. */
+const FLOATING_CASCADE_STEP = 32;
 const WINDOW_MINIMIZE_RECT_EASING = cubicBezier(0.3, -0.3, 0, 1);
 const WINDOW_UNMINIMIZE_RECT_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_MINIMIZE_OPACITY_EASING = cubicBezier(0.3, -0.3, 0, 1);
@@ -421,6 +423,9 @@ export class HybridWindowManager {
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
+  // Set while `activateWindowById({ instant: true })` runs: state changes it
+  // makes skip their animations.
+  private instantTransitions = false;
   private readonly pendingInitialFocusByWindowId = new Map<string, number>();
   private readonly tileabilityByWindowId = new Map<string, boolean>();
   private readonly tileabilitySubscriptionsByWindowId = new Map<
@@ -1440,16 +1445,33 @@ export class HybridWindowManager {
         event.window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE].set(true);
       }
       markWindowCompositionDirty(event.window);
-      scheduleMinimizeAnimation(event.window, event.minimized);
+      scheduleMinimizeAnimation(
+        event.window,
+        event.minimized,
+        this.instantTransitions,
+      );
     }
+    // A minimized window keeps the keyboard until something else is focused:
+    // the compositor only elects a successor when the owner goes away, and a
+    // minimized window is still mapped. Read after the state flip so the
+    // window no longer counts as a tile or a visible candidate.
+    const successor =
+      event.minimized && !wasMinimized && event.window.isFocused()
+        ? (workspace?.successorForMinimizedWindow(event.window, (window) =>
+            this.windowStack.zIndexValue(window),
+          ) ?? null)
+        : null;
     if (workspace?.isTiled) {
       if (!event.minimized && workspace.shouldTile(event.window)) {
         workspace.focusWindow(event.window);
+      } else if (successor && workspace.shouldTile(successor)) {
+        workspace.focusWindow(successor);
       } else {
         workspace.applyLayout();
       }
       this.applyWorkspaceStackPolicy(workspace);
     }
+    successor?.focus();
   }
 
   public onWindowActivateRequest(event: WindowActivateRequestEvent) {
@@ -1729,7 +1751,7 @@ export class HybridWindowManager {
   public switchWorkspaceTo(
     monitor: string,
     targetIndex: number,
-    options: { focusActiveAfter?: boolean } = {},
+    options: { focusActiveAfter?: boolean; instant?: boolean } = {},
   ) {
     this.workspaceGesture = null;
     this.syncWorkspaces();
@@ -1757,22 +1779,28 @@ export class HybridWindowManager {
       workspace.setVisible(workspace.isActive());
     }
 
-    fromWorkspace.animateWorkspaceTransition({
-      fromOffsetY: 0,
-      toOffsetY: -direction * distance,
-      fromOpacity: 1,
-      toOpacity: 0,
-      visibleAfter: false,
-    });
-    toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
-    toWorkspace.applyLayout();
-    toWorkspace.animateWorkspaceTransition({
-      fromOffsetY: direction * distance,
-      toOffsetY: 0,
-      fromOpacity: 0,
-      toOpacity: 1,
-      visibleAfter: true,
-    });
+    if (options.instant) {
+      fromWorkspace.showInstantly(false);
+      toWorkspace.showInstantly(true);
+      toWorkspace.applyLayout({ animate: false });
+    } else {
+      fromWorkspace.animateWorkspaceTransition({
+        fromOffsetY: 0,
+        toOffsetY: -direction * distance,
+        fromOpacity: 1,
+        toOpacity: 0,
+        visibleAfter: false,
+      });
+      toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
+      toWorkspace.applyLayout();
+      toWorkspace.animateWorkspaceTransition({
+        fromOffsetY: direction * distance,
+        toOffsetY: 0,
+        fromOpacity: 0,
+        toOpacity: 1,
+        visibleAfter: true,
+      });
+    }
     // Callers that explicitly want to focus a *different* window after the
     // transition (e.g. dock activation) opt out of the implicit focus so the
     // resulting onFocus callback chain does not stomp on their pan.
@@ -1909,6 +1937,35 @@ export class HybridWindowManager {
     return undefined;
   }
 
+  /**
+   * Every managed window across all workspaces, most recently focused first
+   * (the focused window leads).
+   */
+  public listWindowsByRecentUse(): WaylandWindow[] {
+    const lastUse = (window: WaylandWindow) =>
+      read(window.isFocused)
+        ? Number.POSITIVE_INFINITY
+        : (this.lastFocusedAt.get(window.id) ?? 0);
+    return this.listWindows()
+      .map((window, order) => ({ window, order, at: lastUse(window) }))
+      .sort((a, b) => b.at - a.at || a.order - b.order)
+      .map(({ window }) => window);
+  }
+
+  /**
+   * Whether `window` is on screen on `monitor` right now: its workspace is the
+   * active one there and it is not minimized.
+   */
+  public isWindowShownOn(window: WaylandWindow, monitor: string): boolean {
+    const workspace = this.findWorkspaceForWindow(window);
+    return (
+      workspace !== undefined &&
+      workspace.monitor === monitor &&
+      workspace.isActive() &&
+      !window.state[WINDOW_STATE_MINIMIZED]()
+    );
+  }
+
   /** Every managed window across all workspaces (debug/IPC use). */
   public listWindows(): WaylandWindow[] {
     const windows: WaylandWindow[] = [];
@@ -1928,7 +1985,17 @@ export class HybridWindowManager {
    *
    * Returns true if the window existed.
    */
-  public activateWindowById(windowId: string): boolean {
+  public activateWindowById(
+    windowId: string,
+    options: {
+      /**
+       * Jump there without the window manager's own animations and without
+       * the minimize-raise toggle: the caller (e.g. the Flip 3D switcher)
+       * animates the change itself.
+       */
+      instant?: boolean;
+    } = {},
+  ): boolean {
     const window = this.findWindowById(windowId);
     if (!window) {
       return false;
@@ -1937,15 +2004,21 @@ export class HybridWindowManager {
     if (!workspace) {
       return false;
     }
+    const instant = options.instant === true;
 
     if (window.state[WINDOW_STATE_MINIMIZED]()) {
-      this.onWindowMinimizeRequest({
-        window,
-        minimized: false,
-        source: "api",
-        timestamp: Date.now(),
-      });
-    } else if (this.minimizeOnReactivate(window, workspace)) {
+      this.instantTransitions = instant;
+      try {
+        this.onWindowMinimizeRequest({
+          window,
+          minimized: false,
+          source: "api",
+          timestamp: Date.now(),
+        });
+      } finally {
+        this.instantTransitions = false;
+      }
+    } else if (!instant && this.minimizeOnReactivate(window, workspace)) {
       // Minimize-raise toggle: an IPC activation is always a dock/taskbar
       // gesture, so re-activating the focused window minimizes it.
       return true;
@@ -1957,12 +2030,13 @@ export class HybridWindowManager {
     // onFocus → focusWindow → applyLayout cycle that overrides our pan.
     this.switchWorkspaceTo(workspace.monitor, workspace.index, {
       focusActiveAfter: false,
+      instant,
     });
 
     // Always pan to the target inside the workspace (force-center even if it
     // is already on-screen). This is the "go to this window" gesture.
     if (workspace.isTiled) {
-      workspace.panToWindow(window);
+      workspace.panToWindow(window, { animate: !instant });
     }
 
     // Focus last so it overrides switchWorkspaceTo's focusActiveWindow().
@@ -2275,7 +2349,11 @@ export class HybridWindowManager {
         }
         workspace.setVisible(workspace.isActive());
       }
-      toWorkspace.applyLayout();
+      // Snap, don't animate: the finger drives the slide through a static
+      // offset, and a rect animation overrides the whole rect — offset
+      // included — so the tiles would sit at their final position until it
+      // ended. (Keyboard switching animates the offset itself, which stacks.)
+      toWorkspace.applyLayout({ animate: false });
     }
 
     fromWorkspace.setWorkspaceGestureVisual(rawOffsetY, fromOpacity);
@@ -3560,7 +3638,10 @@ export class Workspace {
         preserveMissingActive: restored !== undefined,
       });
     } else if (this.isTiled) {
-      const initialRect = this.centeredFloatingRect(window);
+      const initialRect = this.cascadeFloatingRect(
+        this.centeredFloatingRect(window),
+        this.visibleFloatingRects(window),
+      );
       const contentRect =
         restored?.floatingRect ??
         this.viewportRectToFloatingContentRect(initialRect);
@@ -3569,7 +3650,12 @@ export class Workspace {
         this.floatingContentRectToViewportRect(contentRect),
       );
     } else {
-      window.state[WINDOW_STATE_RECT].set(this.centeredFloatingRect(window));
+      window.state[WINDOW_STATE_RECT].set(
+        this.cascadeFloatingRect(
+          this.centeredFloatingRect(window),
+          this.visibleFloatingRects(window),
+        ),
+      );
     }
     hotReloadDebug("workspace-add-window", {
       monitor: this.monitor,
@@ -3656,6 +3742,49 @@ export class Workspace {
     }
     const tileable = this.tileableWindows();
     return tileable[Math.min(tileIndex, tileable.length - 1)] ?? null;
+  }
+
+  /**
+   * The window that inherits focus when the focused `window` is minimized,
+   * called once it already counts as minimized.
+   *
+   * A tile hands focus to the tile that slides into its slot, as a removed
+   * tile does. Anything else hands it to the topmost window still on screen:
+   * floating windows stack by focus order, so that is also the one used most
+   * recently. In a tiled workspace only floating windows compete on z-order —
+   * tiles scrolled out of view sit in the same stack — and the active tile
+   * is the fallback.
+   */
+  public successorForMinimizedWindow(
+    window: WaylandWindow,
+    zIndexOf: (window: WaylandWindow) => number,
+  ): WaylandWindow | null {
+    if (this.isTiled && this.shouldTile(window)) {
+      const tile = this.successorForRemovedWindow(
+        true,
+        this.tileIndexOf(window.id),
+      );
+      if (tile) {
+        return tile;
+      }
+    }
+    const topmost = this.windows
+      .filter(
+        (current) =>
+          current.id !== window.id &&
+          !current.state[WINDOW_STATE_MINIMIZED]() &&
+          (!this.isTiled || !this.shouldTile(current)),
+      )
+      .reduce<WaylandWindow | null>(
+        (top, current) =>
+          top === null || zIndexOf(current) > zIndexOf(top) ? current : top,
+        null,
+      );
+    if (topmost || !this.isTiled) {
+      return topmost;
+    }
+    const tileable = this.tileableWindows();
+    return this.activeWindow(tileable) ?? tileable.at(-1) ?? null;
   }
 
   public removeTileDragWindow(window: WaylandWindow) {
@@ -3823,6 +3952,14 @@ export class Workspace {
     }
   }
 
+  /** `setVisible` that also stops a running workspace slide/fade. */
+  public showInstantly(visible: boolean) {
+    for (const window of this.windows) {
+      cancelWorkspaceVisualAnimation(window);
+    }
+    this.setVisible(visible);
+  }
+
   public prepareWorkspaceTransition(offsetY: number, opacity: number) {
     this.visibilityAnimationToken += 1;
     for (const window of this.windows) {
@@ -3970,6 +4107,7 @@ export class Workspace {
       return;
     }
 
+    const restoredFloatingRects: ManagedWindowRect[] = [];
     for (const window of this.windows) {
       // A window that is still maximized across the mode switch keeps its
       // maximized rect. Restoring FLOATING_RECT here would configure the
@@ -3992,9 +4130,14 @@ export class Workspace {
       }
       const rect = window.state[WINDOW_STATE_FLOATING_RECT]();
       if (rect) {
+        // Tiles all remember the centered rect they were opened with, so
+        // without the cascade they would land exactly on top of each other.
         const viewportRect = this.shouldTile(window)
-          ? rect
+          ? this.cascadeFloatingRect(rect, restoredFloatingRects)
           : this.floatingContentRectToViewportRect(rect);
+        if (!window.state[WINDOW_STATE_MINIMIZED]()) {
+          restoredFloatingRects.push(viewportRect);
+        }
         playRectAnimation(
           window,
           WINDOW_STATE_RECT,
@@ -4057,7 +4200,6 @@ export class Workspace {
 
     const viewportRect = this.tileViewportRect();
     this.lastAppliedTileViewportRect = snapshotManagedRect(viewportRect);
-    const tileHeight = read(viewportRect.height);
     let nextX = read(viewportRect.x) - this.physicalAlignedScrollOffset();
     const appliedRects: Record<string, ManagedWindowRect> = {};
     this.lastDraggingSlotRect = null;
@@ -4068,12 +4210,7 @@ export class Workspace {
         ? this.fullscreenRootRect(window)
         : window.state[WINDOW_STATE_MAXIMIZED]()
           ? this.maximizedTileRect(window, nextX)
-          : {
-              x: nextX,
-              y: read(viewportRect.y),
-              width: tileWidth,
-              height: tileHeight,
-            };
+          : this.tileRect(window, nextX, tileWidth, viewportRect);
       appliedRects[window.id] = rect;
       if (window.id === this.draggingWindowId) {
         this.lastDraggingSlotRect = rect;
@@ -4263,7 +4400,7 @@ export class Workspace {
    * normal `scrollToWindow` which is a no-op when already visible) and animate
    * the layout. Used by dock clicks and any other "jump to window" gesture.
    */
-  public panToWindow(window: WaylandWindow) {
+  public panToWindow(window: WaylandWindow, options: { animate?: boolean } = {}) {
     if (!this.isTiled) {
       return;
     }
@@ -4272,7 +4409,7 @@ export class Workspace {
     }
     this.activeWindowId = window.id;
     this.scrollToWindow(window, { force: true });
-    this.applyLayout();
+    this.applyLayout({ animate: options.animate ?? true });
   }
 
   public focusWindowUnderPointer(
@@ -5051,20 +5188,97 @@ export class Workspace {
     }
   }
 
-  private centeredFloatingRect(window: WaylandWindow): ManagedWindowRect {
-    const sizeRect = this.naturalRootRect(window);
+  /** The monitor's usable area in logical coordinates, if it is known. */
+  private floatingPlacementArea():
+    | { x: number; y: number; width: number; height: number }
+    | undefined {
     const monitor = COMPOSITOR.output.current[this.monitor];
     if (!monitor?.resolution) {
+      return undefined;
+    }
+    const usableRect = COMPOSITOR.layer.usableArea(this.monitor);
+    return {
+      x: usableRect?.x ?? monitor.position.x,
+      y: usableRect?.y ?? monitor.position.y,
+      width: usableRect?.width ?? monitor.resolution.width / monitor.scale,
+      height: usableRect?.height ?? monitor.resolution.height / monitor.scale,
+    };
+  }
+
+  /**
+   * Step `rect` down and to the right until its top-left corner no longer
+   * sits on one of `occupied`'s, so windows opened at the same default place
+   * stay distinguishable instead of hiding each other exactly. A step that
+   * would push the window past the bottom or right of the usable area starts
+   * a new cascade from the area's top-left, one step further right each time.
+   */
+  private cascadeFloatingRect(
+    rect: ManagedWindowRect,
+    occupied: readonly ManagedWindowRect[],
+  ): ManagedWindowRect {
+    const corners = occupied.map((other) => ({
+      x: read(other.x),
+      y: read(other.y),
+    }));
+    const width = read(rect.width);
+    const height = read(rect.height);
+    let x = read(rect.x);
+    let y = read(rect.y);
+    const isTaken = () =>
+      corners.some(
+        (corner) =>
+          Math.abs(corner.x - x) < FLOATING_CASCADE_STEP / 2 &&
+          Math.abs(corner.y - y) < FLOATING_CASCADE_STEP / 2,
+      );
+    if (!isTaken()) {
+      return rect;
+    }
+    const area = this.floatingPlacementArea();
+    let restarts = 0;
+    for (let step = 0; step < 64 && isTaken(); step++) {
+      x += FLOATING_CASCADE_STEP;
+      y += FLOATING_CASCADE_STEP;
+      if (
+        area &&
+        (x + width > area.x + area.width || y + height > area.y + area.height)
+      ) {
+        restarts += 1;
+        x = area.x + restarts * FLOATING_CASCADE_STEP;
+        y = area.y;
+        if (x + width > area.x + area.width) {
+          // Too wide to cascade any further: give up rather than loop.
+          return rect;
+        }
+      }
+    }
+    return { x, y, width, height };
+  }
+
+  /** Viewport rects of this workspace's visible floating windows. */
+  private visibleFloatingRects(except: WaylandWindow): ManagedWindowRect[] {
+    return this.windows
+      .filter(
+        (current) =>
+          current.id !== except.id &&
+          !current.state[WINDOW_STATE_MINIMIZED]() &&
+          !current.state[WINDOW_STATE_MAXIMIZED]() &&
+          (!this.isTiled || !this.shouldTile(current)),
+      )
+      .map((current) => current.state[WINDOW_STATE_RECT]());
+  }
+
+  private centeredFloatingRect(window: WaylandWindow): ManagedWindowRect {
+    const sizeRect = this.naturalRootRect(window);
+    const area = this.floatingPlacementArea();
+    if (!area) {
       return sizeRect;
     }
-
-    const usableRect = COMPOSITOR.layer.usableArea(this.monitor);
-    const logicalWidth =
-      usableRect?.width ?? monitor.resolution.width / monitor.scale;
-    const logicalHeight =
-      usableRect?.height ?? monitor.resolution.height / monitor.scale;
-    const logicalX = usableRect?.x ?? monitor.position.x;
-    const logicalY = usableRect?.y ?? monitor.position.y;
+    const {
+      x: logicalX,
+      y: logicalY,
+      width: logicalWidth,
+      height: logicalHeight,
+    } = area;
 
     let width = read(sizeRect.width);
     let height = read(sizeRect.height);
@@ -5260,11 +5474,42 @@ export class Workspace {
   ): number {
     const constraints = window.sizeConstraints();
     const extra = this.rootClientWidthExtra(window);
+    const clientMin = (constraints.min?.width ?? 1) + extra;
+    // The layout floor must not widen a window past the client's own maximum.
     return Math.max(
-      TILE_MIN_WIDTH,
-      (constraints.min?.width ?? 1) + extra,
-      read(viewportRect.width) * 0.2,
+      clientMin,
+      Math.min(
+        Math.max(TILE_MIN_WIDTH, read(viewportRect.width) * 0.2),
+        this.maxTileWidth(window),
+      ),
     );
+  }
+
+  // A tile spans the viewport height unless the client caps its height; such a
+  // window keeps its maximum and is centered vertically instead of stretched.
+  private tileRect(
+    window: WaylandWindow,
+    x: number,
+    width: number,
+    viewportRect: ManagedWindowRect,
+  ): ManagedWindowRect {
+    const viewportHeight = read(viewportRect.height);
+    const constraints = window.sizeConstraints();
+    const height = Math.min(
+      viewportHeight,
+      constrainedMax(constraints, "height", this.rootClientHeightExtra(window)),
+    );
+    return {
+      x,
+      y: read(viewportRect.y) + Math.round((viewportHeight - height) / 2),
+      width,
+      height,
+    };
+  }
+
+  private rootClientHeightExtra(window: WaylandWindow): number {
+    const natural = this.naturalRootRect(window);
+    return Math.max(0, read(natural.height) - window.position.height);
   }
 
   private maxTileWidth(window: WaylandWindow): number {
@@ -5551,7 +5796,19 @@ function scheduleCloseAnimation(window: WaylandWindow): void {
 function scheduleMinimizeAnimation(
   window: WaylandWindow,
   minimized: boolean,
+  instant = false,
 ): void {
+  if (instant) {
+    // Replace whatever the channel holds with its end pose.
+    const rest = minimized ? { x: 0, y: 120, width: 0, height: 0 } : { x: 0, y: 0, width: 0, height: 0 };
+    const opacity = minimized ? 0 : 1;
+    window.scheduleAnimation({
+      channel: MINIMIZE_ANIMATION_CHANNEL,
+      rect: { from: rest, to: rest, duration: 1, mode: "add" },
+      opacity: { from: opacity, to: opacity, duration: 1, mode: "override" },
+    });
+    return;
+  }
   window.scheduleAnimation({
     channel: MINIMIZE_ANIMATION_CHANNEL,
     rect: {

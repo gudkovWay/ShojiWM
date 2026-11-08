@@ -73,6 +73,9 @@ fn main() -> std::process::ExitCode {
 | `window-manager.ts` | `window_manager.rs`、`workspace.rs` |
 | `window-animation.ts` | `window_animation.rs` |
 | `effect/island-glass.ts` | `island_glass.rs` |
+| `window-switcher.tsx` | `window_switcher.rs` |
+| `flip-3d.tsx` | `flip_3d.rs` |
+| `window-grid.tsx` | `window_grid.rs` |
 
 シェーダーとアイコンは `packages/config` のものをそのまま使います。ソースの
 チェックアウトから起動してください（`nix develop` の中か、
@@ -133,8 +136,16 @@ fn setup() {
 | `{hover() && <Icon />}` | `.child_dyn(move \|\| hover.get().then(icon))` |
 | `compileEffect({ input, pipeline })` | `Effect::new(input).stage(..)` |
 | `get("name")`（保存したテクスチャ） | `saved("name")` |
-| `setTimeout` / `createPoll` | `set_timeout` / `set_interval` |
+| `setTimeout` | `set_timeout` |
+| `createPoll(ms, cb, { output })` / `window.createPoll` / `createPollForEachOutput` | `create_poll(ms, output, cb)` / `window.create_poll` / `create_poll_for_each_output` |
 | `createIpcServer()` | `shojiwm_rs::ipc::IpcServer`（同じプロトコル） |
+| `COMPOSITOR.effect.background_effect = computed(..)` | `COMPOSITOR.effect.background_with(\|\| ..)` |
+| `COMPOSITOR.effect.overlay(output, { effect })` | `COMPOSITOR.effect.overlay(output, Overlay::new(effect))`（すぐ返る。await の代わりに `on_ready` / `on_closed`） |
+| `COMPOSITOR.session.configureLockBackground({ windowIds, layerIds })` | `COMPOSITOR.session.configure_lock_background(LockBackground { window_ids, layer_ids })` |
+| `COMPOSITOR.rendering.framePacing = ..` | `COMPOSITOR.rendering.frame_pacing(..)` / `frame_pacing_with(\|output\| ..)` |
+| `COMPOSITOR.rendering.composition = (output) => <DefaultComposition />` | `COMPOSITOR.rendering.composition(\|output\| OutputStack::default_stacking())` |
+| `<Layers>`, `<Windows>`, `<Scene3D>`, `<Plane>`, `renderTexture()` | `Layers::new`、`Windows::all` / `Windows::only`、`Scene3D::new`、`Plane::new`、`RenderTexture::new` |
+| `COMPOSITOR.input.grab({ onKey, ... })` | `COMPOSITOR.input.grab(InputGrabOptions::new().on_key(..))` |
 
 TypeScript と違う点:
 

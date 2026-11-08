@@ -1,22 +1,22 @@
 use smithay::utils::SERIAL_COUNTER;
 use smithay::{
+    backend::renderer::buffer_dimensions,
     desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output},
     output::Output,
     reexports::wayland_server::{
         Resource,
         protocol::{wl_output, wl_surface::WlSurface},
     },
-    backend::renderer::buffer_dimensions,
     utils::{Buffer as BufferCoord, Logical, Rectangle, Size},
     wayland::{
         compositor::{
             BufferAssignment, Damage, SurfaceAttributes, get_children, get_parent, with_states,
         },
-        viewporter::ViewportCachedState,
         shell::wlr_layer::{
             KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
             WlrLayerShellHandler,
         },
+        viewporter::ViewportCachedState,
     },
 };
 use tracing::{debug, info, warn};
@@ -35,6 +35,16 @@ fn layer_popup_root_debug_enabled() -> bool {
 impl WlrLayerShellHandler for ShojiWM {
     fn shell_state(&mut self) -> &mut smithay::wayland::shell::wlr_layer::WlrLayerShellState {
         &mut self.layer_shell_state
+    }
+
+    fn new_popup(
+        &mut self,
+        _parent: WlrLayerSurface,
+        popup: smithay::wayland::shell::xdg::PopupSurface,
+    ) {
+        // `xdg_surface.get_popup` arrived with a null parent, so the xdg-shell
+        // `new_popup` could not place it; the panel is only known now.
+        self.unconstrain_popup(&popup);
     }
 
     fn new_layer_surface(
@@ -259,17 +269,18 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface, damage: LayerComm
             );
         }
         if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG")
-            && let Some(geo) = layer_geo {
-                debug!(
-                    owner = %owner,
-                    layer_geo_loc = ?geo.loc,
-                    layer_geo_size = ?geo.size,
-                    output_loc = ?output_loc,
-                    global_loc_x = output_loc.x + geo.loc.x,
-                    global_loc_y = output_loc.y + geo.loc.y,
-                    "layer source damage stored (global coords)"
-                );
-            }
+            && let Some(geo) = layer_geo
+        {
+            debug!(
+                owner = %owner,
+                layer_geo_loc = ?geo.loc,
+                layer_geo_size = ?geo.size,
+                output_loc = ?output_loc,
+                global_loc_x = output_loc.x + geo.loc.x,
+                global_loc_y = output_loc.y + geo.loc.y,
+                "layer source damage stored (global coords)"
+            );
+        }
         let runtime_id = crate::ssd::layer_runtime_id(layer);
         let previous_rect = match layer_rect {
             Some(rect) => state.layer_source_rects.insert(runtime_id, rect),
@@ -288,10 +299,14 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface, damage: LayerComm
                 &mut state.upper_layer_source_damage
             }
         };
-        source_damage.extend(damage_rects.into_iter().map(|rect| crate::state::OwnedDamageRect {
-            owner: owner.clone(),
-            rect,
-        }));
+        source_damage.extend(
+            damage_rects
+                .into_iter()
+                .map(|rect| crate::state::OwnedDamageRect {
+                    owner: owner.clone(),
+                    rect,
+                }),
+        );
 
         let surface_id = layer.wl_surface().id().protocol_id();
         let keyboard_interactivity = layer.cached_state().keyboard_interactivity;
@@ -448,9 +463,14 @@ fn layer_source_damage_rects(
             _ => vec![layer_rect],
         };
     };
-    let surface_rects = surface
-        .iter()
-        .map(|rect| (rect.loc.x as f64, rect.loc.y as f64, rect.size.w as f64, rect.size.h as f64));
+    let surface_rects = surface.iter().map(|rect| {
+        (
+            rect.loc.x as f64,
+            rect.loc.y as f64,
+            rect.size.w as f64,
+            rect.size.h as f64,
+        )
+    });
     // The buffer covers the whole surface (a root layer surface has no geometry
     // offset), whatever buffer scale or viewport destination maps one to the other.
     let buffer_rects = buffer_size.iter().flat_map(|size| {

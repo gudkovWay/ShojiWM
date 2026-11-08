@@ -163,7 +163,12 @@ fn ordered_paint_elements(
             continue;
         }
         if let Some(element) = crate::backend::paint::paint_element(
-            renderer, to_output, paint_cache, cached, output_geo, alpha,
+            renderer,
+            to_output,
+            paint_cache,
+            cached,
+            output_geo,
+            alpha,
         )? {
             items.push((cached.order, DecorationSceneElements::Paint(element)));
         }
@@ -186,13 +191,12 @@ pub fn popup_elements_for_decoration(
         .into_iter()
         .map(|(order, element)| (order, PopupSceneElement::Decoration(element)))
         .collect::<Vec<_>>();
-    let textures = text::ordered_text_elements_for_part(
-        renderer, decoration, part, output_geo, scale, alpha,
-    )?
-    .into_iter()
-    .chain(crate::backend::icon::ordered_icon_elements_for_part(
-        renderer, decoration, part, output_geo, scale, alpha,
-    )?);
+    let textures =
+        text::ordered_text_elements_for_part(renderer, decoration, part, output_geo, scale, alpha)?
+            .into_iter()
+            .chain(crate::backend::icon::ordered_icon_elements_for_part(
+                renderer, decoration, part, output_geo, scale, alpha,
+            )?);
     items.extend(textures.map(|(order, element)| (order, PopupSceneElement::Texture(element))));
     items.sort_by_key(|(order, _)| *order);
     Ok(items.into_iter().map(|(_, element)| element).collect())
@@ -356,6 +360,26 @@ fn shader_effect_spec(
     scale: Scale<f64>,
     alpha: f32,
 ) -> Option<ShaderEffectSpec> {
+    shader_effect_spec_in_root(
+        decoration.layout.root.rect,
+        decoration.root_subpixel_offset,
+        cached,
+        output_geo,
+        scale,
+        alpha,
+    )
+}
+
+/// The spec of a decoration's `<ShaderEffect>` with its geometry relative to
+/// the root's physical origin, like every decoration element.
+pub(crate) fn shader_effect_spec_in_root(
+    root_rect: LogicalRect,
+    root_subpixel_offset: crate::backend::visual::RootSubpixelEdges,
+    cached: &crate::backend::shader_effect::CachedShaderEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Option<ShaderEffectSpec> {
     if gap_show_border_shell_only_enabled()
         || intersect_logical_rect(cached.rect, output_geo).is_none()
     {
@@ -363,10 +387,7 @@ fn shader_effect_spec(
     }
 
     let local_rect = Rectangle::new(
-        Point::from((
-            cached.rect.x - decoration.layout.root.rect.x,
-            cached.rect.y - decoration.layout.root.rect.y,
-        )),
+        Point::from((cached.rect.x - root_rect.x, cached.rect.y - root_rect.y)),
         (cached.rect.width, cached.rect.height).into(),
     );
     let geometry = cached
@@ -374,8 +395,8 @@ fn shader_effect_spec(
         .map(|rect| {
             relative_physical_rect_from_root_precise(
                 rect,
-                decoration.layout.root.rect,
-                decoration.root_subpixel_offset,
+                root_rect,
+                root_subpixel_offset,
                 output_geo,
                 scale,
             )
@@ -383,8 +404,8 @@ fn shader_effect_spec(
         .unwrap_or_else(|| {
             relative_physical_rect_from_root_snapped_edges(
                 cached.rect,
-                decoration.layout.root.rect,
-                decoration.root_subpixel_offset,
+                root_rect,
+                root_subpixel_offset,
                 output_geo,
                 scale,
             )
@@ -428,16 +449,16 @@ fn shader_effect_spec(
                         rect_precise,
                         local_rect.size.w,
                         local_rect.size.h,
-                        decoration.layout.root.rect,
-                        decoration.root_subpixel_offset,
+                        root_rect,
+                        root_subpixel_offset,
                         output_geo,
                         scale,
                     )
                 })
                 .or_else(|| {
-                    cached.clip_rect.map(|clip_rect| {
-                        local_clip_from_logical_rects(clip_rect, cached.rect)
-                    })
+                    cached
+                        .clip_rect
+                        .map(|clip_rect| local_clip_from_logical_rects(clip_rect, cached.rect))
                 })
         },
         clip_radius: if gap_disable_decoration_clip_enabled()

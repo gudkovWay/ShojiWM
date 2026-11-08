@@ -221,8 +221,7 @@ impl XdgShellHandler for ShojiWM {
         // finalize handshake reports the close; if it did not, nobody else will.
         let mut promoted = false;
         if let Some(decoration) = decoration.as_ref() {
-            if let Err(error) = crate::backend::tty::capture_live_snapshot_for_close(self, &window)
-            {
+            if let Err(error) = crate::backend::capture_live_snapshot_for_close(self, &window) {
                 warn!(
                     window_id,
                     title = decoration.snapshot.title,
@@ -255,10 +254,16 @@ impl XdgShellHandler for ShojiWM {
         if !promoted
             && let Err(error) = self.close_window_in_runtime(
                 &window_id,
-                decoration.as_ref().map(|decoration| decoration.layout.root.rect),
+                decoration
+                    .as_ref()
+                    .map(|decoration| decoration.layout.root.rect),
             )
         {
-            warn!(window_id, ?error, "failed to report destroyed xdg toplevel to the runtime");
+            warn!(
+                window_id,
+                ?error,
+                "failed to report destroyed xdg toplevel to the runtime"
+            );
         }
         // Elect a successor now that the window is out of the space. Nothing
         // else on the close path touches keyboard focus, so the dead target
@@ -602,9 +607,7 @@ impl XdgShellHandler for ShojiWM {
             return;
         }
 
-        if can_receive_keyboard_focus
-            && let Some(keyboard) = keyboard.as_ref()
-        {
+        if can_receive_keyboard_focus && let Some(keyboard) = keyboard.as_ref() {
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = pointer.as_ref() {
@@ -766,7 +769,7 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
 }
 
 impl ShojiWM {
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
@@ -776,6 +779,7 @@ impl ShojiWM {
             .elements()
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
         else {
+            self.unconstrain_layer_popup(popup, &root);
             return;
         };
 
@@ -835,6 +839,48 @@ impl ShojiWM {
                     target = ?target,
                     unconstrained = ?unconstrained,
                     "xdg popup unconstrain"
+                );
+            }
+            state.geometry = unconstrained;
+        });
+    }
+
+    /// Keep a popup of a layer-shell panel (bar menus, tray menus) on the
+    /// output its panel is on. Without this the positioner geometry was used
+    /// as-is, so a menu opened near a screen edge ran off it, while labwc and
+    /// niri slide or flip it back in.
+    fn unconstrain_layer_popup(&self, popup: &PopupSurface, root: &WlSurface) {
+        let Some((output_geo, layer_geo)) = self.space.outputs().find_map(|output| {
+            let map = layer_map_for_output(output);
+            let layer = map.layer_for_surface(root, WindowSurfaceType::TOPLEVEL)?;
+            Some((
+                self.space.output_geometry(output)?,
+                map.layer_geometry(layer)?,
+            ))
+        }) else {
+            return;
+        };
+        let popup_toplevel_coords = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+
+        // Relative to the panel's surface, like the positioner's own geometry.
+        // `layer_geometry` is output-local, so the output is taken at origin.
+        let mut target = Rectangle::from_size(output_geo.size);
+        target.loc -= layer_geo.loc;
+        target.loc -= popup_toplevel_coords;
+
+        popup.with_pending_state(|state| {
+            let unconstrained = state.positioner.get_unconstrained_geometry(target);
+            if xdg_popup_debug_enabled() {
+                debug!(
+                    popup_surface_id = popup.wl_surface().id().protocol_id(),
+                    root_surface_id = root.id().protocol_id(),
+                    output_geo = ?output_geo,
+                    layer_geo = ?layer_geo,
+                    popup_toplevel_coords = ?popup_toplevel_coords,
+                    positioner_geometry = ?state.positioner.get_geometry(),
+                    target = ?target,
+                    unconstrained = ?unconstrained,
+                    "layer popup unconstrain"
                 );
             }
             state.geometry = unconstrained;

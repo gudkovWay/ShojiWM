@@ -1,5 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DisplayModePreference {
     #[default]
     Auto,
@@ -9,7 +8,6 @@ pub enum DisplayModePreference {
         refresh_mhz: Option<i32>,
     },
 }
-
 
 #[derive(Debug, Clone, Default)]
 pub struct DisplayConfig {
@@ -37,6 +35,82 @@ pub struct RuntimeOutputConfig {
     /// `wl_output.geometry`. Unset keeps what the kernel reported for the
     /// connector, which is `unknown` for most panels.
     pub subpixel: Option<RuntimeOutputSubpixel>,
+    /// `hdr`: `true`/`false`, or the HDR settings (which turn it on).
+    pub hdr: Option<RuntimeHdrConfig>,
+    /// Path of the monitor's ICC profile (`~/` allowed). Applied while the
+    /// output runs SDR.
+    pub icc: Option<String>,
+}
+
+/// `hdr`: a plain switch, or the settings of an HDR output.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RuntimeHdrConfig {
+    Enabled(bool),
+    Options(RuntimeHdrOptions),
+}
+
+impl RuntimeHdrConfig {
+    /// Whether the output should be driven as HDR10. The settings form turns
+    /// it on unless it says `enabled: false`.
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Enabled(enabled) => *enabled,
+            Self::Options(options) => options.enabled.unwrap_or(true),
+        }
+    }
+
+    /// The settings, if any were given.
+    pub fn options(&self) -> Option<&RuntimeHdrOptions> {
+        match self {
+            Self::Enabled(_) => None,
+            Self::Options(options) => Some(options),
+        }
+    }
+}
+
+/// The settings form of `hdr`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHdrOptions {
+    /// Unset means on: giving settings turns HDR on. `false` keeps the
+    /// settings but drives the output as SDR.
+    pub enabled: Option<bool>,
+    /// What SDR white is shown at on an HDR output: a fixed luminance, or
+    /// following the panel's backlight. Unset follows the backlight when the
+    /// output has one, else `SHOJI_SDR_NITS`, else 203 (ITU-R BT.2408).
+    pub sdr_luminance: Option<RuntimeSdrLuminance>,
+    /// How SDR content's colors are shown on an HDR output. Unset is native.
+    pub sdr_gamut: Option<RuntimeSdrGamut>,
+    /// Real peak luminance of the display in cd/m². Only needed when the
+    /// EDID advertises PQ but omits its luminance fields, which is common.
+    pub max_luminance: Option<f32>,
+    /// Real black level of the display in cd/m². Same caveat.
+    pub min_luminance: Option<f32>,
+}
+
+/// `hdr.sdrGamut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeSdrGamut {
+    /// Stretched over the panel's own gamut, as the panel shows it in SDR mode.
+    Native,
+    /// Colorimetrically exact sRGB.
+    Srgb,
+}
+
+/// `hdr.sdrLuminance`: cd/m², or `"backlight"`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RuntimeSdrLuminance {
+    Nits(f32),
+    Keyword(RuntimeSdrLuminanceKeyword),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeSdrLuminanceKeyword {
+    Backlight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -186,9 +260,11 @@ pub fn tty_output_names_match(candidate: &str, actual: &str) -> bool {
 
 fn normalize_tty_output_name(name: &str) -> &str {
     if let Some((prefix, rest)) = name.split_once('-')
-        && prefix.starts_with("card") && prefix[4..].chars().all(|ch| ch.is_ascii_digit()) {
-            return rest;
-        }
+        && prefix.starts_with("card")
+        && prefix[4..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        return rest;
+    }
     name
 }
 
@@ -248,12 +324,10 @@ mod tests {
     /// Absent and `null` both mean "keep the detected layout".
     #[test]
     fn runtime_output_config_subpixel_absent_or_null_is_none() {
-        let absent: RuntimeOutputConfig =
-            serde_json::from_str(r#"{"mode":"extend"}"#).unwrap();
+        let absent: RuntimeOutputConfig = serde_json::from_str(r#"{"mode":"extend"}"#).unwrap();
         assert_eq!(absent.subpixel, None);
         let null: RuntimeOutputConfig =
-            serde_json::from_str(r#"{"mode":"mirror","source":"eDP-1","subpixel":null}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"mode":"mirror","source":"eDP-1","subpixel":null}"#).unwrap();
         assert_eq!(null.subpixel, None);
     }
 
@@ -265,13 +339,19 @@ mod tests {
             Subpixel::VerticalBgr,
         );
         assert_eq!(
-            resolve_output_subpixel(Some(RuntimeOutputSubpixel::HorizontalRgb), Subpixel::Unknown),
+            resolve_output_subpixel(
+                Some(RuntimeOutputSubpixel::HorizontalRgb),
+                Subpixel::Unknown
+            ),
             Subpixel::HorizontalRgb,
         );
         // An explicit "unknown" still overrides a kernel report the user
         // knows to be wrong.
         assert_eq!(
-            resolve_output_subpixel(Some(RuntimeOutputSubpixel::Unknown), Subpixel::HorizontalBgr),
+            resolve_output_subpixel(
+                Some(RuntimeOutputSubpixel::Unknown),
+                Subpixel::HorizontalBgr
+            ),
             Subpixel::Unknown,
         );
     }
@@ -296,5 +376,77 @@ mod tests {
                 .unwrap_or_else(|error| panic!("snapshot name {json} does not parse: {error}"));
             assert_eq!(parsed.to_smithay(), subpixel);
         }
+    }
+
+    /// `hdr` is a switch or the settings object; the object turns HDR on
+    /// unless it says `enabled: false`, and missing means SDR.
+    #[test]
+    fn runtime_output_config_parses_hdr_flag() {
+        let update: RuntimeDisplayConfigUpdate = serde_json::from_str(
+            r#"{"outputs":{
+                "HDMI-A-3":{"mode":"extend","resolution":"best","hdr":true},
+                "DP-2":{"hdr":{"sdrGamut":"srgb","maxLuminance":420,"minLuminance":0.05}},
+                "DP-3":{"hdr":{"enabled":false,"sdrLuminance":250}},
+                "eDP-1":{"mode":"extend","resolution":"best"}
+            }}"#,
+        )
+        .expect("display config update should parse");
+        let hdr = |name: &str| update.outputs[name].as_ref().unwrap().hdr.clone();
+        assert_eq!(hdr("HDMI-A-3"), Some(RuntimeHdrConfig::Enabled(true)));
+        assert_eq!(hdr("eDP-1"), None);
+        let dp2 = hdr("DP-2").unwrap();
+        assert!(dp2.enabled());
+        assert_eq!(
+            dp2.options(),
+            Some(&RuntimeHdrOptions {
+                sdr_gamut: Some(RuntimeSdrGamut::Srgb),
+                max_luminance: Some(420.0),
+                min_luminance: Some(0.05),
+                ..Default::default()
+            })
+        );
+        assert!(!hdr("DP-3").unwrap().enabled());
+    }
+
+    #[test]
+    fn runtime_output_config_parses_icc_path() {
+        let update: RuntimeDisplayConfigUpdate = serde_json::from_str(
+            r#"{"outputs":{
+                "DP-1":{"icc":"~/.local/share/icc/DP-1.icc"},
+                "eDP-1":{"mode":"extend"}
+            }}"#,
+        )
+        .expect("display config update should parse");
+        let icc = |name: &str| update.outputs[name].as_ref().unwrap().icc.clone();
+        assert_eq!(icc("DP-1").as_deref(), Some("~/.local/share/icc/DP-1.icc"));
+        assert_eq!(icc("eDP-1"), None);
+    }
+
+    /// `hdr.sdrLuminance` takes cd/m² or the keyword that follows the backlight.
+    #[test]
+    fn runtime_output_config_parses_sdr_luminance() {
+        let update: RuntimeDisplayConfigUpdate = serde_json::from_str(
+            r#"{"outputs":{
+                "eDP-1":{"hdr":{"sdrLuminance":"backlight"}},
+                "DP-1":{"hdr":{"sdrLuminance":300}}
+            }}"#,
+        )
+        .expect("display config update should parse");
+        let sdr = |name: &str| {
+            update.outputs[name]
+                .as_ref()
+                .unwrap()
+                .hdr
+                .as_ref()
+                .and_then(|hdr| hdr.options())
+                .and_then(|options| options.sdr_luminance)
+        };
+        assert_eq!(
+            sdr("eDP-1"),
+            Some(RuntimeSdrLuminance::Keyword(
+                RuntimeSdrLuminanceKeyword::Backlight
+            ))
+        );
+        assert_eq!(sdr("DP-1"), Some(RuntimeSdrLuminance::Nits(300.0)));
     }
 }

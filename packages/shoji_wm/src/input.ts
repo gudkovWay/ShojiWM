@@ -7,6 +7,7 @@ import type {
   InputDeviceInfo,
 } from "./types";
 import type { InputDeviceChangeEvent } from "./events";
+import { grabInput } from "./input-grab";
 
 let currentInputState: Record<string, InputDeviceInfo> = {};
 let desiredInputConfig: InputConfigDraft = { device: {} };
@@ -208,5 +209,8 @@ export const INPUT_CONTROLLER: InputController = {
   },
   reconfigure() {
     reconfigureInput();
+  },
+  grab(options) {
+    return grabInput(options);
   },
 };

@@ -139,6 +139,9 @@ handle.cancel(); // 全出力の poll を止める
 `output` なしで作った poll はエラーになり、エラーメッセージに新しい書き方が示されます。
 
 :::note
-Rust SDK（`shojiwm_rs`）は時計を 1 つだけ持ちます。`set_interval` / `set_timeout` は
-従来どおり、描画されたすべてのフレームで進みます。
+Rust SDK（`shojiwm_rs`）も同じ仕組みで時刻を扱います:
+`create_poll(interval_ms, output, |handle| ..)`（`handle.now_ms()`）、
+`window.create_poll`、`create_poll_for_each_output`、ウィンドウの出力で進む
+アニメーションには `Animation::new(..).on_output(window.output())`。
+`set_interval` / `set_timeout` は出力に結び付かず、次に描画する出力で進みます。
 :::

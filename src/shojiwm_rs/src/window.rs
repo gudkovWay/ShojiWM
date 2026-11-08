@@ -3,6 +3,7 @@
 
 use std::{any::TypeId, fmt, rc::Rc};
 
+use shojiwm_lib::protocols::plasma_shell::PlasmaSurfaceSnapshot;
 use shojiwm_lib::ssd::{
     DecorationInteractionSnapshot, ManagedWindowAnimationMode, ManagedWindowAnimationSnapshot,
     ManagedWindowPointAnimationSnapshot, ManagedWindowPointSnapshot,
@@ -34,9 +35,12 @@ pub(crate) struct WindowSignals {
     pub is_resizable: Signal<bool>,
     pub is_transient: Signal<bool>,
     pub parent_id: Signal<Option<String>>,
+    pub plasma: Signal<Option<PlasmaSurfaceSnapshot>>,
+    pub minimized_geometry: Signal<Option<Rect>>,
     pub icon: Signal<Option<WindowIconSnapshot>>,
     pub interaction: Signal<DecorationInteractionSnapshot>,
     pub decoration: Signal<WindowDecorationStateSnapshot>,
+    pub output: Signal<Option<String>>,
 }
 
 impl WindowSignals {
@@ -55,9 +59,12 @@ impl WindowSignals {
             is_resizable: scope.signal(snapshot.is_resizable),
             is_transient: scope.signal(snapshot.is_transient),
             parent_id: scope.signal(snapshot.parent_id.clone()),
+            plasma: scope.signal(snapshot.plasma.clone()),
+            minimized_geometry: scope.signal(snapshot.minimized_geometry.map(Into::into)),
             icon: scope.signal(snapshot.icon.clone()),
             interaction: scope.signal(snapshot.interaction.clone()),
             decoration: scope.signal(snapshot.decoration),
+            output: scope.signal(snapshot.output_name.clone()),
         }
     }
 
@@ -76,9 +83,13 @@ impl WindowSignals {
         self.is_resizable.set(snapshot.is_resizable);
         self.is_transient.set(snapshot.is_transient);
         self.parent_id.set(snapshot.parent_id.clone());
+        self.plasma.set(snapshot.plasma.clone());
+        self.minimized_geometry
+            .set(snapshot.minimized_geometry.map(Into::into));
         self.icon.set(snapshot.icon.clone());
         self.interaction.set(snapshot.interaction.clone());
         self.decoration.set(snapshot.decoration);
+        self.output.set(snapshot.output_name.clone());
     }
 }
 
@@ -126,12 +137,32 @@ window_signals! {
     is_resizable: bool,
     is_transient: bool,
     parent_id: Option<String>,
+    /// What plasmashell asked for this window (KDE `org_kde_plasma_surface`:
+    /// role, position); `None` for every other window.
+    plasma: Option<PlasmaSurfaceSnapshot>,
+    /// Where a KDE taskbar shows this window, in global logical coordinates
+    /// (`org_kde_plasma_window.set_minimized_geometry`); `None` when no
+    /// taskbar set one.
+    minimized_geometry: Option<Rect>,
     icon: Option<WindowIconSnapshot>,
     interaction: DecorationInteractionSnapshot,
     decoration: WindowDecorationStateSnapshot,
+    /// The output the window belongs to: the one containing its center, else
+    /// one it overlaps, else the nearest (`window.output`).
+    output: Option<String>,
 }
 
 impl Window {
+    /// [`create_poll`](crate::animation::create_poll) on the frames of the
+    /// window's output (`window.createPoll`); it moves with the window.
+    pub fn create_poll(
+        &self,
+        interval_ms: f64,
+        f: impl Fn(&crate::animation::PollHandle) + 'static,
+    ) -> crate::animation::PollHandle {
+        crate::animation::create_poll(interval_ms, self.output(), f)
+    }
+
     pub(crate) fn entry(&self) -> Option<Rc<WindowEntry>> {
         runtime::WINDOWS.with(|windows| windows.borrow().get(self.slot, self.generation))
     }
@@ -140,6 +171,28 @@ impl Window {
         match self.entry() {
             Some(entry) => entry.signals,
             None => dead_signals(),
+        }
+    }
+
+    /// Draw this window's decoration at `scale` times its authored size:
+    /// every length in its view (sizes, offsets, spacing, borders, radii,
+    /// shadows, fonts, popup offsets) is multiplied, so text stays sharp and
+    /// hit testing follows. A label without a font size or line height gets
+    /// the defaults' scaled values. Shader uniforms are not touched, nor is
+    /// the window's rect: a config that reserves room for its decoration
+    /// (a titlebar height in the managed rect) scales that itself. The
+    /// default is 1; a change rebuilds the whole view.
+    pub fn set_ui_scale(&self, scale: f64) {
+        let Some(entry) = self.entry() else {
+            return;
+        };
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        if entry.context.ui_scale.replace(scale) != scale {
+            entry.context.mark_full();
         }
     }
 
@@ -277,6 +330,8 @@ impl Window {
 fn empty_snapshot() -> WaylandWindowSnapshot {
     WaylandWindowSnapshot {
         output_name: None,
+        plasma: None,
+        minimized_geometry: None,
         id: String::new(),
         title: String::new(),
         app_id: None,

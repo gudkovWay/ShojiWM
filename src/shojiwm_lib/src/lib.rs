@@ -11,48 +11,52 @@ use crate::{
 use mimalloc::MiMalloc;
 use std::{
     backtrace::Backtrace,
-    process::ExitCode,
     fs::{self, OpenOptions},
     panic,
-    path::{
-        Path, 
-        PathBuf
-    },
-    time::{
-        Duration, 
-        SystemTime, 
-        UNIX_EPOCH
-    },
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing::{
-    error, 
-    info,
-    warn
-};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+#[cfg(test)]
+mod log_path_tests;
 
 pub mod activation_environment;
 pub mod backend;
+pub mod backlight;
+pub mod color;
 pub mod config;
 pub mod config_error;
+pub mod control_socket;
 pub mod cursor;
-pub mod frame_pacing;
+pub mod dnd;
 pub mod drawing;
 pub mod foreign_toplevel;
+pub mod frame_pacing;
 pub mod grabs;
 pub mod handlers;
 pub mod input;
 pub mod keyboard_layout;
+pub mod log_rate_limit;
+pub mod modifier_tap;
 pub mod output_power;
+pub mod plasma_virtual_desktop;
+pub mod plasma_window_management;
+pub mod pointer_dispatch;
 pub mod presentation;
+pub mod presentation_test_client;
 pub mod process_env;
 pub mod profiler;
 pub mod protocols;
 pub mod runtime_api;
 pub mod runtime_debug;
 pub mod runtime_input;
+pub mod runtime_input_grab;
 pub mod runtime_key_binding;
 pub mod runtime_pointer;
+pub mod runtime_pointer_region;
 pub mod runtime_process;
 pub mod runtime_workspace;
 pub mod ssd;
@@ -60,6 +64,7 @@ pub mod state;
 pub mod window_decoration;
 pub mod wlr_foreign_toplevel;
 pub mod workspace_manager;
+pub mod xdg_toplevel_tag;
 pub mod xwayland_satellite;
 
 // Owned by the library rather than each binary: every ShojiWM build wants the
@@ -96,8 +101,21 @@ pub fn run(launcher: impl RuntimeLauncher + 'static) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.version {
-        println!("shoji_wm {} ({})", env!("CARGO_PKG_VERSION"), launcher.name());
+        println!(
+            "shoji_wm {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            launcher.name()
+        );
         return ExitCode::SUCCESS;
+    }
+    if let Some(command) = args.control_command {
+        return match control_socket::send(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     match run_with_args(Box::new(launcher), args) {
@@ -238,8 +256,9 @@ fn init_logging(
         .write(true)
         .truncate(true)
         .open(&latest_log)?;
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,shojiwm_lib=info,shoji_wm=info,xwayland_satellite=info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,shojiwm_lib=info,shoji_wm=info,xwayland_satellite=info")
+    });
 
     // The compositor runs a single-threaded event loop, so a synchronous
     // writer here puts a filesystem write directly in the path of input and
@@ -253,12 +272,21 @@ fn init_logging(
         .buffered_lines_limit(64 * 1024)
         .finish(log_file);
 
-    tracing_subscriber::fmt()
-        .compact()
-        .with_ansi(false)
-        .with_writer(writer)
-        .with_env_filter(env_filter)
-        .init();
+    // One warning per surface per frame must not fill the disk: see
+    // `log_rate_limit`.
+    let rate_limit = log_rate_limit::enabled_from_env()
+        .then(|| log_rate_limit::LogRateLimitLayer::new(writer.clone()));
+    {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::fmt()
+            .compact()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_env_filter(env_filter)
+            .finish()
+            .with(rate_limit)
+            .init();
+    }
 
     // After the subscriber is installed, so the summary lands in the log it
     // just pruned around.
@@ -290,11 +318,7 @@ impl Default for LogRetention {
         Self {
             min_keep: 5,
             max_total_bytes: Some(512 * 1024 * 1024),
-            max_age: Some(
-                Duration::from_secs(
-                    30 * 24 * 60 * 60
-                )
-            ),
+            max_age: Some(Duration::from_secs(30 * 24 * 60 * 60)),
         }
     }
 }
@@ -305,15 +329,10 @@ impl LogRetention {
     /// `SHOJI_LOG_ROTATE` gate the rest of the logging setup.
     fn from_env() -> Self {
         let mut retention = Self::default();
-        if let Some(bytes) = parse_retention_env(
-            "SHOJI_LOG_KEEP_BYTES",
-        ) {
-            retention.max_total_bytes = (bytes > 0)
-                .then_some(bytes);
+        if let Some(bytes) = parse_retention_env("SHOJI_LOG_KEEP_BYTES") {
+            retention.max_total_bytes = (bytes > 0).then_some(bytes);
         }
-        if let Some(days) = parse_retention_env(
-            "SHOJI_LOG_KEEP_DAYS",
-        ) {
+        if let Some(days) = parse_retention_env("SHOJI_LOG_KEEP_DAYS") {
             retention.max_age =
                 (days > 0).then(|| Duration::from_secs(days.saturating_mul(24 * 60 * 60)));
         }
@@ -321,19 +340,13 @@ impl LogRetention {
     }
 }
 
-fn parse_retention_env(
-    name: &str
-) -> Option<u64> {
-    let value = std::env::var(name)
-        .ok()?;
-    let value = value
-        .trim();
+fn parse_retention_env(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
     if value.eq_ignore_ascii_case("off") {
         return Some(0);
     }
-    value
-        .parse()
-        .ok()
+    value.parse().ok()
 }
 
 /// Drop rotated logs that fall outside `retention`.
@@ -342,25 +355,18 @@ fn parse_retention_env(
 /// `latest.log` and anything a human put here are left alone. Failures are
 /// reported and swallowed: a log directory we cannot tidy is not a reason to
 /// refuse to start a session.
-fn prune_rotated_logs(
-    log_dir: &Path,
-    retention: &LogRetention,
-) {
+fn prune_rotated_logs(log_dir: &Path, retention: &LogRetention) {
     let entries = match fs::read_dir(log_dir) {
         Ok(entries) => entries,
         Err(err) => {
-            warn!(
-                ?err,
-                "could not read log directory to apply retention",
-            );
+            warn!(?err, "could not read log directory to apply retention",);
             return;
         }
     };
 
     let mut rotated: Vec<(u128, u64, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
-        let path = entry
-            .path();
+        let path = entry.path();
         let Some(stamp) = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -369,17 +375,8 @@ fn prune_rotated_logs(
         else {
             continue;
         };
-        let size = entry
-            .metadata()
-            .map(|metadata| metadata.len()).unwrap_or(0);
-        rotated
-            .push(
-                (
-                    stamp,
-                    size, 
-                    path,
-                ),
-            );
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        rotated.push((stamp, size, path));
     }
 
     // Newest first. The rotation timestamp is a better ordering key than
@@ -429,9 +426,30 @@ fn prune_rotated_logs(
 }
 
 fn shoji_log_dir() -> PathBuf {
-    std::env::var_os("HOME")
+    resolve_log_dir(
+        std::env::var_os("SHOJI_LOG_DIR"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn resolve_log_dir(
+    log_dir: Option<std::ffi::OsString>,
+    state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(log_dir) = log_dir.filter(|path| !path.is_empty()) {
+        return PathBuf::from(log_dir);
+    }
+    state_home
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| {
+            home.map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("state")
+        })
         .join("shoji_wm")
         .join("logs")
 }
